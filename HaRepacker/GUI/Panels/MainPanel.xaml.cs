@@ -4111,22 +4111,43 @@ namespace HaRepacker.GUI.Panels
         /// values straight into their WZ properties - a confirmed Ctrl+V is the commit, so
         /// 儲存數值 isn't needed afterwards. Caller confirms first.
         ///
-        /// Marks the node the editor is showing as changed (the tree's usual red) when at least
-        /// one property was really written, so the edit is visible once the selection moves off
-        /// it. Nothing is marked when every value was rejected by its property's type.
+        /// Reddens exactly the leaf properties the paste wrote - pasting price onto
+        /// 02020001\info\price marks `price`, never `info`, the item, or a sibling the paste
+        /// didn't touch. A value the property's type rejected isn't in the returned list, so a
+        /// half-successful paste only reddens the half that landed.
         /// </summary>
         public void PasteCopiedEditorFields()
         {
-            if (nodeEditorPanel == null || nodeEditorPanel.PasteCopiedFieldsShortcut() <= 0)
+            if (nodeEditorPanel == null)
                 return;
 
-            if (DataTree.SelectedNode is not WzNode targetNode)
+            IReadOnlyList<WzImageProperty> changedProperties = nodeEditorPanel.PasteCopiedFieldsShortcut();
+            if (changedProperties.Count == 0)
                 return;
 
-            targetNode.ChangedNodeProperty();
-            // Repaints foregrounds from the model instead of rebuilding the tree - the target is
-            // still selected, so its red only shows once the selection moves elsewhere.
-            UpdateNativeSelectionVisuals();
+            bool marked = false;
+            foreach (WzImageProperty property in changedProperties)
+            {
+                // Every WzNode registers itself on its WzObject (WzNode.ParseChilds sets
+                // SourceObject.HRTag), and the editor only ever shows properties of an already
+                // parsed image, so the node for each written property exists here. Nothing to
+                // mark if it somehow doesn't - the WZ write itself already happened, and
+                // ParentImage.Changed is set regardless, so the file still saves correctly.
+                if (property.HRTag is not WzNode propertyNode)
+                    continue;
+
+                propertyNode.ChangedNodeProperty();
+                marked = true;
+            }
+
+            if (marked)
+            {
+                // Repaints foregrounds from the model for the items that actually exist in the
+                // WPF mirror, instead of rebuilding the tree. A property under a collapsed parent
+                // has no TreeViewItem yet; its WzNode is marked all the same, and
+                // CreateNativeTreeItem applies the red when the user expands it later.
+                UpdateNativeSelectionVisuals();
+            }
         }
 
         /// <summary>

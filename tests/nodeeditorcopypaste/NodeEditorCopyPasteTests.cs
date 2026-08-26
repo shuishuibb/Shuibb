@@ -119,6 +119,13 @@ public sealed class NodeEditorCopyPasteTests
         return AttachToImage(item, "0202.img");
     }
 
+    /// <summary>
+    /// The names of the properties a paste reported writing, in order. MainPanel turns exactly
+    /// this list into red tree nodes (one ChangedNodeProperty per entry, via property.HRTag), so
+    /// what's in here is precisely what does and doesn't go red.
+    /// </summary>
+    private static string[] NamesOf(IReadOnlyList<WzImageProperty> written) => written.Select(p => p.Name).ToArray();
+
     /// <summary>Reads a scalar straight out of the WZ, bypassing the panel entirely.</summary>
     private static int IntValueOf(WzSubProperty owner, string path)
     {
@@ -211,13 +218,19 @@ public sealed class NodeEditorCopyPasteTests
         Assert.False(panel.HasSelectedFields);
         Assert.True(panel.HasCopiedFields); // so MainForm's Ctrl+V takes the field branch
 
-        Assert.Equal(2, panel.PasteCopiedFieldsShortcut());
+        IReadOnlyList<WzImageProperty> written = panel.PasteCopiedFieldsShortcut();
+
+        // Exactly the two pasted leaf properties are reported - these are the only nodes
+        // MainPanel will redden. The item itself and its other properties are not in the list.
+        Assert.Equal(new[] { "price", "slotMax" }, NamesOf(written));
+        Assert.Same(target["price"], written[0]);
+        Assert.Same(target["slotMax"], written[1]);
 
         // The WZ properties themselves are already updated - 儲存數值 is NOT pressed anywhere in
         // this test. This is the behaviour change: a confirmed Ctrl+V is the commit.
         Assert.Equal(210, IntValueOf(target, "price"));
         Assert.Equal(500, IntValueOf(target, "slotMax"));
-        Assert.True(ImageOf(target).Changed);
+        Assert.True(ImageOf(target).Changed); // whole .img still dirty, so it saves correctly
 
         // ...and the boxes show what the WZ now actually holds.
         object targetCard = LooseCard(panel);
@@ -249,11 +262,38 @@ public sealed class NodeEditorCopyPasteTests
         // An unconfirmed hand edit sitting in a box the paste does not carry.
         Fields(LooseCard(panel))["price"].Text = "999";
 
-        Assert.Equal(1, panel.PasteCopiedFieldsShortcut());
+        // Only the pasted field is reported, so only slotMax goes red - the untouched hand edit
+        // neither reddens nor commits.
+        Assert.Equal(new[] { "slotMax" }, NamesOf(panel.PasteCopiedFieldsShortcut()));
 
         Assert.Equal(9999, IntValueOf(target, "slotMax")); // the pasted field was written
         Assert.Equal(1, IntValueOf(target, "price"));      // the staged hand edit was NOT
         Assert.Equal("999", Fields(LooseCard(panel))["price"].Text); // still staged, untouched
+    });
+
+    [Fact]
+    public void Paste_PartialSuccess_ReportsOnlyThePropertyThatWasActuallyWritten() => RunSta(() =>
+    {
+        // One value the target's type accepts, one it doesn't - only the successful one may be
+        // reported, so only it goes red.
+        var panel = new NodeEditorPanel();
+
+        Assert.True(panel.TryLoad(MakeConsumeItem("2040000", ("price", 100), ("slotMax", 200)), null));
+        object sourceCard = LooseCard(panel);
+        Fields(sourceCard)["price"].Text = "777";
+        Fields(sourceCard)["slotMax"].Text = "abc"; // never parses into a WzIntProperty
+        Selected(sourceCard).Add("price");
+        Selected(sourceCard).Add("slotMax");
+        panel.CopySelectedFieldsShortcut();
+
+        WzSubProperty target = MakeConsumeItem("2040001", ("price", 1), ("slotMax", 2));
+        Assert.True(panel.TryLoad(target, null));
+
+        Assert.Equal(new[] { "price" }, NamesOf(panel.PasteCopiedFieldsShortcut()));
+
+        Assert.Equal(777, IntValueOf(target, "price"));
+        Assert.Equal(2, IntValueOf(target, "slotMax")); // rejected value left the property alone
+        Assert.Contains("型別不符", StatusText(panel));
     });
 
     [Fact]
@@ -270,8 +310,8 @@ public sealed class NodeEditorCopyPasteTests
         WzSubProperty target = MakeConsumeItem("2040001", ("price", 1));
         Assert.True(panel.TryLoad(target, null));
 
-        // Nothing written -> MainPanel must not mark the target tree node as changed.
-        Assert.Equal(0, panel.PasteCopiedFieldsShortcut());
+        // Nothing written -> nothing reported -> MainPanel reddens no node at all.
+        Assert.Empty(panel.PasteCopiedFieldsShortcut());
         Assert.Equal(1, IntValueOf(target, "price"));
         Assert.False(ImageOf(target).Changed);
         Assert.Contains("型別不符", StatusText(panel));
@@ -294,7 +334,7 @@ public sealed class NodeEditorCopyPasteTests
         int targetChildCountBefore = target.WzProperties.Count;
         Assert.True(panel.TryLoad(target, null));
 
-        Assert.Equal(1, panel.PasteCopiedFieldsShortcut());
+        Assert.Equal(new[] { "price" }, NamesOf(panel.PasteCopiedFieldsShortcut()));
 
         Assert.Equal(targetChildCountBefore, target.WzProperties.Count); // no node inserted
         Assert.Null(target["2040000"]);                                  // specifically not the source
@@ -315,8 +355,8 @@ public sealed class NodeEditorCopyPasteTests
         Assert.True(panel.TryLoad(target, null));
         Assert.Null(LooseCard(panel)); // no loose card was even built for this item
 
-        // Nothing written, so MainPanel leaves the target tree node unmarked.
-        Assert.Equal(0, panel.PasteCopiedFieldsShortcut());
+        // Nothing written, so nothing is reported and MainPanel reddens no node.
+        Assert.Empty(panel.PasteCopiedFieldsShortcut());
         Assert.False(ImageOf(target).Changed);
 
         // HasCopiedFields staying true is what stops MainForm from ever reaching DoPaste() - an
@@ -379,7 +419,12 @@ public sealed class NodeEditorCopyPasteTests
         WzSubProperty target = MakeEquipItem("01000001", ("reqSTR", 1), ("incPDD", 1));
         Assert.True(panel.TryLoad(target, null));
 
-        Assert.Equal(1, panel.PasteCopiedFieldsShortcut());
+        // Reported property is the leaf under info - info itself is never reported, so it never
+        // goes red.
+        IReadOnlyList<WzImageProperty> written = panel.PasteCopiedFieldsShortcut();
+        Assert.Equal(new[] { "reqSTR" }, NamesOf(written));
+        Assert.Same(target["info"]["reqSTR"], written[0]);
+
         Assert.Equal(999, IntValueOf(target, "info/reqSTR"));
         Assert.Equal(1, IntValueOf(target, "info/incPDD")); // not carried by the copy
         Assert.Equal("999", Fields(CardTitled(panel, "info"))["reqSTR"].Text);

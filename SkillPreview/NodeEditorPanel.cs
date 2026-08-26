@@ -737,23 +737,25 @@ namespace SkillPreview
         /// written. Any *other* box on the card the user had typed into but not yet saved stays
         /// staged and untouched - a paste must never commit edits the user hasn't confirmed.
         ///
-        /// Returns how many properties were really written, so the caller can mark the target
-        /// tree node as changed only when something actually changed.
+        /// Returns exactly the properties that were really written - the caller marks those, and
+        /// only those, as changed in the tree. A property whose value the type rejected is not in
+        /// the list, so a half-successful paste only reddens the half that landed.
         /// </summary>
-        private int PasteFields(GroupBinding binding)
+        private List<WzImageProperty> PasteFields(GroupBinding binding)
         {
+            var changedProperties = new List<WzImageProperty>();
+
             if (copiedFields == null || copiedFields.Count == 0)
             {
                 statusText.Text = "剪貼簿是空的，請先在某張卡片點選欄位名稱再按 Ctrl+C。";
-                return 0;
+                return changedProperties;
             }
             if (!string.Equals(copiedFieldsSourceMatchKey, binding.MatchKey, StringComparison.Ordinal))
             {
                 statusText.Text = "複製的欄位來自「" + copiedFieldsSourceDisplayTitle + "」，無法貼到「" + DisplayTitleFor(binding) + "」。";
-                return 0;
+                return changedProperties;
             }
 
-            int written = 0;
             int missing = 0;
             int failed = 0;
             foreach ((string name, string value) in copiedFields)
@@ -779,12 +781,14 @@ namespace SkillPreview
                     continue;
                 }
 
+                // The whole .img still has to be marked dirty so the file saves correctly, even
+                // though only this leaf property is what the tree will show in red.
                 target.ParentImage.Changed = true;
                 box.Text = value; // keep the box showing what the WZ now actually holds
-                written++;
+                changedProperties.Add(target);
             }
 
-            if (written > 0)
+            if (changedProperties.Count > 0)
                 NodeChanged?.Invoke(this, EventArgs.Empty);
 
             // A clean paste says nothing - the new values showing up in the boxes is the
@@ -797,7 +801,7 @@ namespace SkillPreview
                 notes.Add("有 " + missing + " 個欄位在「" + DisplayTitleFor(binding) + "」找不到同名欄位，已略過");
             statusText.Text = notes.Count > 0 ? string.Join("，", notes) + "。" : string.Empty;
 
-            return written;
+            return changedProperties;
         }
 
         // ---- global Ctrl+C / Ctrl+V routing (MainForm.MainWindow_PreviewKeyDown) ----------------
@@ -871,20 +875,21 @@ namespace SkillPreview
         /// tree-level.
         /// </summary>
         /// <returns>
-        /// How many WZ properties were actually written - 0 when nothing changed (no matching
-        /// card, or every value was rejected by its property's type). The caller uses this to
-        /// decide whether to mark the target tree node as changed.
+        /// The WZ properties this paste actually wrote - empty when nothing changed (no staged
+        /// copy, no matching card, or every value was rejected by its property's type). The
+        /// caller marks exactly these leaf properties' tree nodes as changed; returning the
+        /// properties rather than a count is what keeps the red off their parents.
         /// </returns>
-        public int PasteCopiedFieldsShortcut()
+        public IReadOnlyList<WzImageProperty> PasteCopiedFieldsShortcut()
         {
             if (!HasCopiedFields)
-                return 0;
+                return Array.Empty<WzImageProperty>();
 
             GroupBinding target = groups.FirstOrDefault(g => string.Equals(g.MatchKey, copiedFieldsSourceMatchKey, StringComparison.Ordinal));
             if (target == null)
             {
                 statusText.Text = "複製的欄位來自「" + copiedFieldsSourceDisplayTitle + "」，目前節點沒有同類卡片可以貼上。";
-                return 0;
+                return Array.Empty<WzImageProperty>();
             }
 
             return PasteFields(target);
