@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Linq;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
 using MapleLib;
 using MapleLib.WzLib;
@@ -45,11 +46,35 @@ namespace SkillPreview
         private readonly List<GroupBinding> groups = new List<GroupBinding>();
         private readonly Dictionary<string, TextBox> stringBoxes = new Dictionary<string, TextBox>();
 
+        // Cross-node field copy/paste ("複製選取" / "貼上"). Deliberately NOT reset by Rebuild -
+        // the whole point is copy on node A, select node B (which rebuilds everything), paste
+        // into B's matching card. Only ever staged into TextBoxes; see PasteFields.
+        private List<(string Name, string Value)> copiedFields;
+        private string copiedFieldsSourceMatchKey;
+        private string copiedFieldsSourceDisplayTitle;
+
         private sealed class GroupBinding
         {
             public IPropertyContainer Container;
             public string Title;
+
+            // True for the one card built from the selected node's own loose properties (see
+            // Rebuild: BuildGroupCard(theme, currentNode, currentNodeName, loose)) - its Title is
+            // the *item's own unique name* (e.g. "2040000"), not a category name, so two
+            // different items' loose cards would never Title-match each other. MatchKey collapses
+            // every loose card to one shared key instead, so "copy 2040000's own fields, paste
+            // onto 2040001" actually works - the bug reported for Consume items, whose fields sit
+            // directly on the item instead of under a shared sub-container like Equip's "info".
+            public bool IsLooseFieldsCard;
+            public string MatchKey => IsLooseFieldsCard ? "\0LOOSE" : Title;
+
             public readonly Dictionary<string, TextBox> Fields = new Dictionary<string, TextBox>();
+
+            // Selection state for this card's rows, and the row Border each field's label lives
+            // in (so ToggleFieldSelection can repaint it). Both are per-card and naturally reset
+            // every Rebuild, since a fresh GroupBinding is created each time.
+            public readonly HashSet<string> SelectedFieldNames = new HashSet<string>();
+            public readonly Dictionary<string, Border> RowBorders = new Dictionary<string, Border>();
         }
 
         public event EventHandler NodeChanged;
@@ -274,7 +299,7 @@ namespace SkillPreview
             // The node's own loose values first, then one card per group, in declaration order.
             var loose = currentNode.WzProperties.Where(IsEditableScalar).ToList();
             if (loose.Count > 0)
-                content.Children.Add(BuildGroupCard(theme, currentNode, currentNodeName, loose));
+                content.Children.Add(BuildGroupCard(theme, currentNode, currentNodeName, loose, isLooseFieldsCard: true));
 
             foreach (WzImageProperty child in currentNode.WzProperties)
             {
@@ -325,9 +350,9 @@ namespace SkillPreview
         }
 
         private UIElement BuildGroupCard(EditorTheme theme, IPropertyContainer container, string title,
-            List<WzImageProperty> fields)
+            List<WzImageProperty> fields, bool isLooseFieldsCard = false)
         {
-            var binding = new GroupBinding { Container = container, Title = title };
+            var binding = new GroupBinding { Container = container, Title = title, IsLooseFieldsCard = isLooseFieldsCard };
             groups.Add(binding);
 
             var header = new DockPanel { Margin = new Thickness(0.0, 0.0, 0.0, 10.0) };
@@ -343,6 +368,19 @@ namespace SkillPreview
             save.Click += delegate { SaveGroup(binding); };
             buttons.Children.Add(save);
 
+            // Multi-select (click a label, Ctrl+click to add/remove more) + copy/paste between
+            // two nodes' same-named card - e.g. select reqSTR/reqDEX on item A's "info", copy,
+            // select item B, paste onto its "info". Paste only ever stages TextBox text; nothing
+            // is written to the WZ until the existing 儲存數值 button is pressed, same as typing
+            // a value in by hand.
+            var copySelected = PlainButton(theme, "複製選取");
+            copySelected.Click += delegate { CopySelectedFields(binding); };
+            buttons.Children.Add(copySelected);
+
+            var paste = PlainButton(theme, "貼上");
+            paste.Click += delegate { PasteFields(binding); };
+            buttons.Children.Add(paste);
+
             header.Children.Add(buttons);
             header.Children.Add(new TextBlock
             {
@@ -357,8 +395,11 @@ namespace SkillPreview
             foreach (WzImageProperty field in fields)
             {
                 TextBox box = FieldBox(theme, DescribeValue(field), false);
+                // binding.Fields stays keyed by the real property name - SaveGroup looks values
+                // up by this key when writing back, so the Chinese text below is display-only and
+                // never affects what gets saved.
                 binding.Fields[field.Name] = box;
-                stack.Children.Add(LabelledRow(theme, field.Name, box));
+                stack.Children.Add(LabelledRow(theme, binding, field.Name, PropertyDisplayName.GetDisplayName(field.Name), box));
             }
 
             return Card(theme, stack);
@@ -541,6 +582,10 @@ namespace SkillPreview
             };
         }
 
+        /// <summary>
+        /// Plain, non-selectable row - used only by BuildStringCard (String.wz name/desc), which
+        /// has no GroupBinding to select against. Unchanged from before this feature.
+        /// </summary>
         private static UIElement LabelledRow(EditorTheme theme, string label, TextBox box)
         {
             var grid = new Grid { Margin = new Thickness(0.0, 0.0, 0.0, 6.0) };
@@ -560,6 +605,199 @@ namespace SkillPreview
             Grid.SetColumn(box, 1);
             grid.Children.Add(box);
             return grid;
+        }
+
+        /// <summary>
+        /// propertyName is the real WZ key (used for selection tracking and as the paste
+        /// target lookup); displayLabel is what's actually painted (may be the same string, or
+        /// PropertyDisplayName's Chinese translation of it) - purely cosmetic, never touches
+        /// binding.Fields or anything that gets saved.
+        /// </summary>
+        private UIElement LabelledRow(EditorTheme theme, GroupBinding binding, string propertyName, string displayLabel, TextBox box)
+        {
+            var grid = new Grid();
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(LabelColumnWidth) });
+            grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1.0, GridUnitType.Star) });
+
+            var text = new TextBlock
+            {
+                Text = displayLabel,
+                Foreground = theme.Muted,
+                VerticalAlignment = VerticalAlignment.Center,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                ToolTip = displayLabel,
+                Cursor = Cursors.Hand,
+                Margin = new Thickness(0.0, 0.0, 10.0, 0.0)
+            };
+            grid.Children.Add(text);
+            Grid.SetColumn(box, 1);
+            grid.Children.Add(box);
+
+            var rowBorder = new Border
+            {
+                Child = grid,
+                Padding = new Thickness(4.0, 3.0, 4.0, 3.0),
+                Margin = new Thickness(-4.0, 0.0, -4.0, 6.0),
+                CornerRadius = new CornerRadius(4.0),
+                BorderThickness = new Thickness(1.0),
+                Background = Brushes.Transparent,
+                BorderBrush = Brushes.Transparent,
+                // Focusable so clicking the label moves keyboard focus off whatever TreeViewItem
+                // it was on - see the PreviewKeyDown handler below for why that matters.
+                Focusable = true,
+                FocusVisualStyle = null
+            };
+
+            // Click target is just the label, not the whole row, so clicking into the value box
+            // to type still behaves exactly as before - selection never intercepts that.
+            text.MouseLeftButtonDown += delegate (object sender, MouseButtonEventArgs e)
+            {
+                ToggleFieldSelection(binding, propertyName, (Keyboard.Modifiers & ModifierKeys.Control) != 0);
+                rowBorder.Focus();
+                e.Handled = true;
+            };
+
+            // Ctrl+C/Ctrl+V while a field's label has focus copy/paste the *selected fields* via
+            // CopySelectedFields/PasteFields. Without this, the keystroke tunnels down to
+            // whichever TreeViewItem still holds keyboard focus (clicking a label doesn't move
+            // focus by itself) and MainPanel's own tree-level Ctrl+C/Ctrl+V fires instead,
+            // copying/pasting the *entire selected WZ node* - which is the bug reported: pressing
+            // Ctrl+C after selecting a field pasted the whole item as a new sibling node instead
+            // of just the field's value. rowBorder.Focus() above is what makes this handler run
+            // first. The FocusedElement check keeps this from also swallowing a normal
+            // Ctrl+C/Ctrl+V typed while actually editing inside the value TextBox (an ordinary
+            // WPF text-edit copy/paste, which must keep working unchanged) - rowBorder is an
+            // ancestor of that TextBox, so PreviewKeyDown would otherwise tunnel through here too.
+            rowBorder.PreviewKeyDown += delegate (object sender, KeyEventArgs e)
+            {
+                if (!ReferenceEquals(Keyboard.FocusedElement, rowBorder))
+                    return;
+                if ((Keyboard.Modifiers & ModifierKeys.Control) == 0)
+                    return;
+
+                if (e.Key == Key.C)
+                {
+                    CopySelectedFields(binding);
+                    e.Handled = true;
+                }
+                else if (e.Key == Key.V)
+                {
+                    PasteFields(binding);
+                    e.Handled = true;
+                }
+            };
+
+            binding.RowBorders[propertyName] = rowBorder;
+            return rowBorder;
+        }
+
+        /// <summary>
+        /// Plain click selects only this field; Ctrl+click toggles it in/out of the current
+        /// selection so several fields can be picked before copying.
+        /// </summary>
+        private static void ToggleFieldSelection(GroupBinding binding, string propertyName, bool additive)
+        {
+            if (additive)
+            {
+                if (!binding.SelectedFieldNames.Add(propertyName))
+                    binding.SelectedFieldNames.Remove(propertyName);
+            }
+            else
+            {
+                bool wasOnlySelected = binding.SelectedFieldNames.Count == 1 && binding.SelectedFieldNames.Contains(propertyName);
+                binding.SelectedFieldNames.Clear();
+                if (!wasOnlySelected)
+                    binding.SelectedFieldNames.Add(propertyName);
+            }
+
+            EditorTheme theme = EditorTheme.Current;
+            foreach (KeyValuePair<string, Border> pair in binding.RowBorders)
+                ApplyRowSelectionHighlight(theme, pair.Value, binding.SelectedFieldNames.Contains(pair.Key));
+        }
+
+        private static void ApplyRowSelectionHighlight(EditorTheme theme, Border rowBorder, bool selected)
+        {
+            if (selected)
+            {
+                Color accent = theme.AccentBackground;
+                rowBorder.Background = new SolidColorBrush(Color.FromArgb(48, accent.R, accent.G, accent.B));
+                rowBorder.BorderBrush = theme.AccentEdge;
+            }
+            else
+            {
+                rowBorder.Background = Brushes.Transparent;
+                rowBorder.BorderBrush = Brushes.Transparent;
+            }
+        }
+
+        /// <summary>
+        /// binding.Title for the loose-fields card is the *item's own unique name* (e.g.
+        /// "2040000" for a Consume entry - see Rebuild), not a shared category name like "info",
+        /// so it's never fit to show as if it meant "this kind of card". Everything shown to the
+        /// user goes through this instead of Title directly.
+        /// </summary>
+        private static string DisplayTitleFor(GroupBinding binding) =>
+            binding.IsLooseFieldsCard ? "此節點本身的欄位" : binding.Title;
+
+        /// <summary>
+        /// Copies the selected fields' current (possibly unsaved) text, tagged with which kind of
+        /// card they came from via MatchKey (not the raw Title - see GroupBinding.MatchKey for
+        /// why) - paste only accepts them back into a matching card, so copying "info" fields
+        /// can't land in an unrelated "icon" card, or a different item's own loose fields, by
+        /// mistake.
+        /// </summary>
+        private void CopySelectedFields(GroupBinding binding)
+        {
+            if (binding.SelectedFieldNames.Count == 0)
+            {
+                statusText.Text = "請先選取要複製的欄位——點欄位名稱可選取，Ctrl+點擊可多選。";
+                return;
+            }
+
+            copiedFields = binding.SelectedFieldNames
+                .Where(name => binding.Fields.ContainsKey(name))
+                .Select(name => (Name: name, Value: binding.Fields[name].Text))
+                .ToList();
+            copiedFieldsSourceMatchKey = binding.MatchKey;
+            copiedFieldsSourceDisplayTitle = DisplayTitleFor(binding);
+            statusText.Text = "已複製「" + copiedFieldsSourceDisplayTitle + "」的 " + copiedFields.Count + " 個欄位，可以到另一個節點的同類卡片貼上。";
+        }
+
+        /// <summary>
+        /// Applies previously-copied (name, text) pairs onto this card's same-named fields -
+        /// only staged into the TextBoxes, exactly like typing them in by hand. Nothing is
+        /// written to the WZ until 儲存數值 is pressed.
+        /// </summary>
+        private void PasteFields(GroupBinding binding)
+        {
+            if (copiedFields == null || copiedFields.Count == 0)
+            {
+                statusText.Text = "剪貼簿是空的，請先在某張卡片選取欄位並按「複製選取」。";
+                return;
+            }
+            if (!string.Equals(copiedFieldsSourceMatchKey, binding.MatchKey, StringComparison.Ordinal))
+            {
+                statusText.Text = "複製的欄位來自「" + copiedFieldsSourceDisplayTitle + "」，無法貼到「" + DisplayTitleFor(binding) + "」。";
+                return;
+            }
+
+            int applied = 0;
+            int skipped = 0;
+            foreach ((string name, string value) in copiedFields)
+            {
+                if (binding.Fields.TryGetValue(name, out TextBox box))
+                {
+                    box.Text = value;
+                    applied++;
+                }
+                else
+                {
+                    skipped++;
+                }
+            }
+            statusText.Text = "已貼上 " + applied + " 個欄位到「" + DisplayTitleFor(binding) + "」"
+                + (skipped > 0 ? "，" + skipped + " 個沒有同名欄位被略過" : "")
+                + "——按「儲存數值」才會真的寫入。";
         }
 
         private static TextBox FieldBox(EditorTheme theme, string value, bool multiline)

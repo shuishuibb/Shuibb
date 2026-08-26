@@ -210,6 +210,9 @@ namespace HaRepacker.GUI.Panels
         private TreeViewItem CreateNativeTreeItem(WzNode node)
         {
             EnableNativeTreeVirtualization();
+            // Tree stays plain English (node.Text as-is) - the Chinese display-name translation
+            // only applies to SkillPreview\NodeEditorPanel.cs's property editor cards, per
+            // explicit user preference.
             var item = new TreeViewItem { Header = node.Text, Tag = node };
             nativeTreeItems[node] = item;
             item.PreviewMouseLeftButtonDown += DataTreeViewItem_PreviewMouseLeftButtonDown;
