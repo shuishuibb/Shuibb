@@ -798,23 +798,7 @@ namespace MapleLib {
             if (IsWzFileLoaded(baseName))
                 return null;
 
-            WzFile wzf = new WzFile(filePath, encVersion);
-
-            WzFileParseStatus parseStatus;
-            try
-            {
-                parseStatus = wzf.ParseWzFile();
-            }
-            catch
-            {
-                wzf.Dispose();
-                throw;
-            }
-            if (parseStatus != WzFileParseStatus.Success)
-            {
-                wzf.Dispose();
-                throw new Exception("Error parsing " + baseName + ".wz (" + parseStatus.GetErrorDescription() + ")");
-            }
+            WzFile wzf = ParseWzFileAt(filePath, baseName, encVersion);
 
             try
             {
@@ -833,6 +817,46 @@ namespace MapleLib {
                 wzf.Dispose();
                 throw;
             }
+        }
+
+        /// <summary>
+        /// Parses a fresh, independent WzFile for <paramref name="baseName"/> WITHOUT registering it
+        /// in this manager's shared "already loaded" bookkeeping. The manager only has one slot per
+        /// path - exactly right for the manager's own uses (category lookups, canvas sections, ...)
+        /// - but wrong the moment two different UI tabs legitimately want their own separate
+        /// WzFile/tree/edit-state for the *same* physical file. Every returned instance is
+        /// independent: ReferenceEquals is always false between two calls, even for the same path.
+        /// Callers own the returned WzFile's lifetime (it never shows up in WzFileList or is found
+        /// by IsWzFileLoaded) and are responsible for disposing it themselves.
+        /// </summary>
+        public WzFile LoadWzFileIndependent(string baseName, WzMapleVersion encVersion)
+        {
+            string filePath = GetWzFilePath(baseName);
+            if (filePath == null)
+                return null;
+            return ParseWzFileAt(filePath, baseName, encVersion);
+        }
+
+        private static WzFile ParseWzFileAt(string filePath, string baseName, WzMapleVersion encVersion)
+        {
+            WzFile wzf = new WzFile(filePath, encVersion);
+
+            WzFileParseStatus parseStatus;
+            try
+            {
+                parseStatus = wzf.ParseWzFile();
+            }
+            catch
+            {
+                wzf.Dispose();
+                throw;
+            }
+            if (parseStatus != WzFileParseStatus.Success)
+            {
+                wzf.Dispose();
+                throw new Exception("Error parsing " + baseName + ".wz (" + parseStatus.GetErrorDescription() + ")");
+            }
+            return wzf;
         }
 
         /// <summary>

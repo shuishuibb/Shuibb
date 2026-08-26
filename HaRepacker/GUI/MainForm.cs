@@ -1010,12 +1010,37 @@ namespace HaRepacker.GUI
 
         #region Open WZ File
         /// <summary>
+        /// Whether the given TAB already has this exact file open, by full path - not "loaded
+        /// somewhere in the app". Program.WzFileManager is shared by every tab, but "already open"
+        /// has to mean "already open in front of you" to the user: a different tab opening the
+        /// same physical file wants its own independent copy, not to be silently refused because
+        /// some other tab happens to have that path loaded.
+        /// </summary>
+        private static bool IsWzFileOpenInPanel(MainPanel panel, string fullPath)
+        {
+            string normalized = Path.GetFullPath(fullPath);
+            foreach (System.Windows.Forms.TreeNode node in panel.DataTree.Nodes)
+            {
+                if (node is WzNode wzNode && wzNode.Tag is WzFile wzFile
+                    && wzFile.FilePath != null
+                    && string.Equals(Path.GetFullPath(wzFile.FilePath), normalized, StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /// <summary>
         /// Open WZ or ZLZ file internal
         /// </summary>
         /// <param name="fileNames"></param>
         private async void OpenFileInternal(string[] fileNames) {
             Dispatcher currentDispatcher = Dispatcher.CurrentDispatcher;
             WzFileManager wzFileManager = Program.WzFileManager;
+            // Captured once: this open action belongs to whichever tab was active when the user
+            // triggered it, not to "the active tab" re-read later after the batch has settled.
+            MainPanel activePanel = MainPanel;
 
             WzMapleVersion MapleVersionEncryptionSelected = GetSelectedEncryptionVersion();
 
@@ -1173,7 +1198,14 @@ namespace HaRepacker.GUI
                             return;
                         }
 
-                        wzfilePathsToLoad.Add(filePath); // add to list, so we can load it concurrently
+                        // A duplicate is scoped to THIS tab, not "loaded anywhere in the app":
+                        // Program.WzFileManager is one shared instance for the whole application,
+                        // but each tab's own MainPanel/DataTree is what "already open" has to mean
+                        // to the user - re-selecting a file already showing in this tab is a no-op,
+                        // while a different tab opening that same physical file is a distinct,
+                        // independent copy the manager's single already-loaded slot must not block.
+                        if (!IsWzFileOpenInPanel(activePanel, filePath))
+                            wzfilePathsToLoad.Add(filePath); // add to list, so we can load it concurrently
 
                         // Check if there are any related files
                         string[] wzsWithRelatedFiles = { "Map", "Mob", "Skill", "Sound" };
@@ -1196,7 +1228,7 @@ namespace HaRepacker.GUI
                                 string[] otherMapWzFiles = Directory.GetFiles(filePath.Substring(0, filePath.LastIndexOf("\\")), relatedFileName + "*.wz");
                                 foreach (string filePath_Others in otherMapWzFiles)
                                 {
-                                    if (filePath_Others != filePath)
+                                    if (filePath_Others != filePath && !IsWzFileOpenInPanel(activePanel, filePath_Others))
                                         wzfilePathsToLoad.Add(filePath_Others);
                                 }
                             }
@@ -1220,6 +1252,13 @@ namespace HaRepacker.GUI
                     try
                     {
                         WzFile f = wzFileManager.LoadWzFile(filePath, MapleVersionEncryptionSelected);
+                        if (f == null && wzFileManager.IsWzFileLoaded(filePath))
+                        {
+                            // Some OTHER tab already owns this exact file - IsWzFileOpenInPanel
+                            // already ruled out "this tab has it too" before this path was even
+                            // queued, so this tab needs its own independent WzFile, not nothing.
+                            f = wzFileManager.LoadWzFileIndependent(filePath, MapleVersionEncryptionSelected);
+                        }
                         if (f == null) {
                             // error should be thrown
                         }
@@ -1831,6 +1870,7 @@ namespace HaRepacker.GUI
         /// </param>
         private void RunWzFilesExtraction(object param)
         {
+            cancellationTokenSource = new CancellationTokenSource();
             ChangeApplicationState(false);
 
             string[] wzFilesToDump = (string[])((object[])param)[0];
@@ -1845,7 +1885,8 @@ namespace HaRepacker.GUI
             WzFileExporter.RunWzFilesExtraction(wzFilesToDump, baseDir, version, serializer, 
                 progressCallback: (x) => {
                     UpdateProgressBar(MainPanel.mainProgressBar, 1, false, false);
-                });
+                },
+                cancellationToken: cancellationTokenSource.Token);
 
             // Reset progress bar to 0
             UpdateProgressBar(MainPanel.mainProgressBar, 0, false, true);
@@ -1860,6 +1901,7 @@ namespace HaRepacker.GUI
         /// <param name="param"></param>
         private void RunWzImgDirsExtraction(object param)
         {
+            cancellationTokenSource = new CancellationTokenSource();
             ChangeApplicationState(false);
 
             List<WzDirectory> dirsToDump = (List<WzDirectory>)((object[])param)[0];
@@ -1874,7 +1916,8 @@ namespace HaRepacker.GUI
             WzFileExporter.RunWzImgDirsExtraction(dirsToDump, imgsToDump, baseDir, serializer,
                 progressCallback: (x) => {
                     UpdateProgressBar(MainPanel.mainProgressBar, 1, false, false);
-                });
+                },
+                cancellationToken: cancellationTokenSource.Token);
 
             // Reset progress bar to 0
             UpdateProgressBar(MainPanel.mainProgressBar, 0, false, true);
@@ -1889,6 +1932,7 @@ namespace HaRepacker.GUI
         /// <param name="param"></param>
         private void RunWzObjExtraction(object param)
         {
+            cancellationTokenSource = new CancellationTokenSource();
             ChangeApplicationState(false);
 
 #if DEBUG
@@ -1907,7 +1951,8 @@ namespace HaRepacker.GUI
                         UpdateProgressBar(MainPanel.mainProgressBar, value, true, true);
                     else
                         UpdateProgressBar(MainPanel.mainProgressBar, 1, false, false);
-                });
+                },
+                cancellationToken: cancellationTokenSource.Token);
 
 
             // Reset progress bar to 0
@@ -1921,6 +1966,11 @@ namespace HaRepacker.GUI
         //yes I know this is a stupid way to synchronize threads, I'm just too lazy to use events or locks
         private bool threadDone = false;
         private Thread runningThread = null;
+        // Cooperative cancellation for runningThread: Thread.Abort() is not supported on modern
+        // .NET (throws PlatformNotSupportedException). A fresh token is created at the top of
+        // each of the four worker methods below - before ChangeApplicationState(false) makes the
+        // Abort button visible/clickable - so AbortButton_Click can never race a stale token.
+        private CancellationTokenSource cancellationTokenSource;
 
 
         private delegate void ChangeAppStateDelegate(bool enabled);
@@ -2485,8 +2535,13 @@ namespace HaRepacker.GUI
         {
             if (Warning.Warn(HaRepacker.Properties.Resources.MainConfirmAbort))
             {
-                threadDone = true;
-                runningThread.Abort();
+                // Thread.Abort() is not supported on modern .NET (PlatformNotSupportedException).
+                // Cooperative cancellation instead: the worker checks this token between items and
+                // unwinds through its own normal completion path (progress bar reset, then
+                // threadDone = true), so ProgressBarThread's existing polling loop still notices
+                // completion and re-enables the UI - without forcing threadDone here, which would
+                // re-enable the UI while the worker might still be mid-item.
+                cancellationTokenSource?.Cancel();
             }
         }
 
@@ -2708,6 +2763,7 @@ namespace HaRepacker.GUI
 
         private void WzImporterThread(object param)
         {
+            cancellationTokenSource = new CancellationTokenSource();
             ChangeApplicationState(false);
 
             object[] arr = (object[])param;
@@ -2723,6 +2779,9 @@ namespace HaRepacker.GUI
 
             foreach (string file in files)
             {
+                if (cancellationTokenSource.Token.IsCancellationRequested)
+                    break;
+
                 List<WzObject> objs;
                 try
                 {

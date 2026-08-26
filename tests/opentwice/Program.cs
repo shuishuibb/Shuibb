@@ -1,13 +1,19 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using System.Windows.Forms;
 using System.Windows.Threading;
 using HaRepacker;
 using HaRepacker.GUI;
+using HaRepacker.GUI.Panels;
+using MapleLib.WzLib;
+using Newtonsoft.Json.Linq;
+using TokiAi;
 
 namespace opentwice
 {
@@ -26,6 +32,15 @@ namespace opentwice
     ///    unrelated String_000.wz from a different folder, and a third String_001.wz, and check
     ///    each one gets its own WzFile and its own tree node rather than being skipped as a
     ///    false-positive duplicate.
+    ///
+    /// 3. "不同分頁無法各自開啟同一個 String WZ" - fix #1's "already loaded" check was scoped to
+    ///    the whole app (Program.WzFileManager is one shared instance for every tab), so once tab
+    ///    1 opened a path, tab 2 opening that SAME path silently got nothing at all - correct for
+    ///    a second open in the SAME tab, wrong the moment it is a genuinely different tab wanting
+    ///    its own independent copy. The cross-tab section after the main phase loop opens the tab
+    ///    1 already has open again, but from a freshly created tab 2, and checks each tab ends up
+    ///    with its own WzFile instance and tree, plus that the AI assistant's [1]/[2] tab-prefix
+    ///    disambiguation still resolves both correctly.
     /// </summary>
     static class Program
     {
@@ -237,7 +252,9 @@ namespace opentwice
                         Check("seven distinct String WZ files ended up loaded, not fewer",
                             (HaRepacker.Program.WzFileManager?.WzFileList.Count ?? 0) == 7,
                             "count=" + (HaRepacker.Program.WzFileManager?.WzFileList.Count ?? 0));
-                        Quit(timer);
+
+                        timer.Stop(); // the cross-tab section drives its own timer from here on
+                        RunCrossTabTest(open, rootString, timer);
                         return;
                     }
                     filesBefore = -1; // trigger the next phase's open on the following tick
@@ -250,6 +267,186 @@ namespace opentwice
             };
             timer.Start();
             app.Run(form);
+        }
+
+        // ---- cross-tab: bug #3 - a second tab must get its own independent copy of a path the
+        // first tab already has open, not be silently refused ----
+
+        static MainPanel GetActivePanel()
+        {
+            return (MainPanel)typeof(MainForm)
+                .GetField("MainPanel", BindingFlags.NonPublic | BindingFlags.Instance)
+                .GetValue(form);
+        }
+
+        static int PanelTreeCount(MainPanel panel) => panel.DataTree.Nodes.Count;
+
+        static WzNode FindRootNode(MainPanel panel, string fullPath)
+        {
+            string normalized = Path.GetFullPath(fullPath);
+            foreach (TreeNode node in panel.DataTree.Nodes)
+            {
+                if (node is WzNode wzNode && wzNode.Tag is WzFile wzFile && wzFile.FilePath != null
+                    && string.Equals(Path.GetFullPath(wzFile.FilePath), normalized, StringComparison.OrdinalIgnoreCase))
+                    return wzNode;
+            }
+            return null;
+        }
+
+        static void SelectTab(int index)
+        {
+            var tabControl = (System.Windows.Controls.TabControl)typeof(MainForm)
+                .GetField("tabControl_MainPanels", BindingFlags.NonPublic | BindingFlags.Instance)
+                .GetValue(form);
+            if (index >= 0 && index < tabControl.Items.Count) tabControl.SelectedIndex = index;
+        }
+
+        /// <summary>Lets WPF actually run a layout/render pass before a screenshot.</summary>
+        static void Pump()
+        {
+            for (int i = 0; i < 3; i++)
+                System.Windows.Application.Current.Dispatcher.Invoke(
+                    DispatcherPriority.SystemIdle, new Action(delegate { }));
+        }
+
+        static WzFile FindWzFileInPanel(MainPanel panel, string fullPath)
+        {
+            string normalized = Path.GetFullPath(fullPath);
+            foreach (TreeNode node in panel.DataTree.Nodes)
+            {
+                if (node is WzNode wzNode && wzNode.Tag is WzFile wzFile && wzFile.FilePath != null
+                    && string.Equals(Path.GetFullPath(wzFile.FilePath), normalized, StringComparison.OrdinalIgnoreCase))
+                    return wzFile;
+            }
+            return null;
+        }
+
+        static void RunCrossTabTest(MethodInfo open, string sharedPath, DispatcherTimer mainTimer)
+        {
+            Log("");
+            Log("--- cross-tab: tab 2 opens the SAME path tab 1 already has (bug #3) ---");
+
+            MainPanel tab1Panel = GetActivePanel();
+            int tab1CountBefore = PanelTreeCount(tab1Panel);
+            WzFile tab1File = FindWzFileInPanel(tab1Panel, sharedPath);
+            Check("tab 1 already has its own copy of the shared path before the test", tab1File != null);
+
+            MethodInfo addTab = typeof(MainForm).GetMethod("AddTabsInternal", BindingFlags.NonPublic | BindingFlags.Instance);
+            addTab.Invoke(form, new object[] { "CrossTabTest" });
+
+            MainPanel tab2Panel = GetActivePanel();
+            Check("a second, distinct tab panel now exists",
+                tab2Panel != null && !ReferenceEquals(tab2Panel, tab1Panel));
+
+            ClearDialogs();
+            unhandledCaught = false;
+            open.Invoke(form, new object[] { new string[] { sharedPath } });
+
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            var timer = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(200) };
+            timer.Tick += (s, e) =>
+            {
+                try
+                {
+                    int tab2Count = PanelTreeCount(tab2Panel);
+                    bool settled = tab2Count > 0 && clock.ElapsedMilliseconds > 800;
+                    bool timedOut = clock.ElapsedMilliseconds > 15000;
+                    if (!settled && !timedOut) return;
+                    timer.Stop();
+
+                    Check("tab 2 gained exactly one root node for the shared path",
+                        tab2Count == 1, "tab2 root count=" + tab2Count);
+                    Check("tab 1's own tree is untouched (still " + tab1CountBefore + " root(s))",
+                        PanelTreeCount(tab1Panel) == tab1CountBefore, "now=" + PanelTreeCount(tab1Panel));
+
+                    WzFile tab2File = FindWzFileInPanel(tab2Panel, sharedPath);
+                    Check("tab 2 has its own WzFile for the shared path", tab2File != null);
+                    Check("tab 1 and tab 2 hold DIFFERENT WzFile instances for the same path (this is the whole point)",
+                        tab2File != null && tab1File != null && !ReferenceEquals(tab1File, tab2File));
+                    Check("tab 1's tree and tab 2's tree are different objects",
+                        !ReferenceEquals(tab1Panel.DataTree, tab2Panel.DataTree));
+                    Check("tab 2's copy actually parsed - has readable content, not an empty shell",
+                        tab2File?.WzDirectory != null
+                        && (tab2File.WzDirectory.WzImages.Count + tab2File.WzDirectory.WzDirectories.Count) > 0,
+                        tab2File?.WzDirectory == null ? "WzDirectory is null" : "0 children");
+                    Check("no unhandled exception escaped opening the same file in a second tab",
+                        !unhandledCaught, unhandledMessage);
+                    Check("no error dialog blocked the cross-tab open (this is meant to succeed, not degrade)",
+                        DialogCount() == 0, DialogCount() > 0 ? DialogTextAt(0) : null);
+
+                    // tab 2 is already the selected tab (AddTabsInternal selects the tab it
+                    // creates) - select its own root node the way a click would, switch back to
+                    // tab 1 and do the same, and check the selection actually lands on each tab's
+                    // own independent node - not screenshotted (see note above ScreenshotWindow
+                    // for why that route was abandoned), but still real WPF/WinForms selection
+                    // state on the real, currently-showing MainForm, not a mock.
+                    WzNode tab2Root = FindRootNode(tab2Panel, sharedPath);
+                    if (tab2Root != null) tab2Panel.DataTree.SelectedNode = tab2Root;
+                    Pump();
+                    Check("tab 2's root node can be selected like a real click would",
+                        tab2Root != null && ReferenceEquals(tab2Panel.DataTree.SelectedNode, tab2Root));
+
+                    SelectTab(0);
+                    Pump();
+                    WzNode tab1Root = FindRootNode(tab1Panel, sharedPath);
+                    if (tab1Root != null) tab1Panel.DataTree.SelectedNode = tab1Root;
+                    Pump();
+                    Check("tab 1's root node can be selected independently of tab 2's",
+                        tab1Root != null && ReferenceEquals(tab1Panel.DataTree.SelectedNode, tab1Root)
+                        && !ReferenceEquals(tab1Root, tab2Root));
+
+                    RunAiToolDisambiguationTest(tab1Panel, tab2Panel, sharedPath, mainTimer);
+                }
+                catch (Exception ex)
+                {
+                    Log("!!! THREW during the cross-tab test: " + ex);
+                    Quit(mainTimer);
+                }
+            };
+            timer.Start();
+        }
+
+        /// <summary>
+        /// Test 4: the AI assistant's [1]/[2] tab-prefix disambiguation, exercised against two
+        /// REAL, independently-loaded copies that came from the actual OpenFileInternal path (not
+        /// the old test-only "new WzFile() straight into the tree" bypass) - the thing this whole
+        /// round's fix makes possible for the first time.
+        /// </summary>
+        static void RunAiToolDisambiguationTest(MainPanel tab1Panel, MainPanel tab2Panel, string sharedPath, DispatcherTimer mainTimer)
+        {
+            Log("");
+            Log("--- cross-tab: AI assistant [1]/[2] tab-prefix disambiguation (Test 4) ---");
+            try
+            {
+                var tools = new WzTools(tab1Panel, new PendingChangeSet());
+                string fileName = Path.GetFileName(sharedPath);
+
+                bool isError;
+                string listing = tools.Execute("list_files", new JObject(), out isError);
+                Check("list_files succeeds", !isError, listing);
+                Check("list_files shows a [1] tab", !isError && listing.Contains("[1]"), listing);
+                Check("list_files shows a [2] tab", !isError && listing.Contains("[2]"), listing);
+
+                var noPrefix = new JObject { ["path"] = fileName };
+                string ambiguousResult = tools.Execute("get_node", noPrefix, out isError);
+                Check("no prefix + the name is ambiguous across tabs -> reported as ambiguous, not guessed",
+                    isError, ambiguousResult);
+
+                var q1 = new JObject { ["path"] = "[1]" + fileName };
+                string r1 = tools.Execute("get_node", q1, out isError);
+                Check("[1]" + fileName + " resolves without error", !isError, r1);
+                Check("[1] correctly picks tab 1", !isError && r1.Contains("[1]"), r1);
+
+                var q2 = new JObject { ["path"] = "[2]" + fileName };
+                string r2 = tools.Execute("get_node", q2, out isError);
+                Check("[2]" + fileName + " resolves without error", !isError, r2);
+                Check("[2] correctly picks tab 2", !isError && r2.Contains("[2]"), r2);
+            }
+            catch (Exception ex)
+            {
+                Log("!!! THREW during the AI tool disambiguation test: " + ex);
+            }
+            Quit(mainTimer);
         }
 
         // ---- native-window watcher: finds and dismisses any MessageBox our own process shows,

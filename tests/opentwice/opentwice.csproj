@@ -8,9 +8,10 @@
     <AssemblyName>opentwice</AssemblyName>
   </PropertyGroup>
   <ItemGroup>
-    <!-- The DEPLOYED binaries: the host is untouched, the fix is transplanted into MapleLib.dll. -->
     <ProjectReference Include="..\..\HaRepacker\Harepacker-resurrected.csproj" />
     <ProjectReference Include="..\..\MapleLib\MapleLib\MapleLib.csproj" />
     <ProjectReference Include="..\..\HaSharedLibrary\HaSharedLibrary.csproj" />
+    <!-- Only for driving the real [1]/[2] tab-prefix disambiguation tool the AI assistant uses. -->
+    <ProjectReference Include="..\..\TokiAiAssistant\TokiAiAssistant.csproj" />
   </ItemGroup>
 </Project>

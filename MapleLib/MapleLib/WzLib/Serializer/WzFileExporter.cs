@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace MapleLib.WzLib.Serializer
@@ -23,7 +24,7 @@ namespace MapleLib.WzLib.Serializer
         /// <param name="serializer" Serializer to use for file processing></param>
         /// <param name="progressCallback">Optional callback to report progress (current index, total count)</param>
         public static bool RunWzFilesExtraction(string[] wzFilesToDump, string baseDir, WzMapleVersion version, IWzFileSerializer serializer,
-             Action<int>? progressCallback = null)
+             Action<int>? progressCallback = null, CancellationToken cancellationToken = default)
         {
             if (!Directory.Exists(baseDir))
             {
@@ -33,6 +34,9 @@ namespace MapleLib.WzLib.Serializer
             bool success = true;
             foreach (string wzpath in wzFilesToDump)
             {
+                if (cancellationToken.IsCancellationRequested)
+                    break;
+
                 if (WzTool.IsListFile(wzpath))
                 {
                     //Warning.Error(string.Format(HaRepacker.Properties.Resources.MainListWzDetected, wzpath));
@@ -76,7 +80,7 @@ namespace MapleLib.WzLib.Serializer
         /// <param name="serializer"></param>
         /// <param name="progressCallback"></param>
         public static void RunWzImgDirsExtraction(List<WzDirectory> dirsToDump, List<WzImage> imgsToDump, string baseDir, IWzImageSerializer serializer,
-             Action<int>? progressCallback = null)
+             Action<int>? progressCallback = null, CancellationToken cancellationToken = default)
         {
 
             if (!Directory.Exists(baseDir))
@@ -87,6 +91,9 @@ namespace MapleLib.WzLib.Serializer
             // Selected Wz Images
             foreach (WzImage img in imgsToDump)
             {
+                if (cancellationToken.IsCancellationRequested)
+                    break;
+
                 string escapedPath = Path.Combine(baseDir, ProgressingWzSerializer.EscapeInvalidFilePathNames(img.Name));
 
                 serializer.SerializeImage(img, escapedPath);
@@ -97,6 +104,9 @@ namespace MapleLib.WzLib.Serializer
             // Selected Wz Dirs
             foreach (WzDirectory dir in dirsToDump)
             {
+                if (cancellationToken.IsCancellationRequested)
+                    break;
+
                 string escapedPath = Path.Combine(baseDir, ProgressingWzSerializer.EscapeInvalidFilePathNames(dir.Name));
 
                 serializer.SerializeDirectory(dir, escapedPath);
@@ -117,7 +127,7 @@ namespace MapleLib.WzLib.Serializer
         /// <param name="serializers"></param>
         /// <param name="progressCallback"></param>
         public static void RunWzXmlExtraction(List<WzObject> objsToDump, string path, ProgressingWzSerializer serializers,
-            Action<bool,int>? progressCallback = null)
+            Action<bool,int>? progressCallback = null, CancellationToken cancellationToken = default)
         {
 
 #if DEBUG
@@ -131,6 +141,9 @@ namespace MapleLib.WzLib.Serializer
 
                 foreach (WzObject obj in objsToDump)
                 {
+                    if (cancellationToken.IsCancellationRequested)
+                        break;
+
                     serializer.SerializeObject(obj, path);
 
                     // Update progress bar

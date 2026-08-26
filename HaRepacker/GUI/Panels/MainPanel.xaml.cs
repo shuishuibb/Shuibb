@@ -2025,15 +2025,19 @@ namespace HaRepacker.GUI.Panels
 
                                 img.Value.Item2.PngProperty.PNG = newBitmap;
 
-                                // Update 'origin' x/y if it exist
-                                PointF pointXY = img.Value.Item2.GetCanvasOriginPosition();
-                                if (pointXY != null && pointXY.X != 0 && pointXY.Y != 0) {
+                                // Update 'origin' x/y if it exists.
+                                // Written directly against the WzVectorProperty (instead of via
+                                // WzCanvasProperty.SetCanvasOriginPosition) for the same reason
+                                // ResizeCanvasByScale is above: that helper's zero-check
+                                // ("X != 0 && Y != 0") incorrectly treats a legitimate origin whose
+                                // X or Y is exactly 0 as "no origin", so a 0-anchored origin (e.g.
+                                // a pure vertical/horizontal offset) never scales with the image.
+                                WzVectorProperty originProp = (WzVectorProperty)img.Value.Item2[WzCanvasProperty.OriginPropertyName];
+                                if (originProp != null) {
                                     // 4 * 0.25 = 1, 4 * 0.5 = 2
-                                    PointF pointF = new PointF(
-                                        pointXY.X * (SCALE_UP_FACTOR * downscaleFactorAfter),
-                                        pointXY.Y * (SCALE_UP_FACTOR * downscaleFactorAfter));
-
-                                    img.Value.Item2.SetCanvasOriginPosition(pointF);
+                                    float originScale = SCALE_UP_FACTOR * downscaleFactorAfter;
+                                    originProp.X.SetValue(originProp.X.Value * originScale);
+                                    originProp.Y.SetValue(originProp.Y.Value * originScale);
                                 }
 
                                 // Update 'changed'

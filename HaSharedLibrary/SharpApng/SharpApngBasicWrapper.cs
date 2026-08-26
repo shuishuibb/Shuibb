@@ -27,10 +27,10 @@ namespace HaSharedLibrary.SharpApng
             if (apnglib != IntPtr.Zero)
             {
                 IntPtr createFramePtr = GetProcAddress(apnglib, "CreateFrame");
-                if (createFramePtr != null)
+                if (createFramePtr != IntPtr.Zero)
                     CreateFrame = (CreateFrameDelegate)Marshal.GetDelegateForFunctionPointer(createFramePtr, typeof(CreateFrameDelegate));
                 IntPtr saveApngPtr = GetProcAddress(apnglib, "SaveAPNG");
-                if (saveApngPtr != null)
+                if (saveApngPtr != IntPtr.Zero)
                     SaveAPNG = (SaveAPNGDelegate)Marshal.GetDelegateForFunctionPointer(saveApngPtr, typeof(SaveAPNGDelegate));
             }
             else
@@ -39,13 +39,15 @@ namespace HaSharedLibrary.SharpApng
 
         public static IntPtr MarshalString(string source)
         {
-            byte[] toMarshal = Encoding.ASCII.GetBytes(source);
-            int size = Marshal.SizeOf(source[0]) * source.Length;
-            IntPtr pnt = Marshal.AllocHGlobal(size);
-            Marshal.Copy(toMarshal, 0, pnt, source.Length);
-            IntPtr dest = Environment.Is64BitProcess ? new IntPtr(pnt.ToInt64() + size) : new IntPtr(pnt.ToInt32() + size);
-            Marshal.Copy(new byte[] { 0 }, 0, dest, 1);
-            return pnt;
+            // Native SaveAPNG (apng32/64.dll) takes a plain char* szImage and hands it straight to
+            // fopen(szImage, "wb") - a narrow, null-terminated C string interpreted using the
+            // process's ANSI code page, not ASCII/UTF-8. Marshal.StringToHGlobalAnsi performs
+            // exactly that conversion (the same OS ANSI-codepage rules .NET interop always uses
+            // for narrow strings) and null-terminates correctly, so non-ASCII (e.g. CJK) paths
+            // survive instead of collapsing to '?' and failing fopen(). It allocates from the
+            // same heap AllocHGlobal uses, so the existing ReleaseData/FreeHGlobal lifecycle at
+            // the call sites is unchanged.
+            return Marshal.StringToHGlobalAnsi(source ?? string.Empty);
         }
 
         public static IntPtr MarshalByteArray(byte[] source)
