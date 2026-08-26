@@ -745,23 +745,21 @@ namespace SkillPreview
                 return;
             }
 
-            int applied = 0;
             int skipped = 0;
             foreach ((string name, string value) in copiedFields)
             {
                 if (binding.Fields.TryGetValue(name, out TextBox box))
-                {
                     box.Text = value;
-                    applied++;
-                }
                 else
-                {
                     skipped++;
-                }
             }
-            statusText.Text = "已貼上 " + applied + " 個欄位到「" + DisplayTitleFor(binding) + "」"
-                + (skipped > 0 ? "，" + skipped + " 個沒有同名欄位被略過" : "")
-                + "——按「儲存數值」才會真的寫入。";
+
+            // A clean paste says nothing - the new values showing up in the boxes is the
+            // feedback. Only a partial one still reports, since a field being silently dropped
+            // would otherwise be invisible.
+            statusText.Text = skipped > 0
+                ? "有 " + skipped + " 個欄位在「" + DisplayTitleFor(binding) + "」找不到同名欄位，已略過。"
+                : string.Empty;
         }
 
         // ---- global Ctrl+C / Ctrl+V routing (MainForm.MainWindow_PreviewKeyDown) ----------------
