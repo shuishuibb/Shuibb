@@ -311,11 +311,14 @@
                 <ColumnDefinition Width="8*"/>
             </Grid.ColumnDefinitions>
 
-            <!-- Main panel-->
+            <!-- Main panel. The xctk:PropertyGrid that used to sit under the tree in a fixed 300px
+                 row is gone: WZ file name / value / X,Y moved into the right pane's header
+                 (border_NodeHeader) and WZ file type into MainForm's status bar, so the tree now
+                 owns the whole column. Row 1 is Auto and the find panel in it is Collapsed until
+                 Ctrl+F opens it, so no space is reserved while it's hidden. -->
             <Grid Grid.Column="0">
                 <Grid.RowDefinitions>
                     <RowDefinition Height="*"/>
-                    <RowDefinition Height="300"/>
                     <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
 
@@ -325,32 +328,8 @@
                           TreeViewItem.Expanded="DataTreeView_ItemExpanded"
                           DragOver="DataTreeView_DragOver" Drop="DataTreeView_Drop"/>
 
-                <xctk:PropertyGrid x:Name="propertyGrid" 
-                           Grid.Row="1"
-                               IsCategorized="True"
-                               SelectedObject="{Binding }"
-                               ShowTitle="False" Background="#FFDDDDDD" Foreground="Black">
-                    <xctk:PropertyGrid.EditorDefinitions>
-                        <xctk:EditorTemplateDefinition TargetProperties="WzFileValue">
-                            <xctk:EditorTemplateDefinition.EditingTemplate>
-                                <DataTemplate>
-                                    <!--<TextBox Text="{Binding Value}" IsReadOnly="{Binding Path=Value.IsReadOnly,  RelativeSource={RelativeSource AncestorType=xctk:PropertyItem}}"/> -->
-                                    <!--Visibility="{Binding DataContext.IsWzValueReadOnly, RelativeSource={RelativeSource AncestorType=xctk:PropertyGrid}, Converter={StaticResource booleanToVisibilityConverter}}"-->
-                                    <TextBox 
-                                        Text="{Binding Value}" 
-                                        IsReadOnly="{Binding DataContext.IsWzValueReadOnly, RelativeSource={RelativeSource AncestorType=xctk:PropertyGrid}}"
-                                        BorderBrush="Transparent"
-                                        />
-                                </DataTemplate>
-                            </xctk:EditorTemplateDefinition.EditingTemplate>
-                        </xctk:EditorTemplateDefinition>
-
-                       
-                    </xctk:PropertyGrid.EditorDefinitions>
-                </xctk:PropertyGrid>
-
                 <!-- Find panel -->
-                <Grid x:Name="grid_FindPanel" Grid.Row="2" Grid.RowSpan="2" Opacity="1"
+                <Grid x:Name="grid_FindPanel" Grid.Row="1" Opacity="1"
                       Margin="0,0,0,0" Background="White" Height="40" VerticalAlignment="Top"
                       Visibility="Collapsed" RenderTransformOrigin="0.5,0.5">
                     <Grid.RenderTransform>
@@ -402,11 +381,19 @@
                     <ColumnDefinition Width="0.5*"/>
                 </Grid.ColumnDefinitions>
 
-                <Border Grid.Row="0" Grid.ColumnSpan="2"
+                <!-- Node header: what the old left-hand PropertyGrid used to show. These bind to
+                     the same MainPanelPropertyItems instance the PropertyGrid was bound to (set
+                     in the constructor), so edits still travel through
+                     propertyGrid_PropertyChanged_1 - the rename / value / vector write-back is
+                     unchanged, this is only a new place to type. TwoWay bindings commit on
+                     LostFocus (WPF's default), matching how the PropertyGrid behaved; Enter
+                     commits too, via NodeHeaderField_KeyDown. -->
+                <Border x:Name="border_NodeHeader" Grid.Row="0" Grid.ColumnSpan="2"
                         Padding="8,4" Background="{StaticResource HareSurfaceBrush}"
                         BorderBrush="{StaticResource HareBorderBrush}" BorderThickness="0,0,0,1">
-                    <Button x:Name="button_MoreOption" HorizontalAlignment="Right"
-                            MinWidth="112" Height="30" Padding="12,3"
+                    <DockPanel LastChildFill="True">
+                    <Button x:Name="button_MoreOption" DockPanel.Dock="Right"
+                            MinWidth="112" Height="30" Padding="12,3" Margin="8,0,0,0"
                             Style="{StaticResource HareButtonStyle}"
                             Content="More actions" Click="button_MoreOption_Click"
                             RenderTransformOrigin="0.5,0.5">
@@ -433,6 +420,34 @@
                             </ContextMenu>
                         </Button.ContextMenu>
                     </Button>
+
+                    <TextBlock DockPanel.Dock="Left" Text="名稱" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                    <TextBox x:Name="textBox_NodeName" DockPanel.Dock="Left"
+                             Width="170" Height="24" VerticalContentAlignment="Center"
+                             Margin="0,0,14,0"
+                             Text="{Binding WzFileName, Mode=TwoWay}"
+                             KeyDown="NodeHeaderField_KeyDown"/>
+
+                    <!-- Only shown for WzVectorProperty; see NodeHeader_BindingPropertyChanged. -->
+                    <StackPanel x:Name="panel_NodeVector" DockPanel.Dock="Left"
+                                Orientation="Horizontal" Visibility="Collapsed" VerticalAlignment="Center">
+                        <TextBlock Text="X" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                        <TextBox x:Name="textBox_NodeVectorX" Width="64" Height="24" VerticalContentAlignment="Center"
+                                 Margin="0,0,12,0"
+                                 Text="{Binding XYVector.X, Mode=TwoWay}"
+                                 KeyDown="NodeHeaderField_KeyDown"/>
+                        <TextBlock Text="Y" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                        <TextBox x:Name="textBox_NodeVectorY" Width="64" Height="24" VerticalContentAlignment="Center"
+                                 Text="{Binding XYVector.Y, Mode=TwoWay}"
+                                 KeyDown="NodeHeaderField_KeyDown"/>
+                    </StackPanel>
+
+                    <TextBlock x:Name="label_NodeValue" DockPanel.Dock="Left" Text="值" VerticalAlignment="Center" Margin="0,0,6,0"/>
+                    <TextBox x:Name="textBox_NodeValue" Height="24" MinWidth="60" VerticalContentAlignment="Center"
+                             Text="{Binding WzFileValue, Mode=TwoWay}"
+                             IsReadOnly="{Binding IsWzValueReadOnly}"
+                             KeyDown="NodeHeaderField_KeyDown"/>
+                    </DockPanel>
                 </Border>
 
                 <Grid x:Name="grid1" Grid.Row="1" Grid.ColumnSpan="2">

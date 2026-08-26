@@ -99,9 +99,12 @@ namespace HaRepacker.GUI.Panels
                 DataTree.ForeColor = System.Drawing.Color.White;
             }
 
-            // data binding stuff
-            propertyGrid.DataContext = _bindingPropertyItem;
+            // data binding stuff. The left-hand xctk:PropertyGrid is gone; the same
+            // MainPanelPropertyItems now drives the right pane's header (名稱 / 值 / X,Y), so
+            // every edit still lands in propertyGrid_PropertyChanged_1 exactly as before.
+            border_NodeHeader.DataContext = _bindingPropertyItem;
             _bindingPropertyItem.PropertyChanged += propertyGrid_PropertyChanged_1;
+            _bindingPropertyItem.PropertyChanged += NodeHeader_BindingPropertyChanged;
 
             // Storyboard
             System.Windows.Media.Animation.Storyboard sbb = (System.Windows.Media.Animation.Storyboard)(this.FindResource("Storyboard_Find_FadeIn"));
@@ -688,7 +691,10 @@ namespace HaRepacker.GUI.Panels
             else if (e.Key == Key.F5) { StartAnimateSelectedCanvas(); e.Handled = true; }
             else if ((Keyboard.Modifiers & ModifierKeys.Control) != 0 && e.Key == Key.C) { DoCopy(); e.Handled = true; }
             else if ((Keyboard.Modifiers & ModifierKeys.Control) != 0 && e.Key == Key.V) { DoPaste(); e.Handled = true; RefreshNativeDataTree(); }
-            else if ((Keyboard.Modifiers & ModifierKeys.Control) != 0 && e.Key == Key.F) { ShowSearchPanel(); e.Handled = true; }
+            // Ctrl+F is deliberately not handled here. MainForm's Window-level PreviewKeyDown
+            // tunnels first and marks the key handled, so this branch could never run anyway -
+            // and leaving it would risk toggling the find panel twice for one keypress if that
+            // routing ever changed. One key, one route, one toggle.
             else if ((Keyboard.Modifiers & ~ModifierKeys.Shift) == 0 && TryGetTypeAheadChar(e.Key, out char typedChar))
             {
                 JumpToTypeAheadMatch(typedChar);
@@ -775,6 +781,21 @@ namespace HaRepacker.GUI.Panels
             }
         }
 
+        /// <summary>
+        /// Ctrl+F: opens the find panel when it's hidden, closes it when it's showing. Closing
+        /// leaves the typed search text alone, so reopening resumes where the user left off.
+        /// The X button keeps using the same fade-out, so both routes behave identically.
+        /// </summary>
+        public void ToggleSearchPanel()
+        {
+            if (grid_FindPanel.Visibility == Visibility.Visible)
+            {
+                HideSearchPanel();
+                return;
+            }
+            ShowSearchPanel();
+        }
+
         public void ShowSearchPanel()
         {
             if (grid_FindPanel.Visibility != Visibility.Visible)
@@ -789,6 +810,49 @@ namespace HaRepacker.GUI.Panels
                 Keyboard.Focus(findBox);
                 findBox.SelectAll();
             }), DispatcherPriority.Input);
+        }
+
+        /// <summary>
+        /// Runs the same fade-out the X button uses. Focus goes back to the tree so the next
+        /// keystroke isn't swallowed by the find box that's on its way out.
+        /// </summary>
+        private void HideSearchPanel()
+        {
+            var storyboard = (System.Windows.Media.Animation.Storyboard)FindResource("Storyboard_Find_FadeOut");
+            storyboard.Begin();
+            dataTreeView.Focus();
+        }
+
+        /// <summary>
+        /// Enter commits the header field being edited, matching how the old PropertyGrid
+        /// behaved. Without this a TwoWay binding would only write back on LostFocus.
+        /// </summary>
+        private void NodeHeaderField_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key != Key.Enter || sender is not TextBox box)
+                return;
+
+            box.GetBindingExpression(TextBox.TextProperty)?.UpdateSource();
+            e.Handled = true;
+        }
+
+        /// <summary>
+        /// X/Y only make sense for a WzVectorProperty. IsXYPanelReadOnly is already maintained
+        /// for exactly that case by ShowObjectValue (false only for vectors), so the header just
+        /// follows it instead of duplicating the type check.
+        /// </summary>
+        private void NodeHeader_BindingPropertyChanged(object sender, System.ComponentModel.PropertyChangedEventArgs e)
+        {
+            if (e.PropertyName != nameof(MainPanelPropertyItems.IsXYPanelReadOnly))
+                return;
+
+            bool isVector = !_bindingPropertyItem.IsXYPanelReadOnly;
+            panel_NodeVector.Visibility = isVector ? Visibility.Visible : Visibility.Collapsed;
+
+            // A vector has no single scalar value, so the 值 box would only be confusing.
+            Visibility valueVisibility = isVector ? Visibility.Collapsed : Visibility.Visible;
+            label_NodeValue.Visibility = valueVisibility;
+            textBox_NodeValue.Visibility = valueVisibility;
         }
 
         private void DataTreeView_DragOver(object sender, System.Windows.DragEventArgs e)
@@ -840,6 +904,26 @@ namespace HaRepacker.GUI.Panels
             //selectionLabel.Text = string.Format(Properties.Resources.SelectionType, ((WzNode)DataTree.SelectedNode).GetTypeName());
         }
 
+        /// <summary>
+        /// The selected node's WZ type name, shown next to "Ready" in MainForm's status bar.
+        /// Empty when this tab has no selection - each tab keeps its own, so switching tabs shows
+        /// that tab's selection rather than whatever the previous one had.
+        /// </summary>
+        public string SelectedWzTypeName { get; private set; } = string.Empty;
+
+        /// <summary>Raised when <see cref="SelectedWzTypeName"/> changes.</summary>
+        public event EventHandler SelectedWzTypeNameChanged;
+
+        private void SetSelectedWzTypeName(string typeName)
+        {
+            typeName ??= string.Empty;
+            if (SelectedWzTypeName == typeName)
+                return;
+
+            SelectedWzTypeName = typeName;
+            SelectedWzTypeNameChanged?.Invoke(this, EventArgs.Empty);
+        }
+
         private void ShowSelectedDataTreeNode(WzNode node)
         {
             if (node?.Tag is not WzObject selectedObject)
@@ -847,6 +931,7 @@ namespace HaRepacker.GUI.Panels
 
             ShowObjectValue(selectedObject);
             _bindingPropertyItem.WzFileType = node.GetTypeName();
+            SetSelectedWzTypeName(_bindingPropertyItem.WzFileType);
         }
 
         /// <summary>
@@ -4121,7 +4206,22 @@ namespace HaRepacker.GUI.Panels
             if (nodeEditorPanel == null)
                 return;
 
-            IReadOnlyList<WzImageProperty> changedProperties = nodeEditorPanel.PasteCopiedFieldsShortcut();
+            // Every selected node is a paste target, not just the active one - selecting
+            // 02000001..02000005 and hitting Ctrl+V writes all five. Snapshotted up front, and
+            // the paste works straight on the WzObjects, so the selection and the active node are
+            // never disturbed: no re-selecting, no panel rebuild, no scrolling.
+            WzNode[] targetNodes = GetSelectedBatchNodes();
+            if (targetNodes.Length == 0 && DataTree.SelectedNode is WzNode activeNode)
+                targetNodes = new WzNode[] { activeNode };
+
+            List<WzObject> targets = new List<WzObject>(targetNodes.Length);
+            foreach (WzNode node in targetNodes)
+            {
+                if (node.Tag is WzObject target)
+                    targets.Add(target);
+            }
+
+            IReadOnlyList<WzImageProperty> changedProperties = nodeEditorPanel.PasteCopiedFieldsToTargets(targets);
             if (changedProperties.Count == 0)
                 return;
 

@@ -110,6 +110,11 @@
         </Border>
         <ContentControl x:Name="hotSwapHost" Grid.Row="2" VerticalAlignment="Top" Panel.ZIndex="2"/>
         <TabControl x:Name="tabControl_MainPanels" Grid.Row="2" SelectionChanged="tabControl_MainPanels_TabIndexChanged" Margin="0,0,0,0"/>
-        <TextBlock Grid.Row="3" Text="Ready" Style="{StaticResource HareMutedTextStyle}" Margin="10,5"/>
+        <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="10,5">
+            <TextBlock Text="Ready" Style="{StaticResource HareMutedTextStyle}"/>
+            <!-- Selected node's WZ type, moved here from the removed left-hand PropertyGrid.
+                 Follows the active tab's own selection - see RefreshSelectedWzTypeLabel. -->
+            <TextBlock x:Name="statusLabel_SelectedWzType" Style="{StaticResource HareMutedTextStyle}" Margin="24,0,0,0"/>
+        </StackPanel>
     </Grid>
 </Window>

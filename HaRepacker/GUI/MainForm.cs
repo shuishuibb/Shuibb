@@ -651,7 +651,9 @@ namespace HaRepacker.GUI
                         MainPanel?.RefreshNativeDataTree();
                     }
                     break;
-                case System.Windows.Input.Key.F: searchToolStripMenuItem_Click(this, EventArgs.Empty); break;
+                // Ctrl+F toggles: opens the find panel, closes it if it's already open. The
+                // Search menu item still just opens it (searchToolStripMenuItem_Click).
+                case System.Windows.Input.Key.F: MainPanel?.ToggleSearchPanel(); break;
                 default:
                     if (e.Key >= System.Windows.Input.Key.D0 && e.Key <= System.Windows.Input.Key.D9)
                     {
@@ -1000,6 +1002,28 @@ namespace HaRepacker.GUI
         private void UpdateSelectedMainPanelTab()
         {
             if (tabControl_MainPanels.SelectedItem is TabItem selectedTab && selectedTab.Content is MainPanel panel) MainPanel = panel;
+
+            // Each tab tracks its own selection, so the status bar's type has to be re-read from
+            // whichever panel just became active - otherwise it keeps showing the old tab's node.
+            RefreshSelectedWzTypeLabel();
+        }
+
+        /// <summary>
+        /// Shows the active tab's selected node type next to "Ready". Blank when that tab has
+        /// nothing selected.
+        /// </summary>
+        private void RefreshSelectedWzTypeLabel()
+        {
+            string typeName = MainPanel?.SelectedWzTypeName;
+            statusLabel_SelectedWzType.Text = string.IsNullOrEmpty(typeName) ? string.Empty : "Type: " + typeName;
+        }
+
+        private void MainPanel_SelectedWzTypeNameChanged(object sender, EventArgs e)
+        {
+            // Only the visible tab may drive the label; a background tab parsing a file must not
+            // overwrite what the user is looking at.
+            if (ReferenceEquals(sender, MainPanel))
+                RefreshSelectedWzTypeLabel();
         }
 
         /// <summary>
@@ -1023,6 +1047,7 @@ namespace HaRepacker.GUI
             }
 
             MainPanel panel = new MainPanel(this);
+            panel.SelectedWzTypeNameChanged += MainPanel_SelectedWzTypeNameChanged;
             TabItem tabPage = new TabItem { Content = panel };
 
 

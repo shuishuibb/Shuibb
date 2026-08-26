@@ -23,6 +23,15 @@ namespace SkillPreview
     /// </summary>
     public sealed class NodeEditorPanel : UserControl
     {
+        /// <summary>
+        /// Stands in for the card built from a node's own loose scalar properties. That card's
+        /// Title is the node's own unique name (e.g. a Consume item's "2040000"), so matching by
+        /// Title could never line two different items up; every loose card sharing this one key
+        /// is what makes "copy 2040000's own fields, paste onto 2040001" work. Not a legal WZ
+        /// property name, so it can never collide with a real card Title.
+        /// </summary>
+        private const string LooseMatchKey = "\0LOOSE";
+
         private const double LabelColumnWidth = 118.0;
         private const double FieldHeight = 28.0;
         private const double CardCorner = 8.0;
@@ -66,7 +75,7 @@ namespace SkillPreview
             // onto 2040001" actually works - the bug reported for Consume items, whose fields sit
             // directly on the item instead of under a shared sub-container like Equip's "info".
             public bool IsLooseFieldsCard;
-            public string MatchKey => IsLooseFieldsCard ? "\0LOOSE" : Title;
+            public string MatchKey => IsLooseFieldsCard ? LooseMatchKey : Title;
 
             public readonly Dictionary<string, TextBox> Fields = new Dictionary<string, TextBox>();
 
@@ -728,45 +737,45 @@ namespace SkillPreview
         }
 
         /// <summary>
-        /// Applies previously-copied (name, text) pairs onto this card's same-named fields,
-        /// writing each one straight into its WZ property - a confirmed Ctrl+V is the commit, so
-        /// 儲存數值 is not needed afterwards.
-        ///
-        /// Deliberately walks <see cref="copiedFields"/> rather than binding.Fields (which is what
-        /// <see cref="SaveGroup"/> does): only the fields this paste actually carries may be
-        /// written. Any *other* box on the card the user had typed into but not yet saved stays
-        /// staged and untouched - a paste must never commit edits the user hasn't confirmed.
-        ///
-        /// Returns exactly the properties that were really written - the caller marks those, and
-        /// only those, as changed in the tree. A property whose value the type rejected is not in
-        /// the list, so a half-successful paste only reddens the half that landed.
+        /// Finds the container on <paramref name="targetObject"/> that the staged copy belongs
+        /// in, by the same MatchKey the cards use: a loose-fields copy goes onto the target's own
+        /// scalar properties, a named card's copy goes into the target's same-named sub-container
+        /// (so an "info" copy can only ever land in another item's "info", never in spec or icon).
+        /// Null when this target has no such container.
         /// </summary>
-        private List<WzImageProperty> PasteFields(GroupBinding binding)
+        private IPropertyContainer ResolveMatchingCardOn(WzObject targetObject)
         {
-            var changedProperties = new List<WzImageProperty>();
+            IPropertyContainer editable = ResolveEditableNode(targetObject, out _);
+            if (editable == null)
+                return null;
 
-            if (copiedFields == null || copiedFields.Count == 0)
-            {
-                statusText.Text = "剪貼簿是空的，請先在某張卡片點選欄位名稱再按 Ctrl+C。";
-                return changedProperties;
-            }
-            if (!string.Equals(copiedFieldsSourceMatchKey, binding.MatchKey, StringComparison.Ordinal))
-            {
-                statusText.Text = "複製的欄位來自「" + copiedFieldsSourceDisplayTitle + "」，無法貼到「" + DisplayTitleFor(binding) + "」。";
-                return changedProperties;
-            }
+            if (string.Equals(copiedFieldsSourceMatchKey, LooseMatchKey, StringComparison.Ordinal))
+                return editable;
 
-            int missing = 0;
-            int failed = 0;
+            return ((WzImageProperty)editable)[copiedFieldsSourceMatchKey] as IPropertyContainer;
+        }
+
+        /// <summary>
+        /// Writes the staged copy into one container, straight into the WZ - a confirmed Ctrl+V is
+        /// the commit, so 儲存數值 is not needed afterwards.
+        ///
+        /// Deliberately walks <see cref="copiedFields"/> rather than every property on the
+        /// container (which is what <see cref="SaveGroup"/> does): only the fields this paste
+        /// actually carries may be written. Any *other* value the user had typed into a box but
+        /// not yet saved stays staged and untouched - a paste must never commit edits the user
+        /// hasn't confirmed.
+        ///
+        /// Adds exactly the properties it really wrote to <paramref name="changedProperties"/> -
+        /// the caller marks those, and only those, as changed in the tree. A value the property's
+        /// type rejected is not added, so a half-successful paste only reddens the half that
+        /// landed.
+        /// </summary>
+        private void ApplyCopiedFieldsTo(IPropertyContainer card, List<WzImageProperty> changedProperties,
+            ref int missing, ref int failed)
+        {
             foreach ((string name, string value) in copiedFields)
             {
-                if (!binding.Fields.TryGetValue(name, out TextBox box))
-                {
-                    missing++;
-                    continue;
-                }
-
-                WzImageProperty target = ((WzImageProperty)binding.Container)[name];
+                WzImageProperty target = ((WzImageProperty)card)[name];
                 if (target == null)
                 {
                     missing++;
@@ -784,24 +793,26 @@ namespace SkillPreview
                 // The whole .img still has to be marked dirty so the file saves correctly, even
                 // though only this leaf property is what the tree will show in red.
                 target.ParentImage.Changed = true;
-                box.Text = value; // keep the box showing what the WZ now actually holds
                 changedProperties.Add(target);
             }
+        }
 
-            if (changedProperties.Count > 0)
-                NodeChanged?.Invoke(this, EventArgs.Empty);
+        /// <summary>
+        /// Mirrors what was just written into the boxes the user can actually see. Only the node
+        /// currently on screen has boxes at all - the other targets of a batch paste are edited
+        /// straight in the WZ with no UI built for them.
+        /// </summary>
+        private void SyncDisplayedBoxes(IPropertyContainer card)
+        {
+            GroupBinding displayed = groups.FirstOrDefault(g => ReferenceEquals(g.Container, card));
+            if (displayed == null)
+                return;
 
-            // A clean paste says nothing - the new values showing up in the boxes is the
-            // feedback. Only a partial one still reports, since a field being silently dropped
-            // would otherwise be invisible.
-            var notes = new List<string>();
-            if (failed > 0)
-                notes.Add("有 " + failed + " 個欄位因型別不符沒有寫入");
-            if (missing > 0)
-                notes.Add("有 " + missing + " 個欄位在「" + DisplayTitleFor(binding) + "」找不到同名欄位，已略過");
-            statusText.Text = notes.Count > 0 ? string.Join("，", notes) + "。" : string.Empty;
-
-            return changedProperties;
+            foreach ((string name, string value) in copiedFields)
+            {
+                if (displayed.Fields.TryGetValue(name, out TextBox box))
+                    box.Text = value;
+            }
         }
 
         // ---- global Ctrl+C / Ctrl+V routing (MainForm.MainWindow_PreviewKeyDown) ----------------
@@ -866,33 +877,84 @@ namespace SkillPreview
         }
 
         /// <summary>
-        /// Applies the staged field copy onto the currently displayed node's card of the same
-        /// kind (matched by MatchKey, so a Consume item's own loose fields land on another item's
-        /// loose fields - see GroupBinding.MatchKey), writing each value straight into its WZ
-        /// property. Only call after <see cref="HasCopiedFields"/> is true and the user has
-        /// confirmed - this does no prompting of its own. When the current node has no matching
-        /// card, this says so and leaves the copy staged; it never falls back to anything
-        /// tree-level.
+        /// Applies the staged field copy onto every given target, writing each value straight
+        /// into its WZ property. One call handles the whole tree selection, so the caller prompts
+        /// once and pastes into all of them - targets other than the one on screen are edited
+        /// directly on their WzObject, with no panel rebuild, no selection change and no UI built
+        /// for them.
+        ///
+        /// Each target is matched by the same MatchKey the cards use, so a Consume item's own
+        /// loose fields land on another item's loose fields, and an "info" copy only ever lands in
+        /// another item's "info". Only call after <see cref="HasCopiedFields"/> is true and the
+        /// user has confirmed - this does no prompting of its own, and never falls back to
+        /// anything tree-level.
         /// </summary>
         /// <returns>
-        /// The WZ properties this paste actually wrote - empty when nothing changed (no staged
-        /// copy, no matching card, or every value was rejected by its property's type). The
-        /// caller marks exactly these leaf properties' tree nodes as changed; returning the
-        /// properties rather than a count is what keeps the red off their parents.
+        /// The WZ properties this paste actually wrote, across all targets - empty when nothing
+        /// changed (no staged copy, no matching card anywhere, or every value was rejected by its
+        /// property's type). The caller marks exactly these leaf properties' tree nodes as
+        /// changed; returning the properties rather than a count is what keeps the red off their
+        /// parents.
         /// </returns>
-        public IReadOnlyList<WzImageProperty> PasteCopiedFieldsShortcut()
+        public IReadOnlyList<WzImageProperty> PasteCopiedFieldsToTargets(IReadOnlyList<WzObject> targets)
         {
-            if (!HasCopiedFields)
+            if (!HasCopiedFields || targets == null || targets.Count == 0)
                 return Array.Empty<WzImageProperty>();
 
-            GroupBinding target = groups.FirstOrDefault(g => string.Equals(g.MatchKey, copiedFieldsSourceMatchKey, StringComparison.Ordinal));
-            if (target == null)
+            var changedProperties = new List<WzImageProperty>();
+            int missing = 0;
+            int failed = 0;
+            int targetsWithCard = 0;
+            int targetsWritten = 0;
+
+            foreach (WzObject target in targets)
             {
-                statusText.Text = "複製的欄位來自「" + copiedFieldsSourceDisplayTitle + "」，目前節點沒有同類卡片可以貼上。";
-                return Array.Empty<WzImageProperty>();
+                if (target == null)
+                    continue;
+
+                IPropertyContainer card = ResolveMatchingCardOn(target);
+                if (card == null)
+                    continue;
+
+                targetsWithCard++;
+                int before = changedProperties.Count;
+                ApplyCopiedFieldsTo(card, changedProperties, ref missing, ref failed);
+                if (changedProperties.Count > before)
+                    targetsWritten++;
+
+                // No-op unless this target happens to be the node currently on screen.
+                SyncDisplayedBoxes(card);
             }
 
-            return PasteFields(target);
+            if (changedProperties.Count > 0)
+                NodeChanged?.Invoke(this, EventArgs.Empty);
+
+            statusText.Text = SummarizePaste(targets.Count, targetsWithCard, targetsWritten, missing, failed);
+            return changedProperties;
+        }
+
+        /// <summary>
+        /// A clean paste says nothing - the new values showing up is the feedback. Anything
+        /// skipped is reported once for the whole batch, never per target.
+        /// </summary>
+        private string SummarizePaste(int targetCount, int targetsWithCard, int targetsWritten, int missing, int failed)
+        {
+            // Nothing even had somewhere to put the values - a different message from "the field
+            // was there but the value didn't fit", which the notes below cover.
+            if (targetsWithCard == 0)
+                return "複製的欄位來自「" + copiedFieldsSourceDisplayTitle + "」，選取的節點沒有同類卡片可以貼上。";
+
+            if (missing == 0 && failed == 0 && targetsWritten == targetCount)
+                return string.Empty;
+
+            var notes = new List<string>();
+            if (targetCount > 1)
+                notes.Add(targetsWritten + " 個節點已寫入，" + (targetCount - targetsWritten) + " 個略過");
+            if (failed > 0)
+                notes.Add("有 " + failed + " 個欄位因型別不符沒有寫入");
+            if (missing > 0)
+                notes.Add("有 " + missing + " 個欄位找不到同名欄位，已略過");
+            return notes.Count > 0 ? string.Join("，", notes) + "。" : string.Empty;
         }
 
         private static TextBox FieldBox(EditorTheme theme, string value, bool multiline)
