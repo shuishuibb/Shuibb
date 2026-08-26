@@ -910,6 +910,12 @@ namespace HaRepacker.GUI.Panels
             {
                 ParseOnDataTreeSelectedItem(((WzNode)DataTree.SelectedNode), true);
             }
+
+            // The node may only have become a real WzImage just now, and the editors were picked
+            // back when it was still a reference. Re-run the display so a WorldMap opens on the
+            // double-click that resolved it, instead of needing the user to click away and back.
+            if (DataTree.SelectedNode is WzNode resolvedNode)
+                ShowSelectedDataTreeNode(resolvedNode);
         }
 
         private void DataTree_AfterSelect(object sender, System.Windows.Forms.TreeViewEventArgs e)
@@ -4463,6 +4469,118 @@ namespace HaRepacker.GUI.Panels
         /// </summary>
         private SkillPreview.NodeEditorPanel nodeEditorPanel;
 
+        /// <summary>
+        /// The WorldMap visual editor, parked in the same container as the other editors. Takes
+        /// priority over them: a WorldMap*.img is also an ordinary image, so without this it
+        /// would fall through to the generic panels.
+        /// </summary>
+        private HaRepacker.GUI.WorldMap.WorldMapEditorPanel worldMapEditorPanel;
+
+        private bool ShowWorldMapEditorIfApplicable(WzObject obj)
+        {
+            if (!HaRepacker.GUI.WorldMap.WorldMapDetector.IsWorldMapImage(obj))
+            {
+                if (worldMapEditorPanel != null)
+                    worldMapEditorPanel.Visibility = Visibility.Collapsed;
+                return false;
+            }
+
+            if (worldMapEditorPanel == null)
+            {
+                worldMapEditorPanel = new HaRepacker.GUI.WorldMap.WorldMapEditorPanel();
+                worldMapEditorPanel.Visibility = Visibility.Collapsed;
+                worldMapEditorPanel.PropertiesChanged += WorldMapEditor_PropertiesChanged;
+                worldMapEditorPanel.NavigationRequested += WorldMapEditor_NavigationRequested;
+                worldMapEditorPanel.WorldMapSiblingProvider = GetWorldMapSiblings;
+                grid1.Children.Add(worldMapEditorPanel);
+            }
+
+            bool loaded = worldMapEditorPanel.TryLoad(obj);
+            worldMapEditorPanel.Visibility = loaded ? Visibility.Visible : Visibility.Collapsed;
+            return loaded;
+        }
+
+        /// <summary>
+        /// Reddens exactly the leaf properties a WorldMap edit wrote - the spot vector, a type, a
+        /// mapNo entry - never their MapList / mapNo parents. Same mechanism the property editor's
+        /// paste uses; no second changed-colour system.
+        /// </summary>
+        private void WorldMapEditor_PropertiesChanged(object sender, IReadOnlyList<WzImageProperty> changedProperties)
+        {
+            if (changedProperties == null || changedProperties.Count == 0)
+                return;
+
+            bool marked = false;
+            foreach (WzImageProperty property in changedProperties)
+            {
+                if (property?.HRTag is not WzNode propertyNode)
+                    continue;
+
+                propertyNode.ChangedNodeProperty();
+                marked = true;
+            }
+
+            // Repaints the items that exist in the WPF mirror. Deliberately not
+            // RefreshNativeDataTree() - dragging a spot must not rebuild the whole tree.
+            if (marked)
+                UpdateNativeSelectionVisuals();
+        }
+
+        /// <summary>
+        /// Moves the tree onto the requested WorldMap image so both halves stay in step - the
+        /// editor never swaps its own picture behind the tree's back. Reuses the normal selection
+        /// path, which then re-runs ShowObjectValue and reloads the editor.
+        /// </summary>
+        private void WorldMapEditor_NavigationRequested(object sender, string targetImageName)
+        {
+            if (string.IsNullOrEmpty(targetImageName) || DataTree.SelectedNode is not WzNode currentNode)
+                return;
+
+            if (currentNode.Parent is not WzNode directoryNode)
+                return;
+
+            foreach (WzNode sibling in directoryNode.Nodes.OfType<WzNode>())
+            {
+                if (!string.Equals(sibling.Text, targetImageName, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                // The target may still be a lightweight IMG reference; resolve and parse it the
+                // same way double-clicking would before handing it to the editor.
+                TryResolveImgFilesystemImageNode(sibling, out _);
+                if (sibling.Tag is WzImage image && !image.Parsed)
+                    ParseOnDataTreeSelectedItem(sibling, false);
+
+                SelectAndRevealNativeNode(sibling);
+                return;
+            }
+
+            BatchInfo("在同一個 WorldMap 目錄中找不到 " + targetImageName + "。");
+        }
+
+        /// <summary>
+        /// The WorldMap images sitting alongside the one being edited, for the double-click
+        /// forward match. Walks the tree rather than the WzDirectory so lazily-referenced IMG
+        /// files are included, and touches only this directory - never the rest of the WZ.
+        /// </summary>
+        private IReadOnlyList<WzImage> GetWorldMapSiblings()
+        {
+            var siblings = new List<WzImage>();
+            if (DataTree.SelectedNode is not WzNode currentNode || currentNode.Parent is not WzNode directoryNode)
+                return siblings;
+
+            foreach (WzNode sibling in directoryNode.Nodes.OfType<WzNode>())
+            {
+                if (sibling.Text == null || !sibling.Text.StartsWith(
+                        HaRepacker.GUI.WorldMap.WorldMapDetector.WorldMapDirectoryName, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                TryResolveImgFilesystemImageNode(sibling, out _);
+                if (sibling.Tag is WzImage image)
+                    siblings.Add(image);
+            }
+            return siblings;
+        }
+
         private void ShowNodeEditorIfApplicable(WzObject obj)
         {
             if (skillPreviewPanel != null && skillPreviewPanel.Visibility == Visibility.Visible)
@@ -4576,13 +4694,29 @@ namespace HaRepacker.GUI.Panels
                 // Avalon Text editor
                 textEditor.Visibility = Visibility.Collapsed;
 
-                // Skill range / effect preview - shown in place of the other editors whenever
-                // the selection resolves to a skill (a node owning a "level" container).
-                ShowSkillPreviewIfApplicable(obj);
+                // WorldMap*.img under a WorldMap directory gets the visual world map editor, and
+                // it outranks the others: a world map is also an ordinary image, so letting the
+                // generic panels see it first would hide the map behind a field list.
+                if (ShowWorldMapEditorIfApplicable(obj))
+                {
+                    if (skillPreviewPanel != null)
+                    {
+                        skillPreviewPanel.Visibility = Visibility.Collapsed;
+                        skillPreviewPanel.StopPlayback();
+                    }
+                    if (nodeEditorPanel != null)
+                        nodeEditorPanel.Visibility = Visibility.Collapsed;
+                }
+                else
+                {
+                    // Skill range / effect preview - shown in place of the other editors whenever
+                    // the selection resolves to a skill (a node owning a "level" container).
+                    ShowSkillPreviewIfApplicable(obj);
 
-                // Ordinary entities (an item code, a mob, an npc) get the inline field editor.
-                // Runs after the skill check so a skill keeps its own richer panel.
-                ShowNodeEditorIfApplicable(obj);
+                    // Ordinary entities (an item code, a mob, an npc) get the inline field editor.
+                    // Runs after the skill check so a skill keeps its own richer panel.
+                    ShowNodeEditorIfApplicable(obj);
+                }
 
                 // vars
                 bool bIsWzFile = obj is WzFile file;

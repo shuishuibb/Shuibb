@@ -28,6 +28,7 @@
     <Project Path="tests/svtest/svtest.csproj" />
     <Project Path="tests/switchtest/switchtest.csproj" />
     <Project Path="tests/typeahead/typeahead.csproj" />
+    <Project Path="tests/worldmapeditor/worldmapeditor.csproj" />
   </Folder>
   <Folder Name="/tools/">
     <Project Path="tools/iltransplant/iltransplant.csproj" />
