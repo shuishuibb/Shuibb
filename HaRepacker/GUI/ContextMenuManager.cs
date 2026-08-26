@@ -1,6 +1,8 @@
 ﻿using HaRepacker.GUI;
+using HaRepacker.GUI.EquipmentStringInfo;
 using HaRepacker.GUI.Input;
 using HaRepacker.GUI.MapObjectInfo;
+using HaRepacker.GUI.NpcInfo;
 using HaRepacker.GUI.Panels;
 using MapleLib.Img;
 using MapleLib.WzLib;
@@ -86,6 +88,14 @@ namespace HaRepacker
         // Read-only map summary (mapMark/bgm/back/tile/obj/npc/mob/reactor); see
         // HaRepacker\GUI\MapObjectInfo\.
         private ToolStripMenuItem MapObjectInfoMenuItem;
+
+        // Read-only NPC summary (id/name/String extras/wz path/animations); see
+        // HaRepacker\GUI\NpcInfo\.
+        private ToolStripMenuItem NpcInfoMenuItem;
+
+        // Read-only equipment String.wz cross-reference (id/name/wz path/String source(s)); see
+        // HaRepacker\GUI\EquipmentStringInfo\.
+        private ToolStripMenuItem EquipmentStringInfoMenuItem;
 
         /*private ToolStripMenuItem ExportPropertySubMenu;
         private ToolStripMenuItem ExportAnimationSubMenu;
@@ -195,6 +205,10 @@ namespace HaRepacker
             AskAiAboutNode = new ToolStripMenuItem("AI 助手（詢問這個節點）...", null, new EventHandler(AskAiAboutNode_Click));
 
             MapObjectInfoMenuItem = new ToolStripMenuItem("地圖物件資訊", null, new EventHandler(MapObjectInfo_Click));
+
+            NpcInfoMenuItem = new ToolStripMenuItem("NPC 詳細資訊", null, new EventHandler(NpcInfo_Click));
+
+            EquipmentStringInfoMenuItem = new ToolStripMenuItem("裝備 String 資訊", null, new EventHandler(EquipmentStringInfo_Click));
 
             AddSortMenu = new ToolStripMenuItem(UiLocalization.Translate("Sort"), Properties.Resources.sort, SortAllChildViewNode, SortPropertiesByName);
 
@@ -582,6 +596,41 @@ namespace HaRepacker
         }
 
         /// <summary>
+        /// Opens the read-only "NPC 詳細資訊" summary for the right-clicked NPC WzImage. Purely a
+        /// read + a modal window: no WzObject is touched, and String.wz is only consulted if it's
+        /// already among Program.WzFileManager.WzFileList - nothing is loaded on demand.
+        /// </summary>
+        private void NpcInfo_Click(object sender, EventArgs e)
+        {
+            if (!NpcInfoBuilder.TryGetNpcImage(currNode, out WzImage npcImage, out string npcId))
+                return; // CreateMenu only offers this item for a valid NPC image; this is the same safety net at click time.
+
+            IReadOnlyCollection<WzFile> loadedWzFiles =
+                Program.WzFileManager?.WzFileList ?? (IReadOnlyCollection<WzFile>)Array.Empty<WzFile>();
+            NpcInfoResult result = NpcInfoBuilder.Build(npcImage, npcId, loadedWzFiles);
+
+            NpcInfoWindow.Show(result);
+        }
+
+        /// <summary>
+        /// Opens the read-only "裝備 String 資訊" summary for the right-clicked equipment
+        /// WzImage. Purely a read + a modal window: no WzObject is touched, and every currently
+        /// loaded String.wz-shaped WzFile is checked (not just the first) - nothing is loaded on
+        /// demand.
+        /// </summary>
+        private void EquipmentStringInfo_Click(object sender, EventArgs e)
+        {
+            if (!EquipmentStringInfoBuilder.TryGetEquipmentImage(currNode, out WzImage equipImage, out string itemId))
+                return; // CreateMenu only offers this item for a valid equipment image; this is the same safety net at click time.
+
+            IReadOnlyCollection<WzFile> loadedWzFiles =
+                Program.WzFileManager?.WzFileList ?? (IReadOnlyCollection<WzFile>)Array.Empty<WzFile>();
+            EquipmentStringInfoResult result = EquipmentStringInfoBuilder.Build(equipImage, itemId, loadedWzFiles);
+
+            EquipmentStringInfoWindow.Show(result);
+        }
+
+        /// <summary>
         /// The tree's own multi-selection (TreeViewMS.SelectedNodes) if it has anything, else the
         /// single node this context menu was actually built for. A plain right-click collapses
         /// TreeViewMS's selection to just the clicked node (see TreeViewMS.OnAfterSelect), so in
@@ -747,6 +796,22 @@ namespace HaRepacker
                     toolStripmenuItems.Add(MapObjectInfoMenuItem);
                     break;
                 }
+            }
+
+            // Only offered when the right-clicked node is itself a valid NPC WzImage - see
+            // NpcInfoBuilder.IsNpcImageNode. Single-node only (no multi-select union), matching
+            // this feature's "選取一個 NPC WzImage" scope.
+            if (NpcInfoBuilder.IsNpcImageNode(node))
+            {
+                toolStripmenuItems.Add(NpcInfoMenuItem);
+            }
+
+            // Only offered when the right-clicked node is itself a valid equipment WzImage - see
+            // EquipmentStringInfoBuilder.IsEquipmentImageNode. Single-node only, same scope as
+            // NPC 詳細資訊.
+            if (EquipmentStringInfoBuilder.IsEquipmentImageNode(node))
+            {
+                toolStripmenuItems.Add(EquipmentStringInfoMenuItem);
             }
 
             if (Tag is WzCanvasProperty)

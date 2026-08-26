@@ -16,7 +16,9 @@
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/derivetest/derivetest.csproj" />
+    <Project Path="tests/equipmentstringinfo/equipmentstringinfo.csproj" />
     <Project Path="tests/mapobjectinfo/mapobjectinfo.csproj" />
+    <Project Path="tests/npcinfo/npcinfo.csproj" />
     <Project Path="tests/nodetest/nodetest.csproj" />
     <Project Path="tests/opentwice/opentwice.csproj" />
     <Project Path="tests/svtest/svtest.csproj" />

@@ -1,0 +1,68 @@
+<gui:ThemedDialogWindow x:Class="HaRepacker.GUI.NpcInfo.NpcInfoWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:gui="clr-namespace:HaRepacker.GUI"
+        Title="NPC 詳細資訊"
+        Width="600" Height="680" MinWidth="420" MinHeight="360"
+        WindowStartupLocation="CenterOwner" ResizeMode="CanResize"
+        Background="{DynamicResource HareCanvasBrush}"
+        Foreground="{DynamicResource HareTextBrush}" FontFamily="Segoe UI" FontSize="13">
+    <gui:ThemedDialogWindow.Resources>
+        <ResourceDictionary><ResourceDictionary.MergedDictionaries>
+            <ResourceDictionary Source="/HaSharedLibrary;component/GUI/Themes/HarepackerTheme.xaml"/>
+        </ResourceDictionary.MergedDictionaries></ResourceDictionary>
+    </gui:ThemedDialogWindow.Resources>
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <Grid Grid.Row="0" Margin="0,0,0,14">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" Text="NPC 詳細資訊" Style="{StaticResource HarePageTitleStyle}" VerticalAlignment="Center"/>
+            <StackPanel Grid.Column="1" Orientation="Horizontal">
+                <Button x:Name="copyButton" Content="複製" Width="90" Style="{StaticResource HarePrimaryButtonStyle}" Click="CopyButton_Click"/>
+                <Button x:Name="closeButton" Content="關閉" Width="90" Margin="8,0,0,0" IsCancel="True" Click="CloseButton_Click"/>
+            </StackPanel>
+        </Grid>
+
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+            <StackPanel>
+                <Border Style="{StaticResource HareCardStyle}" Margin="0,0,0,10">
+                    <StackPanel>
+                        <TextBlock Text="NPC ID" Style="{StaticResource HareSectionTitleStyle}"/>
+                        <TextBlock x:Name="npcIdText" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                    </StackPanel>
+                </Border>
+                <Border Style="{StaticResource HareCardStyle}" Margin="0,0,0,10">
+                    <StackPanel>
+                        <TextBlock Text="NPC 名稱" Style="{StaticResource HareSectionTitleStyle}"/>
+                        <TextBlock x:Name="npcNameText" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                    </StackPanel>
+                </Border>
+                <Border Style="{StaticResource HareCardStyle}" Margin="0,0,0,10">
+                    <StackPanel>
+                        <TextBlock Text="NPC String 額外資訊" Style="{StaticResource HareSectionTitleStyle}"/>
+                        <TextBlock x:Name="stringExtrasText" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                    </StackPanel>
+                </Border>
+                <Border Style="{StaticResource HareCardStyle}" Margin="0,0,0,10">
+                    <StackPanel>
+                        <TextBlock Text="NPC WZ 路徑" Style="{StaticResource HareSectionTitleStyle}"/>
+                        <TextBlock x:Name="wzPathText" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                    </StackPanel>
+                </Border>
+                <Border Style="{StaticResource HareCardStyle}" Margin="0,0,0,0">
+                    <StackPanel>
+                        <TextBlock Text="動作 / Animation 名稱" Style="{StaticResource HareSectionTitleStyle}"/>
+                        <TextBlock x:Name="animationsText" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+        </ScrollViewer>
+    </Grid>
+</gui:ThemedDialogWindow>
