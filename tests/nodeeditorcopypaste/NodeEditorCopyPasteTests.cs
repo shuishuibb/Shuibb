@@ -21,7 +21,8 @@ namespace NodeEditorCopyPasteTests;
 ///
 ///   HasSelectedFields / HasCopiedFields  - which clipboard the keystroke belongs to
 ///   CopySelectedFieldsShortcut()         - stage the selected fields
-///   PasteCopiedFieldsShortcut()          - apply them to the current node's matching card
+///   PasteCopiedFieldsShortcut()          - write them straight into the current node's matching
+///                                          card's WZ properties, returning how many were written
 ///   ClearCopiedFields()                  - "last Ctrl+C wins", called from MainPanel.DoCopy()
 ///
 /// SCOPE - what these tests do NOT cover, and must not be cited as proof of:
@@ -29,8 +30,11 @@ namespace NodeEditorCopyPasteTests;
 ///   * the 是否複製 / 是否貼上 confirmation prompts (Warning.Warn), which live in HaRepacker
 ///     and are deliberately not reachable from this project,
 ///   * IsValueTextBoxFocused's real behaviour with live keyboard focus in a TextBox,
-///   * anything about the tree's own DoCopy/DoPaste.
-/// Those are keyboard/confirmation UI behaviour and are verified manually.
+///   * anything about the tree's own DoCopy/DoPaste,
+///   * the target tree node turning red after a paste - that is MainPanel calling
+///     WzNode.ChangedNodeProperty() on the strength of the count returned here, and there is no
+///     tree in this project at all.
+/// Those are keyboard/confirmation/tree UI behaviour and are verified manually.
 ///
 /// No GUI is driven here - no window, no message pump, no simulated clicks or key presses.
 /// These call the panel's public API directly against in-memory WzSubProperty fixtures, and use
@@ -62,6 +66,23 @@ public sealed class NodeEditorCopyPasteTests
     // ---- fixture builders --------------------------------------------------------------------
 
     /// <summary>
+    /// Parents an item under a real WzImage, the way batched Item.wz storage holds many item
+    /// codes in one .img. Required, not cosmetic: a paste now writes through to the WZ and
+    /// touches prop.ParentImage.Changed, which only resolves when there is a WzImage ancestor -
+    /// exactly as in the running editor. Changed is reset afterwards so tests can tell a paste's
+    /// dirty-marking apart from the one AddProperty does while the fixture is being built.
+    /// </summary>
+    private static WzSubProperty AttachToImage(WzSubProperty item, string imageName)
+    {
+        var image = new WzImage(imageName);
+        image.AddProperty(item);
+        image.Changed = false;
+        return item;
+    }
+
+    private static WzImage ImageOf(WzSubProperty item) => ((WzImageProperty)item).ParentImage;
+
+    /// <summary>
     /// A Consume-style item: fields sit directly on the item's own WzSubProperty (batched
     /// Item.wz storage), which is what made the loose-fields card's Title the item's own unique
     /// code (e.g. "2040000") rather than a shared category name - see GroupBinding.MatchKey.
@@ -71,7 +92,7 @@ public sealed class NodeEditorCopyPasteTests
         var item = new WzSubProperty(itemId);
         foreach ((string name, int value) in looseFields)
             item.AddProperty(new WzIntProperty(name, value));
-        return item;
+        return AttachToImage(item, "0202.img");
     }
 
     /// <summary>An Equip-style item: fields sit under a shared "info" sub-container.</summary>
@@ -82,7 +103,7 @@ public sealed class NodeEditorCopyPasteTests
         foreach ((string name, int value) in infoFields)
             info.AddProperty(new WzIntProperty(name, value));
         item.AddProperty(info);
-        return item;
+        return AttachToImage(item, itemId + ".img");
     }
 
     /// <summary>
@@ -95,7 +116,19 @@ public sealed class NodeEditorCopyPasteTests
         var spec = new WzSubProperty("spec");
         spec.AddProperty(new WzIntProperty("someField", 1));
         item.AddProperty(spec);
-        return item;
+        return AttachToImage(item, "0202.img");
+    }
+
+    /// <summary>Reads a scalar straight out of the WZ, bypassing the panel entirely.</summary>
+    private static int IntValueOf(WzSubProperty owner, string path)
+    {
+        WzImageProperty prop = owner;
+        foreach (string step in path.Split('/'))
+        {
+            prop = prop[step];
+            Assert.True(prop != null, "fixture has no property at '" + path + "'");
+        }
+        return Assert.IsType<WzIntProperty>(prop).Value;
     }
 
     // ---- reflection helpers (see class doc comment for why) ----------------------------------
@@ -173,12 +206,20 @@ public sealed class NodeEditorCopyPasteTests
         // Clicking another item in the tree rebuilds the panel for it, same as
         // MainPanel.ShowNodeEditorIfApplicable does on every selection change. Nothing needs to
         // be (re)selected on the target - the staged copy survives the rebuild on purpose.
-        Assert.True(panel.TryLoad(MakeConsumeItem("2020001", ("price", 1), ("slotMax", 2)), null));
+        WzSubProperty target = MakeConsumeItem("2020001", ("price", 1), ("slotMax", 2));
+        Assert.True(panel.TryLoad(target, null));
         Assert.False(panel.HasSelectedFields);
         Assert.True(panel.HasCopiedFields); // so MainForm's Ctrl+V takes the field branch
 
-        panel.PasteCopiedFieldsShortcut();
+        Assert.Equal(2, panel.PasteCopiedFieldsShortcut());
 
+        // The WZ properties themselves are already updated - 儲存數值 is NOT pressed anywhere in
+        // this test. This is the behaviour change: a confirmed Ctrl+V is the commit.
+        Assert.Equal(210, IntValueOf(target, "price"));
+        Assert.Equal(500, IntValueOf(target, "slotMax"));
+        Assert.True(ImageOf(target).Changed);
+
+        // ...and the boxes show what the WZ now actually holds.
         object targetCard = LooseCard(panel);
         Assert.Equal("210", Fields(targetCard)["price"].Text);
         Assert.Equal("500", Fields(targetCard)["slotMax"].Text);
@@ -190,6 +231,78 @@ public sealed class NodeEditorCopyPasteTests
     });
 
     [Fact]
+    public void Paste_WritesOnlyTheCopiedFields_LeavingOtherStagedEditsUncommitted() => RunSta(() =>
+    {
+        // The reason a paste must not just call SaveGroup: SaveGroup walks the whole card, which
+        // would also commit a box the user had typed into but not yet confirmed with 儲存數值.
+        var panel = new NodeEditorPanel();
+
+        Assert.True(panel.TryLoad(MakeConsumeItem("2040000", ("price", 100), ("slotMax", 200)), null));
+        object sourceCard = LooseCard(panel);
+        Fields(sourceCard)["slotMax"].Text = "9999";
+        Selected(sourceCard).Add("slotMax"); // clipboard carries slotMax only
+        panel.CopySelectedFieldsShortcut();
+
+        WzSubProperty target = MakeConsumeItem("2040001", ("price", 1), ("slotMax", 2));
+        Assert.True(panel.TryLoad(target, null));
+
+        // An unconfirmed hand edit sitting in a box the paste does not carry.
+        Fields(LooseCard(panel))["price"].Text = "999";
+
+        Assert.Equal(1, panel.PasteCopiedFieldsShortcut());
+
+        Assert.Equal(9999, IntValueOf(target, "slotMax")); // the pasted field was written
+        Assert.Equal(1, IntValueOf(target, "price"));      // the staged hand edit was NOT
+        Assert.Equal("999", Fields(LooseCard(panel))["price"].Text); // still staged, untouched
+    });
+
+    [Fact]
+    public void Paste_TypeMismatch_LeavesTargetPropertyAlone_AndReportsNothingWritten() => RunSta(() =>
+    {
+        var panel = new NodeEditorPanel();
+
+        Assert.True(panel.TryLoad(MakeConsumeItem("2040000", ("price", 100)), null));
+        object sourceCard = LooseCard(panel);
+        Fields(sourceCard)["price"].Text = "abc"; // never parses into the target's WzIntProperty
+        Selected(sourceCard).Add("price");
+        panel.CopySelectedFieldsShortcut();
+
+        WzSubProperty target = MakeConsumeItem("2040001", ("price", 1));
+        Assert.True(panel.TryLoad(target, null));
+
+        // Nothing written -> MainPanel must not mark the target tree node as changed.
+        Assert.Equal(0, panel.PasteCopiedFieldsShortcut());
+        Assert.Equal(1, IntValueOf(target, "price"));
+        Assert.False(ImageOf(target).Changed);
+        Assert.Contains("型別不符", StatusText(panel));
+    });
+
+    [Fact]
+    public void Paste_NeverAddsOrRemovesNodes_OnEitherSide() => RunSta(() =>
+    {
+        // Guards the original bug from the other direction: a field paste must only ever change
+        // values in place - never insert the source item under the target, never touch the source.
+        var panel = new NodeEditorPanel();
+
+        WzSubProperty source = MakeConsumeItem("2040000", ("price", 100));
+        Assert.True(panel.TryLoad(source, null));
+        Fields(LooseCard(panel))["price"].Text = "777";
+        Selected(LooseCard(panel)).Add("price");
+        panel.CopySelectedFieldsShortcut();
+
+        WzSubProperty target = MakeConsumeItem("2040001", ("price", 1));
+        int targetChildCountBefore = target.WzProperties.Count;
+        Assert.True(panel.TryLoad(target, null));
+
+        Assert.Equal(1, panel.PasteCopiedFieldsShortcut());
+
+        Assert.Equal(targetChildCountBefore, target.WzProperties.Count); // no node inserted
+        Assert.Null(target["2040000"]);                                  // specifically not the source
+        Assert.Equal(100, IntValueOf(source, "price"));                  // source left alone
+        Assert.False(ImageOf(source).Changed);
+    });
+
+    [Fact]
     public void MismatchedTargetCard_KeepsFieldBranchAndClipboard_SoTreePasteNeverRuns() => RunSta(() =>
     {
         var panel = new NodeEditorPanel();
@@ -198,10 +311,13 @@ public sealed class NodeEditorCopyPasteTests
         Selected(LooseCard(panel)).Add("price");
         panel.CopySelectedFieldsShortcut();
 
-        Assert.True(panel.TryLoad(MakeItemWithOnlySpecContainer("9999999"), null));
+        WzSubProperty target = MakeItemWithOnlySpecContainer("9999999");
+        Assert.True(panel.TryLoad(target, null));
         Assert.Null(LooseCard(panel)); // no loose card was even built for this item
 
-        panel.PasteCopiedFieldsShortcut();
+        // Nothing written, so MainPanel leaves the target tree node unmarked.
+        Assert.Equal(0, panel.PasteCopiedFieldsShortcut());
+        Assert.False(ImageOf(target).Changed);
 
         // HasCopiedFields staying true is what stops MainForm from ever reaching DoPaste() - an
         // incompatible target must not silently fall back to pasting the whole tree node. The
@@ -260,9 +376,12 @@ public sealed class NodeEditorCopyPasteTests
         Selected(sourceCard).Add("reqSTR");
         panel.CopySelectedFieldsShortcut();
 
-        Assert.True(panel.TryLoad(MakeEquipItem("01000001", ("reqSTR", 1), ("incPDD", 1)), null));
-        panel.PasteCopiedFieldsShortcut();
+        WzSubProperty target = MakeEquipItem("01000001", ("reqSTR", 1), ("incPDD", 1));
+        Assert.True(panel.TryLoad(target, null));
 
+        Assert.Equal(1, panel.PasteCopiedFieldsShortcut());
+        Assert.Equal(999, IntValueOf(target, "info/reqSTR"));
+        Assert.Equal(1, IntValueOf(target, "info/incPDD")); // not carried by the copy
         Assert.Equal("999", Fields(CardTitled(panel, "info"))["reqSTR"].Text);
     });
 

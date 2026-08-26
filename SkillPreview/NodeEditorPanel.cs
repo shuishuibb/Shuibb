@@ -48,7 +48,7 @@ namespace SkillPreview
 
         // Cross-node field copy/paste (plain Ctrl+C / Ctrl+V). Deliberately NOT reset by Rebuild -
         // the whole point is copy on node A, select node B (which rebuilds everything), paste
-        // into B's matching card. Only ever staged into TextBoxes; see PasteFields.
+        // into B's matching card. A confirmed paste writes straight into the WZ; see PasteFields.
         private List<(string Name, string Value)> copiedFields;
         private string copiedFieldsSourceMatchKey;
         private string copiedFieldsSourceDisplayTitle;
@@ -728,38 +728,76 @@ namespace SkillPreview
         }
 
         /// <summary>
-        /// Applies previously-copied (name, text) pairs onto this card's same-named fields -
-        /// only staged into the TextBoxes, exactly like typing them in by hand. Nothing is
-        /// written to the WZ until 儲存數值 is pressed.
+        /// Applies previously-copied (name, text) pairs onto this card's same-named fields,
+        /// writing each one straight into its WZ property - a confirmed Ctrl+V is the commit, so
+        /// 儲存數值 is not needed afterwards.
+        ///
+        /// Deliberately walks <see cref="copiedFields"/> rather than binding.Fields (which is what
+        /// <see cref="SaveGroup"/> does): only the fields this paste actually carries may be
+        /// written. Any *other* box on the card the user had typed into but not yet saved stays
+        /// staged and untouched - a paste must never commit edits the user hasn't confirmed.
+        ///
+        /// Returns how many properties were really written, so the caller can mark the target
+        /// tree node as changed only when something actually changed.
         /// </summary>
-        private void PasteFields(GroupBinding binding)
+        private int PasteFields(GroupBinding binding)
         {
             if (copiedFields == null || copiedFields.Count == 0)
             {
                 statusText.Text = "剪貼簿是空的，請先在某張卡片點選欄位名稱再按 Ctrl+C。";
-                return;
+                return 0;
             }
             if (!string.Equals(copiedFieldsSourceMatchKey, binding.MatchKey, StringComparison.Ordinal))
             {
                 statusText.Text = "複製的欄位來自「" + copiedFieldsSourceDisplayTitle + "」，無法貼到「" + DisplayTitleFor(binding) + "」。";
-                return;
+                return 0;
             }
 
-            int skipped = 0;
+            int written = 0;
+            int missing = 0;
+            int failed = 0;
             foreach ((string name, string value) in copiedFields)
             {
-                if (binding.Fields.TryGetValue(name, out TextBox box))
-                    box.Text = value;
-                else
-                    skipped++;
+                if (!binding.Fields.TryGetValue(name, out TextBox box))
+                {
+                    missing++;
+                    continue;
+                }
+
+                WzImageProperty target = ((WzImageProperty)binding.Container)[name];
+                if (target == null)
+                {
+                    missing++;
+                    continue;
+                }
+
+                // Same writer 儲存數值 uses - one type parser for both paths. A value the target
+                // property's type can't hold leaves that property completely alone.
+                if (!ApplyScalarValue(target, value))
+                {
+                    failed++;
+                    continue;
+                }
+
+                target.ParentImage.Changed = true;
+                box.Text = value; // keep the box showing what the WZ now actually holds
+                written++;
             }
+
+            if (written > 0)
+                NodeChanged?.Invoke(this, EventArgs.Empty);
 
             // A clean paste says nothing - the new values showing up in the boxes is the
             // feedback. Only a partial one still reports, since a field being silently dropped
             // would otherwise be invisible.
-            statusText.Text = skipped > 0
-                ? "有 " + skipped + " 個欄位在「" + DisplayTitleFor(binding) + "」找不到同名欄位，已略過。"
-                : string.Empty;
+            var notes = new List<string>();
+            if (failed > 0)
+                notes.Add("有 " + failed + " 個欄位因型別不符沒有寫入");
+            if (missing > 0)
+                notes.Add("有 " + missing + " 個欄位在「" + DisplayTitleFor(binding) + "」找不到同名欄位，已略過");
+            statusText.Text = notes.Count > 0 ? string.Join("，", notes) + "。" : string.Empty;
+
+            return written;
         }
 
         // ---- global Ctrl+C / Ctrl+V routing (MainForm.MainWindow_PreviewKeyDown) ----------------
@@ -826,22 +864,30 @@ namespace SkillPreview
         /// <summary>
         /// Applies the staged field copy onto the currently displayed node's card of the same
         /// kind (matched by MatchKey, so a Consume item's own loose fields land on another item's
-        /// loose fields - see GroupBinding.MatchKey). Only call after
-        /// <see cref="HasCopiedFields"/> is true and the user has confirmed - this does no
-        /// prompting of its own, and only ever stages TextBox text: nothing reaches the WZ until
-        /// 儲存數值 is pressed. When the current node has no matching card, this says so and
-        /// leaves the copy staged; it never falls back to anything tree-level.
+        /// loose fields - see GroupBinding.MatchKey), writing each value straight into its WZ
+        /// property. Only call after <see cref="HasCopiedFields"/> is true and the user has
+        /// confirmed - this does no prompting of its own. When the current node has no matching
+        /// card, this says so and leaves the copy staged; it never falls back to anything
+        /// tree-level.
         /// </summary>
-        public void PasteCopiedFieldsShortcut()
+        /// <returns>
+        /// How many WZ properties were actually written - 0 when nothing changed (no matching
+        /// card, or every value was rejected by its property's type). The caller uses this to
+        /// decide whether to mark the target tree node as changed.
+        /// </returns>
+        public int PasteCopiedFieldsShortcut()
         {
             if (!HasCopiedFields)
-                return;
+                return 0;
 
             GroupBinding target = groups.FirstOrDefault(g => string.Equals(g.MatchKey, copiedFieldsSourceMatchKey, StringComparison.Ordinal));
-            if (target != null)
-                PasteFields(target);
-            else
+            if (target == null)
+            {
                 statusText.Text = "複製的欄位來自「" + copiedFieldsSourceDisplayTitle + "」，目前節點沒有同類卡片可以貼上。";
+                return 0;
+            }
+
+            return PasteFields(target);
         }
 
         private static TextBox FieldBox(EditorTheme theme, string value, bool multiline)

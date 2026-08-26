@@ -4107,10 +4107,27 @@ namespace HaRepacker.GUI.Panels
         public void CopySelectedEditorFields() => nodeEditorPanel?.CopySelectedFieldsShortcut();
 
         /// <summary>
-        /// Applies the staged field copy onto the current node's matching card - staged into the
-        /// TextBoxes only, never written to the WZ until 儲存數值 is pressed. Caller confirms first.
+        /// Applies the staged field copy onto the current node's matching card, writing the
+        /// values straight into their WZ properties - a confirmed Ctrl+V is the commit, so
+        /// 儲存數值 isn't needed afterwards. Caller confirms first.
+        ///
+        /// Marks the node the editor is showing as changed (the tree's usual red) when at least
+        /// one property was really written, so the edit is visible once the selection moves off
+        /// it. Nothing is marked when every value was rejected by its property's type.
         /// </summary>
-        public void PasteCopiedEditorFields() => nodeEditorPanel?.PasteCopiedFieldsShortcut();
+        public void PasteCopiedEditorFields()
+        {
+            if (nodeEditorPanel == null || nodeEditorPanel.PasteCopiedFieldsShortcut() <= 0)
+                return;
+
+            if (DataTree.SelectedNode is not WzNode targetNode)
+                return;
+
+            targetNode.ChangedNodeProperty();
+            // Repaints foregrounds from the model instead of rebuilding the tree - the target is
+            // still selected, so its red only shows once the selection moves elsewhere.
+            UpdateNativeSelectionVisuals();
+        }
 
         /// <summary>
         /// The name of the node the clipboard contents were copied out of, or null when the
