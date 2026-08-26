@@ -1,0 +1,92 @@
+<gui:ThemedDialogWindow x:Class="HaRepacker.GUI.MapObjectInfo.MapObjectInfoWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:gui="clr-namespace:HaRepacker.GUI"
+        Title="地圖物件資訊"
+        Width="640" Height="720" MinWidth="420" MinHeight="360"
+        WindowStartupLocation="CenterOwner" ResizeMode="CanResize"
+        Background="{DynamicResource HareCanvasBrush}"
+        Foreground="{DynamicResource HareTextBrush}" FontFamily="Segoe UI" FontSize="13">
+    <gui:ThemedDialogWindow.Resources>
+        <ResourceDictionary><ResourceDictionary.MergedDictionaries>
+            <ResourceDictionary Source="/HaSharedLibrary;component/GUI/Themes/HarepackerTheme.xaml"/>
+        </ResourceDictionary.MergedDictionaries></ResourceDictionary>
+    </gui:ThemedDialogWindow.Resources>
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+
+        <Grid Grid.Row="0" Margin="0,0,0,14">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock Grid.Column="0" Text="地圖物件資訊" Style="{StaticResource HarePageTitleStyle}" VerticalAlignment="Center"/>
+            <StackPanel Grid.Column="1" Orientation="Horizontal">
+                <Button x:Name="copyButton" Content="複製" Width="90" Style="{StaticResource HarePrimaryButtonStyle}" Click="CopyButton_Click"/>
+                <Button x:Name="closeButton" Content="關閉" Width="90" Margin="8,0,0,0" IsCancel="True" Click="CloseButton_Click"/>
+            </StackPanel>
+        </Grid>
+
+        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+            <StackPanel>
+                <Border Style="{StaticResource HareCardStyle}" Margin="0,0,0,10">
+                    <StackPanel>
+                        <TextBlock Text="選取地圖" Style="{StaticResource HareSectionTitleStyle}"/>
+                        <TextBlock x:Name="selectedMapsText" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                    </StackPanel>
+                </Border>
+                <Border Style="{StaticResource HareCardStyle}" Margin="0,0,0,10">
+                    <StackPanel>
+                        <TextBlock Text="mapMark" Style="{StaticResource HareSectionTitleStyle}"/>
+                        <TextBlock x:Name="mapMarksText" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                    </StackPanel>
+                </Border>
+                <Border Style="{StaticResource HareCardStyle}" Margin="0,0,0,10">
+                    <StackPanel>
+                        <TextBlock Text="bgm" Style="{StaticResource HareSectionTitleStyle}"/>
+                        <TextBlock x:Name="bgmsText" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                    </StackPanel>
+                </Border>
+                <Border Style="{StaticResource HareCardStyle}" Margin="0,0,0,10">
+                    <StackPanel>
+                        <TextBlock Text="Back" Style="{StaticResource HareSectionTitleStyle}"/>
+                        <TextBlock x:Name="backsText" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                    </StackPanel>
+                </Border>
+                <Border Style="{StaticResource HareCardStyle}" Margin="0,0,0,10">
+                    <StackPanel>
+                        <TextBlock Text="Tile" Style="{StaticResource HareSectionTitleStyle}"/>
+                        <TextBlock x:Name="tilesText" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                    </StackPanel>
+                </Border>
+                <Border Style="{StaticResource HareCardStyle}" Margin="0,0,0,10">
+                    <StackPanel>
+                        <TextBlock Text="Obj" Style="{StaticResource HareSectionTitleStyle}"/>
+                        <TextBlock x:Name="objsText" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                    </StackPanel>
+                </Border>
+                <Border Style="{StaticResource HareCardStyle}" Margin="0,0,0,10">
+                    <StackPanel>
+                        <TextBlock Text="Npc" Style="{StaticResource HareSectionTitleStyle}"/>
+                        <TextBlock x:Name="npcsText" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                    </StackPanel>
+                </Border>
+                <Border Style="{StaticResource HareCardStyle}" Margin="0,0,0,10">
+                    <StackPanel>
+                        <TextBlock Text="Mob" Style="{StaticResource HareSectionTitleStyle}"/>
+                        <TextBlock x:Name="mobsText" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                    </StackPanel>
+                </Border>
+                <Border Style="{StaticResource HareCardStyle}" Margin="0,0,0,0">
+                    <StackPanel>
+                        <TextBlock Text="Reactor" Style="{StaticResource HareSectionTitleStyle}"/>
+                        <TextBlock x:Name="reactorsText" TextWrapping="Wrap" Margin="0,6,0,0"/>
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+        </ScrollViewer>
+    </Grid>
+</gui:ThemedDialogWindow>

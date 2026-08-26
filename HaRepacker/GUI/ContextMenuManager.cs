@@ -1,5 +1,6 @@
 ﻿using HaRepacker.GUI;
 using HaRepacker.GUI.Input;
+using HaRepacker.GUI.MapObjectInfo;
 using HaRepacker.GUI.Panels;
 using MapleLib.Img;
 using MapleLib.WzLib;
@@ -81,6 +82,10 @@ namespace HaRepacker
         private ToolStripMenuItem BatchCleanupString;
         private ToolStripMenuItem BatchCoverFolderImages;
         private ToolStripMenuItem BatchImportFolderImages;
+
+        // Read-only map summary (mapMark/bgm/back/tile/obj/npc/mob/reactor); see
+        // HaRepacker\GUI\MapObjectInfo\.
+        private ToolStripMenuItem MapObjectInfoMenuItem;
 
         /*private ToolStripMenuItem ExportPropertySubMenu;
         private ToolStripMenuItem ExportAnimationSubMenu;
@@ -188,6 +193,8 @@ namespace HaRepacker
                 BatchCoverFolderImages, BatchImportFolderImages);
 
             AskAiAboutNode = new ToolStripMenuItem("AI 助手（詢問這個節點）...", null, new EventHandler(AskAiAboutNode_Click));
+
+            MapObjectInfoMenuItem = new ToolStripMenuItem("地圖物件資訊", null, new EventHandler(MapObjectInfo_Click));
 
             AddSortMenu = new ToolStripMenuItem(UiLocalization.Translate("Sort"), Properties.Resources.sort, SortAllChildViewNode, SortPropertiesByName);
 
@@ -557,6 +564,47 @@ namespace HaRepacker
             return path.ToString();
         }
 
+        /// <summary>
+        /// Opens the read-only "地圖物件資訊" summary for every valid map WzImage among the
+        /// current selection (falling back to just the right-clicked node if the tree doesn't
+        /// report a multi-selection - see GetMapObjectInfoCandidateNodes). Purely a read + a
+        /// modal window: no WzObject is touched.
+        /// </summary>
+        private void MapObjectInfo_Click(object sender, EventArgs e)
+        {
+            MainPanel panel = getMainPanel();
+            List<WzNode> candidates = GetMapObjectInfoCandidateNodes(panel, currNode);
+            MapObjectInfoResult result = MapObjectInfoBuilder.Build(candidates);
+            if (result.SelectedMaps.Count == 0)
+                return; // CreateMenu only offers this item when a valid map is present; this is just the same safety net at click time.
+
+            MapObjectInfoWindow.Show(result);
+        }
+
+        /// <summary>
+        /// The tree's own multi-selection (TreeViewMS.SelectedNodes) if it has anything, else the
+        /// single node this context menu was actually built for. A plain right-click collapses
+        /// TreeViewMS's selection to just the clicked node (see TreeViewMS.OnAfterSelect), so in
+        /// practice this is "the selection" whenever it truly is multiple nodes, and "the clicked
+        /// node" otherwise - either way it's the tree's own selection state, not a separate one.
+        /// </summary>
+        private static List<WzNode> GetMapObjectInfoCandidateNodes(MainPanel panel, WzNode fallbackNode)
+        {
+            List<WzNode> nodes = new List<WzNode>();
+            System.Collections.ArrayList selectedNodes = panel?.DataTree?.SelectedNodes;
+            if (selectedNodes != null)
+            {
+                foreach (object selected in selectedNodes)
+                {
+                    if (selected is WzNode wzNode)
+                        nodes.Add(wzNode);
+                }
+            }
+            if (nodes.Count == 0 && fallbackNode != null)
+                nodes.Add(fallbackNode);
+            return nodes;
+        }
+
         private void BatchOffsetNodeNames_Click(object sender, EventArgs e)
         {
             getMainPanel().BatchOffsetNodeNames();
@@ -688,6 +736,18 @@ namespace HaRepacker
             toolStripmenuItems.Add(AddBatchMenu);
             toolStripmenuItems.Add(AddNodeBatchMenu);
             toolStripmenuItems.Add(AskAiAboutNode);
+
+            // Only offered when at least one valid map WzImage (single or multi-selected) is
+            // among the current selection - see MapObjectInfoBuilder.IsMapImageNode.
+            List<WzNode> mapObjectInfoCandidates = GetMapObjectInfoCandidateNodes(getMainPanel(), node);
+            foreach (WzNode candidate in mapObjectInfoCandidates)
+            {
+                if (MapObjectInfoBuilder.IsMapImageNode(candidate))
+                {
+                    toolStripmenuItems.Add(MapObjectInfoMenuItem);
+                    break;
+                }
+            }
 
             if (Tag is WzCanvasProperty)
             {
