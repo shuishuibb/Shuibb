@@ -34,8 +34,29 @@
     <StartupObject>HaRepacker.Program</StartupObject>
     <ApplicationIcon>logo.ico</ApplicationIcon>
     <PackageIcon>logo.png</PackageIcon>
+
+    <!-- Program.cs sets CurrentUICulture to the legacy "zh-CHT"/"zh-CHS" neutral names (not the
+         modern "zh-Hant"/"zh-Hans"), and every *.zh-CHT.resx / *.zh-CHS.resx file is named to
+         match. The SDK's own filename-based culture detection does not recognise those two
+         legacy codes, so without this they silently get treated as ordinary (non-localised)
+         resources baked into the neutral assembly instead of a zh-CHT/zh-CHS satellite -
+         CurrentUICulture=zh-CHT then finds no satellite to fall back from and shows English.
+         RespectAlreadyAssignedItemCulture makes AssignCulture honour the Culture metadata set
+         explicitly below instead of re-deriving (and rejecting) it from the filename. -->
+    <RespectAlreadyAssignedItemCulture>true</RespectAlreadyAssignedItemCulture>
   </PropertyGroup>
-  
+
+  <ItemGroup>
+    <EmbeddedResource Update="**\*.zh-CHT.resx">
+      <Culture>zh-CHT</Culture>
+      <WithCulture>true</WithCulture>
+    </EmbeddedResource>
+    <EmbeddedResource Update="**\*.zh-CHS.resx">
+      <Culture>zh-CHS</Culture>
+      <WithCulture>true</WithCulture>
+    </EmbeddedResource>
+  </ItemGroup>
+
   <ItemGroup>
     <Compile Remove="Resources\OrangeMushroom\**" />
     <EmbeddedResource Remove="Resources\OrangeMushroom\**" />
@@ -200,4 +221,20 @@
       <DependentUpon>WzMapleVersionInputBox.xaml</DependentUpon>
     </Compile>
   </ItemGroup>
+
+  <!-- The SDK's own "which satellite culture folders does a ProjectReference contribute" check
+       does not recognise "zh-CHT"/"zh-CHS" either (the same legacy-culture gap the
+       RespectAlreadyAssignedItemCulture fix above works around for THIS project's own resx), so
+       HaSharedLibrary's zh-CHT/zh-CHS satellite never gets copied here automatically even though
+       HaSharedLibrary itself now builds it correctly. Runs after Build, once HaSharedLibrary's
+       ProjectReference is guaranteed built, so build order is not a concern; a no-op if the
+       referenced project has no output yet (nothing else in this project depends on it existing). -->
+  <Target Name="CopyHaSharedLibraryLegacyChineseSatellites" AfterTargets="Build">
+    <ItemGroup>
+      <_HaSharedLibraryZhChtSatellite Include="..\HaSharedLibrary\bin\$(Configuration)\$(TargetFramework)\zh-CHT\HaSharedLibrary.resources.dll" />
+      <_HaSharedLibraryZhChsSatellite Include="..\HaSharedLibrary\bin\$(Configuration)\$(TargetFramework)\zh-CHS\HaSharedLibrary.resources.dll" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_HaSharedLibraryZhChtSatellite)" DestinationFolder="$(OutDir)zh-CHT" Condition="Exists('@(_HaSharedLibraryZhChtSatellite)')" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(_HaSharedLibraryZhChsSatellite)" DestinationFolder="$(OutDir)zh-CHS" Condition="Exists('@(_HaSharedLibraryZhChsSatellite)')" SkipUnchangedFiles="true" />
+  </Target>
 </Project>

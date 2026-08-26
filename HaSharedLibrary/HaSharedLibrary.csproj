@@ -11,6 +11,12 @@
     <_SuppressWinFormsTrimError>true</_SuppressWinFormsTrimError>
 
     <ImportWindowsDesktopTargets>true</ImportWindowsDesktopTargets>
+
+    <!-- Resources.zh-CHT.resx / Resources.zh-CHS.resx use the legacy neutral culture names the
+         host's CurrentUICulture is set to (see Harepacker-resurrected.csproj for the full note).
+         The SDK does not recognise those two as culture names by filename alone, so without this
+         they get baked into the neutral assembly instead of a zh-CHT/zh-CHS satellite. -->
+    <RespectAlreadyAssignedItemCulture>true</RespectAlreadyAssignedItemCulture>
   </PropertyGroup>
 
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|AnyCPU' ">
@@ -19,6 +25,16 @@
   <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|AnyCPU' ">
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Update="**\*.zh-CHT.resx">
+      <Culture>zh-CHT</Culture>
+      <WithCulture>true</WithCulture>
+    </EmbeddedResource>
+    <EmbeddedResource Update="**\*.zh-CHS.resx">
+      <Culture>zh-CHS</Culture>
+      <WithCulture>true</WithCulture>
+    </EmbeddedResource>
+  </ItemGroup>
   <ItemGroup>
     <Compile Update="GUI\FieldLimitPanel.cs">
       <SubType>UserControl</SubType>
