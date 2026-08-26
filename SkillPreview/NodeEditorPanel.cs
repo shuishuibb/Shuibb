@@ -641,50 +641,24 @@ namespace SkillPreview
                 CornerRadius = new CornerRadius(4.0),
                 BorderThickness = new Thickness(1.0),
                 Background = Brushes.Transparent,
-                BorderBrush = Brushes.Transparent,
-                // Focusable so clicking the label moves keyboard focus off whatever TreeViewItem
-                // it was on - see the PreviewKeyDown handler below for why that matters.
-                Focusable = true,
-                FocusVisualStyle = null
+                BorderBrush = Brushes.Transparent
             };
 
             // Click target is just the label, not the whole row, so clicking into the value box
             // to type still behaves exactly as before - selection never intercepts that.
+            //
+            // Ctrl+C/Ctrl+V themselves are NOT handled here (an earlier version tried a
+            // PreviewKeyDown on rowBorder gated on keyboard focus, but that can never fire:
+            // WPF tunnels PreviewKeyDown from the Window down to the focused element, and
+            // MainForm's own Window-level PreviewKeyDown handler marks the key Handled first -
+            // before it ever reaches this row, no matter what has focus. The real routing is in
+            // MainForm.MainWindow_PreviewKeyDown, via TryHandleFieldCopyShortcut/
+            // TryHandleFieldPasteShortcut below, which key off the field selection/clipboard
+            // state instead of focus.
             text.MouseLeftButtonDown += delegate (object sender, MouseButtonEventArgs e)
             {
                 ToggleFieldSelection(binding, propertyName, (Keyboard.Modifiers & ModifierKeys.Control) != 0);
-                rowBorder.Focus();
                 e.Handled = true;
-            };
-
-            // Ctrl+C/Ctrl+V while a field's label has focus copy/paste the *selected fields* via
-            // CopySelectedFields/PasteFields. Without this, the keystroke tunnels down to
-            // whichever TreeViewItem still holds keyboard focus (clicking a label doesn't move
-            // focus by itself) and MainPanel's own tree-level Ctrl+C/Ctrl+V fires instead,
-            // copying/pasting the *entire selected WZ node* - which is the bug reported: pressing
-            // Ctrl+C after selecting a field pasted the whole item as a new sibling node instead
-            // of just the field's value. rowBorder.Focus() above is what makes this handler run
-            // first. The FocusedElement check keeps this from also swallowing a normal
-            // Ctrl+C/Ctrl+V typed while actually editing inside the value TextBox (an ordinary
-            // WPF text-edit copy/paste, which must keep working unchanged) - rowBorder is an
-            // ancestor of that TextBox, so PreviewKeyDown would otherwise tunnel through here too.
-            rowBorder.PreviewKeyDown += delegate (object sender, KeyEventArgs e)
-            {
-                if (!ReferenceEquals(Keyboard.FocusedElement, rowBorder))
-                    return;
-                if ((Keyboard.Modifiers & ModifierKeys.Control) == 0)
-                    return;
-
-                if (e.Key == Key.C)
-                {
-                    CopySelectedFields(binding);
-                    e.Handled = true;
-                }
-                else if (e.Key == Key.V)
-                {
-                    PasteFields(binding);
-                    e.Handled = true;
-                }
             };
 
             binding.RowBorders[propertyName] = rowBorder;
@@ -798,6 +772,77 @@ namespace SkillPreview
             statusText.Text = "已貼上 " + applied + " 個欄位到「" + DisplayTitleFor(binding) + "」"
                 + (skipped > 0 ? "，" + skipped + " 個沒有同名欄位被略過" : "")
                 + "——按「儲存數值」才會真的寫入。";
+        }
+
+        // ---- global Ctrl+C / Ctrl+V routing (MainForm.MainWindow_PreviewKeyDown) ----------------
+        //
+        // WPF tunnels PreviewKeyDown from the Window down to the focused element, so
+        // MainForm's own Window-level PreviewKeyDown handler always runs - and marks the event
+        // Handled - before any handler further down the tree (dataTreeView's, or a field row's)
+        // ever sees the key. That handler unconditionally called MainPanel.DoCopy()/DoPaste(),
+        // which is the real reason a plain Ctrl+C/Ctrl+V after selecting a field still copied and
+        // pasted the *entire tree node*: nothing lower in the tree ever got a chance to react,
+        // no matter what had keyboard focus. These three members let MainForm ask this panel
+        // first instead, based on the field selection/clipboard state (not focus, which is what
+        // made the previous attempt at this fix ineffective).
+
+        /// <summary>
+        /// True while a field copy (via TryHandleFieldCopyShortcut or the 複製選取 button) is
+        /// staged and hasn't been superseded by a tree-level copy - see ClearCopiedFields.
+        /// </summary>
+        public bool HasCopiedFields => copiedFields != null && copiedFields.Count > 0;
+
+        /// <summary>
+        /// Discards any staged field copy. Called from MainPanel.DoCopy() right before it copies
+        /// a whole tree node, so "the last Ctrl+C wins": copying a tree node always cancels a
+        /// pending field copy, and the next Ctrl+V then falls back to the tree's normal
+        /// whole-node paste instead of trying to apply stale field values.
+        /// </summary>
+        public void ClearCopiedFields()
+        {
+            copiedFields = null;
+            copiedFieldsSourceMatchKey = null;
+            copiedFieldsSourceDisplayTitle = null;
+        }
+
+        /// <summary>
+        /// Backs a global Ctrl+C: when a field is actively selected on the currently displayed
+        /// card, copies the selected fields (same as pressing 複製選取) and returns true so the
+        /// caller skips its own whole-node tree copy. Returns false when nothing is selected, so
+        /// an ordinary Ctrl+C still copies the tree node exactly as before.
+        /// </summary>
+        public bool TryHandleFieldCopyShortcut()
+        {
+            GroupBinding source = groups.FirstOrDefault(g => g.SelectedFieldNames.Count > 0);
+            if (source == null)
+                return false;
+
+            CopySelectedFields(source);
+            return true;
+        }
+
+        /// <summary>
+        /// Backs a global Ctrl+V: when a field copy is staged, pastes those fields into the
+        /// currently displayed node's matching card (by MatchKey) and returns true so the caller
+        /// skips its own whole-node tree paste - this is what makes "copy fields on 2040000,
+        /// select 2040001, Ctrl+V" land on the field's matching card instead of cloning the whole
+        /// WZ node. Shows the usual mismatch message (and still returns true, so the tree paste
+        /// never runs as a fallback) when the current node has no card of that kind. Returns
+        /// false only when no field copy is staged, so an ordinary Ctrl+V still pastes the tree
+        /// node as before.
+        /// </summary>
+        public bool TryHandleFieldPasteShortcut()
+        {
+            if (!HasCopiedFields)
+                return false;
+
+            GroupBinding target = groups.FirstOrDefault(g => string.Equals(g.MatchKey, copiedFieldsSourceMatchKey, StringComparison.Ordinal));
+            if (target != null)
+                PasteFields(target);
+            else
+                statusText.Text = "複製的欄位來自「" + copiedFieldsSourceDisplayTitle + "」，目前節點沒有同類卡片可以貼上。";
+
+            return true;
         }
 
         private static TextBox FieldBox(EditorTheme theme, string value, bool multiline)

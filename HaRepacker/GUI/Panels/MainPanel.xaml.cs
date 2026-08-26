@@ -4038,9 +4038,15 @@ namespace HaRepacker.GUI.Panels
             if (!Warning.Warn(Properties.Resources.MainConfirmCopy) || bPasteTaskActive)
                 return;
 
+            // "Last Ctrl+C wins": a whole-node tree copy always cancels a pending field copy
+            // staged in the property editor, so a following Ctrl+V goes back to this tree paste
+            // instead of trying to apply stale field values - see TryHandleFieldCopyShortcut /
+            // TryHandleFieldPasteShortcut below and MainForm.MainWindow_PreviewKeyDown.
+            nodeEditorPanel?.ClearCopiedFields();
+
             foreach (WzObject obj in clipboard)
             {
-                //this causes minor weirdness with png's in copied nodes but otherwise memory is not free'd 
+                //this causes minor weirdness with png's in copied nodes but otherwise memory is not free'd
                 obj.Dispose();
             }
 
@@ -4070,6 +4076,20 @@ namespace HaRepacker.GUI.Panels
                 }
             }
         }
+
+        /// <summary>
+        /// Lets a global Ctrl+C (MainForm.MainWindow_PreviewKeyDown) copy the property editor's
+        /// selected fields instead of this tree's whole-node copy, when a field is actively
+        /// selected there. See NodeEditorPanel.TryHandleFieldCopyShortcut.
+        /// </summary>
+        public bool TryHandleFieldCopyShortcut() => nodeEditorPanel?.TryHandleFieldCopyShortcut() == true;
+
+        /// <summary>
+        /// Lets a global Ctrl+V (MainForm.MainWindow_PreviewKeyDown) paste a staged field copy
+        /// into the property editor's matching card instead of this tree's whole-node paste, when
+        /// a field copy is staged. See NodeEditorPanel.TryHandleFieldPasteShortcut.
+        /// </summary>
+        public bool TryHandleFieldPasteShortcut() => nodeEditorPanel?.TryHandleFieldPasteShortcut() == true;
 
         /// <summary>
         /// The name of the node the clipboard contents were copied out of, or null when the

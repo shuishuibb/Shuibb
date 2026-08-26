@@ -607,8 +607,24 @@ namespace HaRepacker.GUI
                 case System.Windows.Input.Key.I: toolStripMenuItem_newWzFormat_Click(this, EventArgs.Empty); break;
                 case System.Windows.Input.Key.S: SaveToolStripMenuItem_Click(this, EventArgs.Empty); break;
                 case System.Windows.Input.Key.T: AddTabsInternal(); break;
-                case System.Windows.Input.Key.C: MainPanel?.DoCopy(); break;
-                case System.Windows.Input.Key.V: MainPanel?.DoPaste(); MainPanel?.RefreshNativeDataTree(); break;
+                // A field selected/copied in the property editor (SkillPreview\NodeEditorPanel's
+                // 複製選取/貼上 cards) takes priority over the tree's own whole-node copy/paste -
+                // this handler is on the Window itself, so PreviewKeyDown's tunnel reaches it
+                // before any descendant (the tree, or a field row) ever sees the key, no matter
+                // what currently has keyboard focus. Checking the field editor's own selection/
+                // clipboard state here (instead of relying on focus) is what actually fixes
+                // "select a field, Ctrl+C, select another item, Ctrl+V" cloning the whole WZ node.
+                case System.Windows.Input.Key.C:
+                    if (MainPanel?.TryHandleFieldCopyShortcut() != true)
+                        MainPanel?.DoCopy();
+                    break;
+                case System.Windows.Input.Key.V:
+                    if (MainPanel?.TryHandleFieldPasteShortcut() != true)
+                    {
+                        MainPanel?.DoPaste();
+                        MainPanel?.RefreshNativeDataTree();
+                    }
+                    break;
                 case System.Windows.Input.Key.F: searchToolStripMenuItem_Click(this, EventArgs.Empty); break;
                 default:
                     if (e.Key >= System.Windows.Input.Key.D0 && e.Key <= System.Windows.Input.Key.D9)
