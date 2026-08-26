@@ -353,6 +353,13 @@ namespace HaRepacker.GUI.Panels
                 isSynchronizingNativeSelection = false;
             }
             UpdateNativeSelectionVisuals();
+
+            // Picking a node is how the user says "search here", so it ends the current search
+            // session and the next Find next re-snapshots from this selection. The search's own
+            // jump to a hit is excluded - otherwise the first hit would become the search root
+            // and Find next could never reach the second match.
+            if (!isNavigatingSearchResult)
+                EndSearchSession();
         }
 
         private List<WzNode> GetVisibleNativeNodes()
@@ -574,11 +581,31 @@ namespace HaRepacker.GUI.Panels
         // Created lazily so MainPanel's constructor does not have to change.
         private Dictionary<TreeViewItem, WzNode> pendingNativeFills;
 
+        /// <summary>
+        /// Set while the search is jumping to one of its own hits. The selection that happens in
+        /// there is the search showing a result, not the user choosing a new place to search, so
+        /// it must not restart the search session - see SynchronizeNativeSelection.
+        /// </summary>
+        private bool isNavigatingSearchResult;
+
         private void SelectAndRevealNativeNode(WzNode node)
         {
             if (node == null)
                 return;
 
+            isNavigatingSearchResult = true;
+            try
+            {
+                RevealAndSelectNativeNodeCore(node);
+            }
+            finally
+            {
+                isNavigatingSearchResult = false;
+            }
+        }
+
+        private void RevealAndSelectNativeNodeCore(WzNode node)
+        {
             FlushPendingNativeTreeItems();
 
             var path = new List<WzNode>();
@@ -4860,6 +4887,36 @@ namespace HaRepacker.GUI.Panels
         /// </summary>
         /// <param name="sender"></param>
         /// <param name="e"></param>
+        /// <summary>
+        /// Repaints one node's label in the WPF mirror. TreeViewItem.Header is a plain copy of
+        /// node.Text taken when the item was created (see CreateNativeTreeItem) rather than a
+        /// binding, so a rename has to push the new text across. Only this node is touched - no
+        /// tree rebuild, so scroll position and expansion state stay exactly as they were.
+        /// </summary>
+        private void UpdateNativeNodeHeader(WzNode node)
+        {
+            if (node != null && nativeTreeItems.TryGetValue(node, out TreeViewItem item))
+                item.Header = node.Text;
+        }
+
+        /// <summary>
+        /// Puts the 名稱 box back to the node's real name after a rename that was refused, so the
+        /// header never shows a name that was not applied. isLoading suppresses the
+        /// PropertyChanged this assignment raises - the same guard ShowObjectValue uses while
+        /// populating - which is what keeps this from re-entering the rename handler.
+        /// </summary>
+        private void RevertNodeNameBox(WzNode node)
+        {
+            bool wasLoading = isLoading;
+            isLoading = true;
+            try {
+                _bindingPropertyItem.WzFileName = node.Text;
+            }
+            finally {
+                isLoading = wasLoading;
+            }
+        }
+
         private void propertyGrid_PropertyChanged_1(object sender, System.ComponentModel.PropertyChangedEventArgs e) {
             if (isLoading) {
                 return;
@@ -4869,21 +4926,33 @@ namespace HaRepacker.GUI.Panels
                         break;
                     }
                 case "WzFileName": {
-                        if (DataTree.SelectedNode == null) 
+                        if (DataTree.SelectedNode is not WzNode node)
                             return;
 
                         string setText = _bindingPropertyItem.WzFileName;
 
-                        WzNode node = (WzNode)DataTree.SelectedNode;
+                        // Re-entering the same name (or just pressing Enter without editing) is a
+                        // no-op, not a duplicate - CanNodeBeInserted would otherwise find this
+                        // very node under that name and report "node exists".
+                        if (string.Equals(setText, node.Text, StringComparison.Ordinal))
+                            break;
 
                         if (node.Tag is WzFile) {
-
+                            // A WZ file node is not renamed here; put the box back so the header
+                            // never shows a name the tree does not actually have.
+                            RevertNodeNameBox(node);
                         }
                         else if (WzNode.CanNodeBeInserted((WzNode)node.Parent, setText)) {
                             node.ChangeName(setText);
+                            // TreeViewItem.Header is a one-time copy of node.Text taken in
+                            // CreateNativeTreeItem, so the rename has to be pushed across or the
+                            // visible tree keeps the old name until it is rebuilt.
+                            UpdateNativeNodeHeader(node);
                         }
-                        else
+                        else {
                             Warning.Error(Properties.Resources.MainNodeExists);
+                            RevertNodeNameBox(node);
+                        }
                         break;
                     }
                 case "XYVector":
@@ -5144,7 +5213,11 @@ namespace HaRepacker.GUI.Panels
             currentidx = 0;
             searchText = findBox.Text;
             extractImages = Program.ConfigurationManager.UserSettings.ParseImagesInSearch;
-            foreach (WzNode node in DataTree.SelectedNodes)
+
+            // Same session as Find next, for the same reason: run after a few Find next presses,
+            // the live selection is a previous hit rather than the scope the user chose.
+            EnsureSearchSession(searchText);
+            foreach (WzNode node in searchRootNodes)
             {
                 if (node.Tag is WzImageProperty)
                     continue;
@@ -5201,6 +5274,60 @@ namespace HaRepacker.GUI.Panels
         /// </summary>
         /// <param name="sender"></param>
         /// <param name="e"></param>
+        /// <summary>
+        /// The nodes the current run of "Find next" walks, snapshotted once when the session
+        /// starts. Held across presses on purpose: the tree selection moves to each hit as it is
+        /// found, so re-reading the selection every press would shrink the search down to its own
+        /// first result and never reach the second match.
+        /// </summary>
+        private readonly List<WzNode> searchRootNodes = new List<WzNode>();
+        private string searchRootQuery;
+
+        /// <summary>
+        /// Drops the saved roots so the next Find next starts a fresh session from whatever is
+        /// selected then. Called when the user selects a node themselves and when the query text
+        /// changes.
+        /// </summary>
+        private void EndSearchSession()
+        {
+            searchRootNodes.Clear();
+            searchRootQuery = null;
+        }
+
+        /// <summary>
+        /// Makes sure <see cref="searchRootNodes"/> holds the roots for the text about to be
+        /// searched, re-snapshotting from the tree selection when the session is new, the query
+        /// changed, or a stored root has been removed from the tree. A brand new snapshot also
+        /// restarts the match counter, so the first press lands on the first match.
+        /// </summary>
+        private void EnsureSearchSession(string query)
+        {
+            bool anyRootDetached = false;
+            foreach (WzNode root in searchRootNodes)
+            {
+                if (root.TreeView == null)
+                {
+                    anyRootDetached = true;
+                    break;
+                }
+            }
+
+            if (!SearchSessionPolicy.ShouldSnapshotRoots(searchRootNodes.Count > 0, searchRootQuery, query, anyRootDetached))
+                return;
+
+            searchRootNodes.Clear();
+            foreach (object item in DataTree.SelectedNodes)
+            {
+                if (item is WzNode node)
+                    searchRootNodes.Add(node);
+            }
+            if (searchRootNodes.Count == 0 && DataTree.SelectedNode is WzNode activeNode)
+                searchRootNodes.Add(activeNode);
+
+            searchRootQuery = query;
+            searchidx = 0;
+        }
+
         private void button_nextSearch_Click(object sender, RoutedEventArgs e)
         {
             if (coloredNode != null)
@@ -5217,7 +5344,11 @@ namespace HaRepacker.GUI.Panels
             currentidx = 0;
             searchText = findBox.Text;
             extractImages = Program.ConfigurationManager.UserSettings.ParseImagesInSearch;
-            foreach (WzNode node in DataTree.SelectedNodes)
+
+            // Walk the session's roots, not the live selection - the live selection is now
+            // whichever hit the previous press jumped to.
+            EnsureSearchSession(searchText);
+            foreach (WzNode node in searchRootNodes)
             {
                 if (node.Tag is IPropertyContainer)
                     SearchWzProperties((IPropertyContainer)node.Tag);
@@ -5225,6 +5356,9 @@ namespace HaRepacker.GUI.Panels
                 else SearchTV(node);
                 if (finished) break;
             }
+            // Past the last match: rewind so the next press starts over from the first one. The
+            // session's roots stay put, so "start over" means the original scope, not the hit the
+            // selection happens to be sitting on.
             if (!finished) { MessageBox.Show(Properties.Resources.MainTreeEnd); searchidx = 0; WzNode.EnsureVisibleIfDisplayed(DataTree.SelectedNode); }
             findBox.Focus();
         }
@@ -5241,6 +5375,9 @@ namespace HaRepacker.GUI.Panels
         private void findBox_TextChanged(object sender, TextChangedEventArgs e)
         {
             searchidx = 0;
+            // Different text means the next Find next is a new search, so the roots get
+            // re-snapshotted from whatever the user has selected at that point.
+            EndSearchSession();
         }
         #endregion
     }
