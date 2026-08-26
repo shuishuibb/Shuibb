@@ -1,6 +1,6 @@
 # Shuibb
 
-MapleStory WZ 編輯器。前身為 TOKI改，上游為 [HaRepacker-resurrected](https://github.com/lastbattle/Harepacker-resurrected)（HaSuite）。
+MapleStory WZ 編輯器。上游為 [HaRepacker-resurrected](https://github.com/lastbattle/Harepacker-resurrected)（HaSuite）。
 
 自 `shuibb-baseline-v1` 起，所有正式功能（含歷年 IL transplant 移植的修改、
 TokiAiAssistant、SkillPreview、MapleLib 修正）皆完整存在本 Source，
