@@ -640,23 +640,29 @@ namespace SkillPreview
                 CornerRadius = new CornerRadius(4.0),
                 BorderThickness = new Thickness(1.0),
                 Background = Brushes.Transparent,
-                BorderBrush = Brushes.Transparent
+                BorderBrush = Brushes.Transparent,
+                // Focusable so picking a field can take keyboard focus off whatever TextBox had
+                // it - see the click handler below. No focus rectangle: the row already shows
+                // its selection with the accent highlight.
+                Focusable = true,
+                FocusVisualStyle = null
             };
 
             // Click target is just the label, not the whole row, so clicking into the value box
             // to type still behaves exactly as before - selection never intercepts that.
             //
-            // Ctrl+C/Ctrl+V themselves are NOT handled here (an earlier version tried a
-            // PreviewKeyDown on rowBorder gated on keyboard focus, but that can never fire:
-            // WPF tunnels PreviewKeyDown from the Window down to the focused element, and
-            // MainForm's own Window-level PreviewKeyDown handler marks the key Handled first -
-            // before it ever reaches this row, no matter what has focus. The real routing is in
-            // MainForm.MainWindow_PreviewKeyDown, via HasSelectedFields/HasCopiedFields and
-            // CopySelectedFieldsShortcut/PasteCopiedFieldsShortcut below, which key off the field
-            // selection/clipboard state instead of focus.
+            // Ctrl+C/Ctrl+V themselves are NOT handled here. WPF tunnels PreviewKeyDown from the
+            // Window down, and MainForm's own Window-level handler decides which clipboard the
+            // key belongs to (ClipboardShortcutPolicy) before this row ever sees it. That rule
+            // gives a focused TextBox priority, so text selected in 名稱 / 值 / X / Y copies as
+            // text - which means picking a field here has to move focus off the TextBox, or the
+            // following Ctrl+C would still be treated as a text copy and the field clipboard
+            // would silently keep its previous contents.
             text.MouseLeftButtonDown += delegate (object sender, MouseButtonEventArgs e)
             {
                 ToggleFieldSelection(binding, propertyName, (Keyboard.Modifiers & ModifierKeys.Control) != 0);
+                rowBorder.Focus();
+                Keyboard.Focus(rowBorder);
                 e.Handled = true;
             };
 

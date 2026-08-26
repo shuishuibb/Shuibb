@@ -107,6 +107,36 @@ public sealed class NodeEditorCopyPasteTests
     }
 
     /// <summary>
+    /// A real Consume item as 0202.img actually stores one: no loose scalars on the item at all,
+    /// everything under info and spec.
+    ///
+    ///   02020000
+    ///   ├─ info
+    ///   │  ├─ price
+    ///   │  └─ slotMax
+    ///   └─ spec
+    ///      └─ hp
+    ///
+    /// Distinct from MakeConsumeItem, which models the flat layout other WZ versions use - the
+    /// batch tests around it would not have caught a paste that failed on this nesting.
+    /// </summary>
+    private static WzSubProperty MakeNestedConsumeItem(string itemId, int price, int slotMax, int hp)
+    {
+        var item = new WzSubProperty(itemId);
+
+        var info = new WzSubProperty("info");
+        info.AddProperty(new WzIntProperty("price", price));
+        info.AddProperty(new WzIntProperty("slotMax", slotMax));
+        item.AddProperty(info);
+
+        var spec = new WzSubProperty("spec");
+        spec.AddProperty(new WzIntProperty("hp", hp));
+        item.AddProperty(spec);
+
+        return AttachToImage(item, "0202.img");
+    }
+
+    /// <summary>
     /// An item with something editable, but none of it sitting loose on the item itself - so
     /// Rebuild never builds a loose-fields card for it at all (only a "spec" card).
     /// </summary>
@@ -586,6 +616,50 @@ public sealed class NodeEditorCopyPasteTests
             Assert.Equal(childCountsBefore[i], targets[i].WzProperties.Count);
             Assert.Null(targets[i]["2040000"]); // specifically not the source item
         }
+    });
+
+    [Fact]
+    public void BatchPaste_RealConsumeLayout_InfoFieldsAcrossSixTargets_WritesAllTwelve() => RunSta(() =>
+    {
+        // The exact shape 0202.img uses: price/slotMax under info, hp under spec. Reported as
+        // "0 個節點已寫入, 12 個欄位找不到同名欄位" - which turned out to be a stale field
+        // clipboard from a flat-layout copy, not a batch-engine fault. This pins the engine on
+        // the real layout so the two causes can never be confused again.
+        var panel = new NodeEditorPanel();
+
+        Assert.True(panel.TryLoad(MakeNestedConsumeItem("02020000", price: 265, slotMax: 9999, hp: 500), null));
+        object sourceCard = CardTitled(panel, "info");
+        Assert.NotNull(sourceCard);
+        Selected(sourceCard).Add("price");
+        Selected(sourceCard).Add("slotMax");
+        panel.CopySelectedFieldsShortcut();
+
+        WzSubProperty[] targets = new[] { "02020001", "02020002", "02020003", "02020004", "02020005", "02020006" }
+            .Select(id => MakeNestedConsumeItem(id, price: 1, slotMax: 2, hp: 3))
+            .ToArray();
+
+        IReadOnlyList<WzImageProperty> written = PasteTo(panel, targets);
+
+        Assert.Equal(12, written.Count);
+        foreach (WzSubProperty target in targets)
+        {
+            Assert.Equal(265, IntValueOf(target, "info/price"));
+            Assert.Equal(9999, IntValueOf(target, "info/slotMax"));
+
+            // spec is a different card and was never copied - it must be untouched.
+            Assert.Equal(3, IntValueOf(target, "spec/hp"));
+
+            // Only the two leaves are reported, so only they go red - not info, not spec, not
+            // the item.
+            Assert.Contains(target["info"]["price"], written);
+            Assert.Contains(target["info"]["slotMax"], written);
+            Assert.DoesNotContain(target["info"], written);
+            Assert.DoesNotContain(target["spec"], written);
+            Assert.DoesNotContain(target["spec"]["hp"], written);
+        }
+
+        // A clean paste stays quiet - no "找不到同名欄位" for this layout.
+        Assert.Equal(string.Empty, StatusText(panel));
     });
 
     [Fact]
