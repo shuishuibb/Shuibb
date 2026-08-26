@@ -4210,8 +4210,12 @@ namespace HaRepacker.GUI.Panels
         public bool HasCopiedEditorFields => nodeEditorPanel?.HasCopiedFields == true;
 
         /// <summary>
-        /// True when keyboard focus is inside one of the property editor's value boxes, where
-        /// Ctrl+C/Ctrl+V must stay ordinary WPF text copy/paste - no WZ clipboard, no prompt.
+        /// True when keyboard focus is inside one of the property editor's value boxes.
+        ///
+        /// No longer used for Ctrl+C/Ctrl+V routing: MainForm now checks for *any* focused
+        /// TextBox (see ClipboardShortcutPolicy), which covers these boxes along with the node
+        /// header's 名稱 / 值 / X / Y and the find box. Kept because it answers a narrower
+        /// question than that check does.
         /// </summary>
         public bool IsNodeEditorValueBoxFocused => nodeEditorPanel?.IsValueTextBoxFocused == true;
 

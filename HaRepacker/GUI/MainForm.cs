@@ -601,15 +601,6 @@ namespace HaRepacker.GUI
             if (!ctrl) return;
             if (MainPanel?.IsTextEditorFocused == true) return;
 
-            // Typing inside one of the property editor's value boxes: Ctrl+C/Ctrl+V there mean
-            // "copy/paste the selected text", the ordinary WPF TextBox behaviour. Returning
-            // without marking the event handled leaves it to the TextBox - neither WZ clipboard
-            // gets involved and no confirmation prompt appears. Only C/V are let through, so
-            // Ctrl+S/Ctrl+O etc. still work while a field is focused.
-            if ((e.Key == System.Windows.Input.Key.C || e.Key == System.Windows.Input.Key.V)
-                && MainPanel?.IsNodeEditorValueBoxFocused == true)
-                return;
-
             switch (e.Key)
             {
                 case System.Windows.Input.Key.N: newToolStripMenuItem_Click(this, EventArgs.Empty); break;
@@ -617,40 +608,53 @@ namespace HaRepacker.GUI
                 case System.Windows.Input.Key.I: toolStripMenuItem_newWzFormat_Click(this, EventArgs.Empty); break;
                 case System.Windows.Input.Key.S: SaveToolStripMenuItem_Click(this, EventArgs.Empty); break;
                 case System.Windows.Input.Key.T: AddTabsInternal(); break;
-                // Two clipboards share Ctrl+C/Ctrl+V: the tree's whole-node one (DoCopy/DoPaste)
-                // and the property editor's field one. Which one a keystroke belongs to is
-                // decided here, because this handler is on the Window itself - PreviewKeyDown
-                // tunnels root-to-leaf, so it always runs before the tree or any field row sees
-                // the key, whatever holds keyboard focus. The editor's own selection/clipboard
-                // state (not focus) picks the branch: fields win a Ctrl+C when rows are selected,
-                // and a Ctrl+V then keeps going to the fields even after the user has clicked
-                // another item in the tree - which is the whole point, and never clones a WZ node.
+                // Three clipboards share Ctrl+C/Ctrl+V: the focused text box's own text, the
+                // property editor's field one, and the tree's whole-node one (DoCopy/DoPaste).
+                // Which one a keystroke belongs to is decided here, because this handler is on
+                // the Window itself - PreviewKeyDown tunnels root-to-leaf, so it always runs
+                // before the tree, a field row, or a text box sees the key. See
+                // ClipboardShortcutPolicy for the priority order.
                 //
-                // Each branch prompts exactly once: DoCopy/DoPaste already ask on their own, so
-                // the field branches ask here instead of delegating.
+                // Each WZ branch prompts exactly once: DoCopy/DoPaste already ask on their own,
+                // so the field branches ask here instead of delegating. Text input never prompts.
                 case System.Windows.Input.Key.C:
-                    if (MainPanel?.HasSelectedEditorFields == true)
-                    {
-                        if (Warning.Warn(HaRepacker.Properties.Resources.MainConfirmCopy))
-                            MainPanel.CopySelectedEditorFields();
-                    }
-                    else
-                    {
-                        MainPanel?.DoCopy();
-                    }
-                    break;
                 case System.Windows.Input.Key.V:
-                    if (MainPanel?.HasCopiedEditorFields == true)
+                {
+                    bool isCopy = e.Key == System.Windows.Input.Key.C;
+                    ClipboardShortcutRoute route = ClipboardShortcutPolicy.Resolve(
+                        System.Windows.Input.Keyboard.FocusedElement is System.Windows.Controls.TextBox,
+                        isCopy,
+                        MainPanel?.HasSelectedEditorFields == true,
+                        MainPanel?.HasCopiedEditorFields == true);
+
+                    switch (route)
                     {
-                        if (Warning.Warn(HaRepacker.Properties.Resources.MainConfirmPaste))
-                            MainPanel.PasteCopiedEditorFields();
-                    }
-                    else
-                    {
-                        MainPanel?.DoPaste();
-                        MainPanel?.RefreshNativeDataTree();
+                        case ClipboardShortcutRoute.TextInput:
+                            // Returning without setting e.Handled lets the key carry on tunnelling
+                            // down to the text box, which does the ordinary text copy/paste.
+                            return;
+                        case ClipboardShortcutRoute.FieldCopy:
+                            if (Warning.Warn(HaRepacker.Properties.Resources.MainConfirmCopy))
+                                MainPanel.CopySelectedEditorFields();
+                            break;
+                        case ClipboardShortcutRoute.FieldPaste:
+                            if (Warning.Warn(HaRepacker.Properties.Resources.MainConfirmPaste))
+                                MainPanel.PasteCopiedEditorFields();
+                            break;
+                        default:
+                            if (isCopy)
+                            {
+                                MainPanel?.DoCopy();
+                            }
+                            else
+                            {
+                                MainPanel?.DoPaste();
+                                MainPanel?.RefreshNativeDataTree();
+                            }
+                            break;
                     }
                     break;
+                }
                 // Ctrl+F toggles: opens the find panel, closes it if it's already open. The
                 // Search menu item still just opens it (searchToolStripMenuItem_Click).
                 case System.Windows.Input.Key.F: MainPanel?.ToggleSearchPanel(); break;

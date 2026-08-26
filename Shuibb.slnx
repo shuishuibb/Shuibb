@@ -15,6 +15,7 @@
     <Project Path="MapleLib/spine-runtimes-4.1-ns/spine-csharp/spine-csharp-4.1-ns.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/clipboardrouting/clipboardrouting.csproj" />
     <Project Path="tests/derivetest/derivetest.csproj" />
     <Project Path="tests/equipmentstringinfo/equipmentstringinfo.csproj" />
     <Project Path="tests/mapobjectinfo/mapobjectinfo.csproj" />
