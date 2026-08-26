@@ -1211,18 +1211,34 @@ namespace HaRepacker.GUI
             // Try opening one, to see if the user is having the right priviledge
 
             // Load all original WZ files
+            List<string> loadFailures = new List<string>();
             await Task.Run(() =>
             {
                 List<WzFile> loadedWzFiles = new List<WzFile>();
                 ParallelLoopResult loop = Parallel.ForEach(wzfilePathsToLoad, filePath =>
                 {
-                    WzFile f = wzFileManager.LoadWzFile(filePath, MapleVersionEncryptionSelected);
-                    if (f == null) {
-                        // error should be thrown
+                    try
+                    {
+                        WzFile f = wzFileManager.LoadWzFile(filePath, MapleVersionEncryptionSelected);
+                        if (f == null) {
+                            // error should be thrown
+                        }
+                        else {
+                            lock (loadedWzFiles) {
+                                loadedWzFiles.Add(f);
+                            }
+                        }
                     }
-                    else {
-                        lock (loadedWzFiles) {
-                            loadedWzFiles.Add(f);
+                    catch (Exception ex)
+                    {
+                        // A file that fails to parse (wrong encryption, truncated, wrong format, ...)
+                        // must not take the whole batch - or the app - down with it: this used to
+                        // escape Parallel.ForEach as an AggregateException, out of this async void
+                        // method, and hit Program.CurrentDomain_UnhandledException, which shows the
+                        // crash dialog and calls Environment.Exit. One bad file could not be opened
+                        // again without also permanently losing every file already open in the tree.
+                        lock (loadFailures) {
+                            loadFailures.Add(Path.GetFileName(filePath) + " - " + ex.Message);
                         }
                     }
                 });
@@ -1238,6 +1254,11 @@ namespace HaRepacker.GUI
 
             // Hide panel splash sdcreen
             MainPanel.OnSetPanelLoadingCompleted();
+
+            if (loadFailures.Count > 0)
+            {
+                MessageBox.Show(string.Join("\n", loadFailures), HaRepacker.Properties.Resources.Warning, MessageBoxButtons.OK);
+            }
         }
         #endregion
 
