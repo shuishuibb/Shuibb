@@ -15,27 +15,30 @@ using Assert = Xunit.Assert;
 namespace NodeEditorCopyPasteTests;
 
 /// <summary>
-/// Targeted regression for the Ctrl+C / Ctrl+V routing bug: selecting fields on
-/// NodeEditorPanel's property cards and pressing Ctrl+C/Ctrl+V pasted/cloned the *entire tree
-/// node* instead of applying just the selected field values to the target's matching card.
+/// Targeted regression for NodeEditorPanel's field copy/paste *state machine* - the part
+/// MainForm.MainWindow_PreviewKeyDown queries to decide whether a Ctrl+C/Ctrl+V belongs to the
+/// property editor's fields or to the tree's whole-node clipboard:
 ///
-/// Root cause was MainForm.MainWindow_PreviewKeyDown - a Window-level PreviewKeyDown handler
-/// that always runs first (WPF tunnels PreviewKeyDown root-to-leaf) and unconditionally called
-/// MainPanel.DoCopy()/DoPaste(), regardless of what had keyboard focus. The fix adds
-/// NodeEditorPanel.HasCopiedFields / ClearCopiedFields / TryHandleFieldCopyShortcut /
-/// TryHandleFieldPasteShortcut, which MainForm now consults before falling back to the tree's
-/// own whole-node copy/paste - see MainPanel.TryHandleFieldCopyShortcut/
-/// TryHandleFieldPasteShortcut and MainForm.MainWindow_PreviewKeyDown for the wiring.
+///   HasSelectedFields / HasCopiedFields  - which clipboard the keystroke belongs to
+///   CopySelectedFieldsShortcut()         - stage the selected fields
+///   PasteCopiedFieldsShortcut()          - apply them to the current node's matching card
+///   ClearCopiedFields()                  - "last Ctrl+C wins", called from MainPanel.DoCopy()
 ///
-/// No GUI is driven, no window/message pump, no simulated clicks or key presses - these tests
-/// call the panel's public API directly (exactly like MainForm now does) against in-memory
-/// WzSubProperty fixtures, and use reflection only to read/seed the private per-card selection
-/// state (GroupBinding.SelectedFieldNames) and to read back the staged TextBox values, since
-/// NodeEditorPanel intentionally exposes no other hook into that state. Each test body runs on
-/// its own STA thread (plain System.Threading, no extra package) purely because constructing any
-/// WPF Control - NodeEditorPanel included - throws off an MTA thread; that's a WPF requirement
-/// unrelated to this bug and has nothing to do with the field-selection/keyboard-routing logic
-/// under test.
+/// SCOPE - what these tests do NOT cover, and must not be cited as proof of:
+///   * the real Ctrl+C / Ctrl+V keystrokes and MainWindow_PreviewKeyDown's routing,
+///   * the 是否複製 / 是否貼上 confirmation prompts (Warning.Warn), which live in HaRepacker
+///     and are deliberately not reachable from this project,
+///   * IsValueTextBoxFocused's real behaviour with live keyboard focus in a TextBox,
+///   * anything about the tree's own DoCopy/DoPaste.
+/// Those are keyboard/confirmation UI behaviour and are verified manually.
+///
+/// No GUI is driven here - no window, no message pump, no simulated clicks or key presses.
+/// These call the panel's public API directly against in-memory WzSubProperty fixtures, and use
+/// reflection only to seed the private per-card selection state (GroupBinding.SelectedFieldNames,
+/// normally set by clicking a field label) and to read back staged TextBox values, since the
+/// panel intentionally exposes no other hook into that. Each test body runs on its own STA
+/// thread (plain System.Threading, no extra package) purely because constructing any WPF Control
+/// throws off an MTA thread - a WPF requirement unrelated to the logic under test.
 /// </summary>
 public sealed class NodeEditorCopyPasteTests
 {
@@ -121,115 +124,133 @@ public sealed class NodeEditorCopyPasteTests
     // ---- tests ---------------------------------------------------------------------------------
 
     [Fact]
-    public void FieldCopy_SetsHasCopiedFields_AndClearResetsIt() => RunSta(() =>
+    public void NoFieldSelected_HasSelectedFieldsIsFalse_SoCtrlCStaysATreeCopy() => RunSta(() =>
     {
         var panel = new NodeEditorPanel();
-        Assert.True(panel.TryLoad(MakeConsumeItem("2040000", ("price", 100), ("incPDD", 5)), null));
+        Assert.True(panel.TryLoad(MakeConsumeItem("2040000", ("price", 100)), null));
+
+        // MainForm reads exactly this to pick its branch: false here means Ctrl+C falls through
+        // to MainPanel.DoCopy(), which shows 是否複製 on its own.
+        Assert.False(panel.HasSelectedFields);
         Assert.False(panel.HasCopiedFields);
+    });
+
+    [Fact]
+    public void SelectingAField_MakesCtrlCTheFieldBranch_AndStagesTheCopy() => RunSta(() =>
+    {
+        var panel = new NodeEditorPanel();
+        Assert.True(panel.TryLoad(MakeConsumeItem("2040000", ("price", 100), ("slotMax", 9999)), null));
 
         object loose = LooseCard(panel);
         Assert.NotNull(loose);
         Selected(loose).Add("price");
 
-        Assert.True(panel.TryHandleFieldCopyShortcut());
+        Assert.True(panel.HasSelectedFields);
+
+        // MainForm calls this only after the user answers Yes to 是否複製.
+        panel.CopySelectedFieldsShortcut();
         Assert.True(panel.HasCopiedFields);
-
-        panel.ClearCopiedFields();
-        Assert.False(panel.HasCopiedFields);
-    });
-
-    [Fact]
-    public void TryHandleFieldCopyShortcut_NoFieldSelected_ReturnsFalse_SoOrdinaryTreeCopyStillRuns() => RunSta(() =>
-    {
-        var panel = new NodeEditorPanel();
-        Assert.True(panel.TryLoad(MakeConsumeItem("2040000", ("price", 100)), null));
-
-        // Nothing selected - MainForm's Ctrl+C handler must fall back to MainPanel.DoCopy().
-        Assert.False(panel.TryHandleFieldCopyShortcut());
-        Assert.False(panel.HasCopiedFields);
     });
 
     [Fact]
     public void ConsumeLooseFields_CopyOnOneItemId_PastesOntoMatchingFieldsOfAnotherItemId() => RunSta(() =>
     {
-        // This is the exact reported workflow: 2040000 -> select fields -> Ctrl+C ->
-        // select 2040001 -> Ctrl+V, expecting only the field values to land on 2040001.
+        // The reported workflow: 02020000 -> select 價格/slotMax -> Ctrl+C -> click 02020001 in
+        // the tree -> Ctrl+V, expecting only those field values to land on 02020001.
         var panel = new NodeEditorPanel();
 
-        Assert.True(panel.TryLoad(MakeConsumeItem("2040000", ("price", 100), ("incPDD", 5)), null));
+        Assert.True(panel.TryLoad(MakeConsumeItem("2020000", ("price", 100), ("slotMax", 9999)), null));
         object sourceCard = LooseCard(panel);
-        Fields(sourceCard)["price"].Text = "777";
-        Fields(sourceCard)["incPDD"].Text = "42";
+        Fields(sourceCard)["price"].Text = "210";
+        Fields(sourceCard)["slotMax"].Text = "500";
         Selected(sourceCard).Add("price");
-        Selected(sourceCard).Add("incPDD");
+        Selected(sourceCard).Add("slotMax");
 
-        Assert.True(panel.TryHandleFieldCopyShortcut());
+        Assert.True(panel.HasSelectedFields);
+        panel.CopySelectedFieldsShortcut();
         Assert.True(panel.HasCopiedFields);
 
-        // Switching tree selection to a different item id rebuilds the panel for 2040001, same
-        // as MainPanel.ShowNodeEditorIfApplicable does on every tree selection change. No field
-        // needs to be (re)selected on the target per the reported workflow.
-        Assert.True(panel.TryLoad(MakeConsumeItem("2040001", ("price", 1), ("incPDD", 2)), null));
+        // Clicking another item in the tree rebuilds the panel for it, same as
+        // MainPanel.ShowNodeEditorIfApplicable does on every selection change. Nothing needs to
+        // be (re)selected on the target - the staged copy survives the rebuild on purpose.
+        Assert.True(panel.TryLoad(MakeConsumeItem("2020001", ("price", 1), ("slotMax", 2)), null));
+        Assert.False(panel.HasSelectedFields);
+        Assert.True(panel.HasCopiedFields); // so MainForm's Ctrl+V takes the field branch
 
-        Assert.True(panel.TryHandleFieldPasteShortcut());
+        panel.PasteCopiedFieldsShortcut();
 
         object targetCard = LooseCard(panel);
-        Assert.Equal("777", Fields(targetCard)["price"].Text);
-        Assert.Equal("42", Fields(targetCard)["incPDD"].Text);
+        Assert.Equal("210", Fields(targetCard)["price"].Text);
+        Assert.Equal("500", Fields(targetCard)["slotMax"].Text);
 
-        // The card is still 2040001's own - proving this applied values onto the *target's*
-        // card rather than swapping in the source's. There is no tree at all in this test, which
-        // is the point: field paste has no code path that could ever insert/clone a WZ node.
-        Assert.Equal("2040001", Title(targetCard));
+        // Still 2020001's own card - the values were applied onto the *target*, not the source
+        // card swapped in. There is no tree in this test at all, which is the point: this path
+        // has no way to clone or insert a WZ node.
+        Assert.Equal("2020001", Title(targetCard));
     });
 
     [Fact]
-    public void MismatchedTargetCard_PasteShortcut_ReturnsTrueWithoutFallback_AndKeepsClipboardStaged() => RunSta(() =>
+    public void MismatchedTargetCard_KeepsFieldBranchAndClipboard_SoTreePasteNeverRuns() => RunSta(() =>
     {
         var panel = new NodeEditorPanel();
 
         Assert.True(panel.TryLoad(MakeConsumeItem("2040000", ("price", 100)), null));
-        object sourceCard = LooseCard(panel);
-        Selected(sourceCard).Add("price");
-        Assert.True(panel.TryHandleFieldCopyShortcut());
+        Selected(LooseCard(panel)).Add("price");
+        panel.CopySelectedFieldsShortcut();
 
         Assert.True(panel.TryLoad(MakeItemWithOnlySpecContainer("9999999"), null));
         Assert.Null(LooseCard(panel)); // no loose card was even built for this item
 
-        // Must still report "handled" (true) so MainForm never falls back to the tree's
-        // whole-node paste - that fallback is exactly what the reported bug looked like.
-        Assert.True(panel.TryHandleFieldPasteShortcut());
+        panel.PasteCopiedFieldsShortcut();
 
-        // Nothing to apply the values to, and nothing should be silently dropped - the clipboard
-        // stays staged so the user can navigate to a compatible card and try again.
+        // HasCopiedFields staying true is what stops MainForm from ever reaching DoPaste() - an
+        // incompatible target must not silently fall back to pasting the whole tree node. The
+        // copy also stays staged so the user can go to a compatible card and retry.
         Assert.True(panel.HasCopiedFields);
         Assert.Contains("沒有同類卡片可以貼上", StatusText(panel));
     });
 
     [Fact]
-    public void ClearCopiedFields_MakesPasteShortcutReturnFalse_SoTreeLevelPasteRunsInstead() => RunSta(() =>
+    public void TreeCopyClearsFieldClipboard_SoTheNextCtrlVIsATreePaste() => RunSta(() =>
     {
         var panel = new NodeEditorPanel();
 
         Assert.True(panel.TryLoad(MakeConsumeItem("2040000", ("price", 100)), null));
-        object sourceCard = LooseCard(panel);
-        Selected(sourceCard).Add("price");
-        Assert.True(panel.TryHandleFieldCopyShortcut());
+        Selected(LooseCard(panel)).Add("price");
+        panel.CopySelectedFieldsShortcut();
         Assert.True(panel.HasCopiedFields);
 
-        // Exactly what MainPanel.DoCopy() now calls before doing its own whole-node tree copy -
-        // "the last Ctrl+C wins".
+        // Exactly what MainPanel.DoCopy() calls before taking its own whole-node copy -
+        // "last Ctrl+C wins".
         panel.ClearCopiedFields();
 
         Assert.True(panel.TryLoad(MakeConsumeItem("2040001", ("price", 1)), null));
-        Assert.False(panel.TryHandleFieldPasteShortcut());
+        Assert.False(panel.HasCopiedFields); // MainForm's Ctrl+V now goes to DoPaste()
+    });
+
+    [Fact]
+    public void FieldCopyAfterATreeCopy_WinsTheNextCtrlV() => RunSta(() =>
+    {
+        // The mirror of the previous test: a tree copy happened first (modelled by the
+        // ClearCopiedFields that DoCopy performs), then the user copies fields - the field
+        // clipboard must be the one a following Ctrl+V uses.
+        var panel = new NodeEditorPanel();
+        Assert.True(panel.TryLoad(MakeConsumeItem("2040000", ("price", 100)), null));
+
+        panel.ClearCopiedFields();
+
+        Selected(LooseCard(panel)).Add("price");
+        panel.CopySelectedFieldsShortcut();
+
+        Assert.True(panel.TryLoad(MakeConsumeItem("2040001", ("price", 1)), null));
+        Assert.True(panel.HasCopiedFields);
     });
 
     [Fact]
     public void EquipStyleInfoCard_CopyThenPasteAcrossDifferentItemIds_StillMatchesByTitle() => RunSta(() =>
     {
-        // Regression for the pre-existing (Equip) MatchKey-by-Title path, composed with the new
-        // shortcut methods - only the Consume loose-card path changed for this bug.
+        // Regression for the Equip (MatchKey-by-Title) path - only the Consume loose-card path
+        // needed the synthetic match key, and this must keep working alongside it.
         var panel = new NodeEditorPanel();
 
         Assert.True(panel.TryLoad(MakeEquipItem("01000000", ("reqSTR", 40), ("incPDD", 10)), null));
@@ -237,12 +258,23 @@ public sealed class NodeEditorCopyPasteTests
         Assert.NotNull(sourceCard);
         Fields(sourceCard)["reqSTR"].Text = "999";
         Selected(sourceCard).Add("reqSTR");
-        Assert.True(panel.TryHandleFieldCopyShortcut());
+        panel.CopySelectedFieldsShortcut();
 
         Assert.True(panel.TryLoad(MakeEquipItem("01000001", ("reqSTR", 1), ("incPDD", 1)), null));
-        Assert.True(panel.TryHandleFieldPasteShortcut());
+        panel.PasteCopiedFieldsShortcut();
 
-        object targetCard = CardTitled(panel, "info");
-        Assert.Equal("999", Fields(targetCard)["reqSTR"].Text);
+        Assert.Equal("999", Fields(CardTitled(panel, "info"))["reqSTR"].Text);
+    });
+
+    [Fact]
+    public void IsValueTextBoxFocused_IsFalseWhenNothingInThePanelHasFocus() => RunSta(() =>
+    {
+        // Narrow guard only: with no live focus the TextBox escape hatch must not misfire and
+        // swallow Ctrl+C/Ctrl+V. Its real behaviour with keyboard focus inside a value box needs
+        // a focused window and is verified manually - see the class doc comment's SCOPE note.
+        var panel = new NodeEditorPanel();
+        Assert.True(panel.TryLoad(MakeConsumeItem("2040000", ("price", 100)), null));
+
+        Assert.False(panel.IsValueTextBoxFocused);
     });
 }

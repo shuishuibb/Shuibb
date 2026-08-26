@@ -46,7 +46,7 @@ namespace SkillPreview
         private readonly List<GroupBinding> groups = new List<GroupBinding>();
         private readonly Dictionary<string, TextBox> stringBoxes = new Dictionary<string, TextBox>();
 
-        // Cross-node field copy/paste ("複製選取" / "貼上"). Deliberately NOT reset by Rebuild -
+        // Cross-node field copy/paste (plain Ctrl+C / Ctrl+V). Deliberately NOT reset by Rebuild -
         // the whole point is copy on node A, select node B (which rebuilds everything), paste
         // into B's matching card. Only ever staged into TextBoxes; see PasteFields.
         private List<(string Name, string Value)> copiedFields;
@@ -363,23 +363,13 @@ namespace SkillPreview
             add.Click += delegate { AddFieldTo(binding); };
             buttons.Children.Add(add);
 
+            // Field copy/paste has no buttons of its own by design: multi-select rows (click a
+            // label, Ctrl+click to add/remove more) and use plain Ctrl+C / Ctrl+V, which route
+            // here through MainForm.MainWindow_PreviewKeyDown - see the shortcut API below.
             var save = AccentButton(theme, "儲存數值");
             save.Margin = new Thickness(0.0);
             save.Click += delegate { SaveGroup(binding); };
             buttons.Children.Add(save);
-
-            // Multi-select (click a label, Ctrl+click to add/remove more) + copy/paste between
-            // two nodes' same-named card - e.g. select reqSTR/reqDEX on item A's "info", copy,
-            // select item B, paste onto its "info". Paste only ever stages TextBox text; nothing
-            // is written to the WZ until the existing 儲存數值 button is pressed, same as typing
-            // a value in by hand.
-            var copySelected = PlainButton(theme, "複製選取");
-            copySelected.Click += delegate { CopySelectedFields(binding); };
-            buttons.Children.Add(copySelected);
-
-            var paste = PlainButton(theme, "貼上");
-            paste.Click += delegate { PasteFields(binding); };
-            buttons.Children.Add(paste);
 
             header.Children.Add(buttons);
             header.Children.Add(new TextBlock
@@ -652,9 +642,9 @@ namespace SkillPreview
             // WPF tunnels PreviewKeyDown from the Window down to the focused element, and
             // MainForm's own Window-level PreviewKeyDown handler marks the key Handled first -
             // before it ever reaches this row, no matter what has focus. The real routing is in
-            // MainForm.MainWindow_PreviewKeyDown, via TryHandleFieldCopyShortcut/
-            // TryHandleFieldPasteShortcut below, which key off the field selection/clipboard
-            // state instead of focus.
+            // MainForm.MainWindow_PreviewKeyDown, via HasSelectedFields/HasCopiedFields and
+            // CopySelectedFieldsShortcut/PasteCopiedFieldsShortcut below, which key off the field
+            // selection/clipboard state instead of focus.
             text.MouseLeftButtonDown += delegate (object sender, MouseButtonEventArgs e)
             {
                 ToggleFieldSelection(binding, propertyName, (Keyboard.Modifiers & ModifierKeys.Control) != 0);
@@ -746,7 +736,7 @@ namespace SkillPreview
         {
             if (copiedFields == null || copiedFields.Count == 0)
             {
-                statusText.Text = "剪貼簿是空的，請先在某張卡片選取欄位並按「複製選取」。";
+                statusText.Text = "剪貼簿是空的，請先在某張卡片點選欄位名稱再按 Ctrl+C。";
                 return;
             }
             if (!string.Equals(copiedFieldsSourceMatchKey, binding.MatchKey, StringComparison.Ordinal))
@@ -776,27 +766,44 @@ namespace SkillPreview
 
         // ---- global Ctrl+C / Ctrl+V routing (MainForm.MainWindow_PreviewKeyDown) ----------------
         //
-        // WPF tunnels PreviewKeyDown from the Window down to the focused element, so
-        // MainForm's own Window-level PreviewKeyDown handler always runs - and marks the event
-        // Handled - before any handler further down the tree (dataTreeView's, or a field row's)
-        // ever sees the key. That handler unconditionally called MainPanel.DoCopy()/DoPaste(),
-        // which is the real reason a plain Ctrl+C/Ctrl+V after selecting a field still copied and
-        // pasted the *entire tree node*: nothing lower in the tree ever got a chance to react,
-        // no matter what had keyboard focus. These three members let MainForm ask this panel
-        // first instead, based on the field selection/clipboard state (not focus, which is what
-        // made the previous attempt at this fix ineffective).
+        // WPF tunnels PreviewKeyDown from the Window down to the focused element, so MainForm's
+        // own Window-level PreviewKeyDown handler always runs - and marks the event Handled -
+        // before any handler further down the tree (dataTreeView's, or a field row's) ever sees
+        // the key. Field copy/paste therefore cannot be implemented down here; it has to be a
+        // decision MainForm makes. These members are the state MainForm asks about, and the two
+        // actions it invokes once the user has answered the confirmation prompt.
+        //
+        // The confirmation prompts themselves (Warning.Warn / Properties.Resources.MainConfirm*)
+        // deliberately stay in MainForm: they live in HaRepacker, which this project must not
+        // reference (SkillPreview -> MapleLib only; HaRepacker -> SkillPreview). So the split is:
+        // MainForm decides *whether* to act and asks the user, this panel only reports state and
+        // does the work.
 
         /// <summary>
-        /// True while a field copy (via TryHandleFieldCopyShortcut or the 複製選取 button) is
-        /// staged and hasn't been superseded by a tree-level copy - see ClearCopiedFields.
+        /// True when at least one card currently has selected field rows, i.e. a Ctrl+C should
+        /// copy those fields rather than the tree's selected WZ node.
+        /// </summary>
+        public bool HasSelectedFields => groups.Any(g => g.SelectedFieldNames.Count > 0);
+
+        /// <summary>
+        /// True while a field copy is staged and hasn't been superseded by a tree-level copy
+        /// (see <see cref="ClearCopiedFields"/>), i.e. a Ctrl+V should paste those field values
+        /// rather than the tree clipboard's WZ nodes.
         /// </summary>
         public bool HasCopiedFields => copiedFields != null && copiedFields.Count > 0;
 
         /// <summary>
+        /// True when keyboard focus is inside one of this panel's editable value boxes, so
+        /// Ctrl+C/Ctrl+V must be left alone as ordinary WPF text copy/paste of the selected text -
+        /// neither a field copy nor a tree copy, and no confirmation prompt.
+        /// </summary>
+        public bool IsValueTextBoxFocused => IsKeyboardFocusWithin && Keyboard.FocusedElement is TextBox;
+
+        /// <summary>
         /// Discards any staged field copy. Called from MainPanel.DoCopy() right before it copies
         /// a whole tree node, so "the last Ctrl+C wins": copying a tree node always cancels a
-        /// pending field copy, and the next Ctrl+V then falls back to the tree's normal
-        /// whole-node paste instead of trying to apply stale field values.
+        /// pending field copy, and the next Ctrl+V then goes back to the tree's normal whole-node
+        /// paste instead of applying stale field values.
         /// </summary>
         public void ClearCopiedFields()
         {
@@ -806,43 +813,37 @@ namespace SkillPreview
         }
 
         /// <summary>
-        /// Backs a global Ctrl+C: when a field is actively selected on the currently displayed
-        /// card, copies the selected fields (same as pressing 複製選取) and returns true so the
-        /// caller skips its own whole-node tree copy. Returns false when nothing is selected, so
-        /// an ordinary Ctrl+C still copies the tree node exactly as before.
+        /// Copies the currently selected fields. Only call after <see cref="HasSelectedFields"/>
+        /// is true and the user has confirmed - this does no prompting of its own.
         /// </summary>
-        public bool TryHandleFieldCopyShortcut()
+        public void CopySelectedFieldsShortcut()
         {
             GroupBinding source = groups.FirstOrDefault(g => g.SelectedFieldNames.Count > 0);
             if (source == null)
-                return false;
+                return;
 
             CopySelectedFields(source);
-            return true;
         }
 
         /// <summary>
-        /// Backs a global Ctrl+V: when a field copy is staged, pastes those fields into the
-        /// currently displayed node's matching card (by MatchKey) and returns true so the caller
-        /// skips its own whole-node tree paste - this is what makes "copy fields on 2040000,
-        /// select 2040001, Ctrl+V" land on the field's matching card instead of cloning the whole
-        /// WZ node. Shows the usual mismatch message (and still returns true, so the tree paste
-        /// never runs as a fallback) when the current node has no card of that kind. Returns
-        /// false only when no field copy is staged, so an ordinary Ctrl+V still pastes the tree
-        /// node as before.
+        /// Applies the staged field copy onto the currently displayed node's card of the same
+        /// kind (matched by MatchKey, so a Consume item's own loose fields land on another item's
+        /// loose fields - see GroupBinding.MatchKey). Only call after
+        /// <see cref="HasCopiedFields"/> is true and the user has confirmed - this does no
+        /// prompting of its own, and only ever stages TextBox text: nothing reaches the WZ until
+        /// 儲存數值 is pressed. When the current node has no matching card, this says so and
+        /// leaves the copy staged; it never falls back to anything tree-level.
         /// </summary>
-        public bool TryHandleFieldPasteShortcut()
+        public void PasteCopiedFieldsShortcut()
         {
             if (!HasCopiedFields)
-                return false;
+                return;
 
             GroupBinding target = groups.FirstOrDefault(g => string.Equals(g.MatchKey, copiedFieldsSourceMatchKey, StringComparison.Ordinal));
             if (target != null)
                 PasteFields(target);
             else
                 statusText.Text = "複製的欄位來自「" + copiedFieldsSourceDisplayTitle + "」，目前節點沒有同類卡片可以貼上。";
-
-            return true;
         }
 
         private static TextBox FieldBox(EditorTheme theme, string value, bool multiline)

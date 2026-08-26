@@ -4040,8 +4040,9 @@ namespace HaRepacker.GUI.Panels
 
             // "Last Ctrl+C wins": a whole-node tree copy always cancels a pending field copy
             // staged in the property editor, so a following Ctrl+V goes back to this tree paste
-            // instead of trying to apply stale field values - see TryHandleFieldCopyShortcut /
-            // TryHandleFieldPasteShortcut below and MainForm.MainWindow_PreviewKeyDown.
+            // instead of trying to apply stale field values - see the editor pass-throughs below
+            // and MainForm.MainWindow_PreviewKeyDown. Placed after the confirmation above, so
+            // answering No to 是否複製 leaves the field copy alone too.
             nodeEditorPanel?.ClearCopiedFields();
 
             foreach (WzObject obj in clipboard)
@@ -4077,19 +4078,39 @@ namespace HaRepacker.GUI.Panels
             }
         }
 
-        /// <summary>
-        /// Lets a global Ctrl+C (MainForm.MainWindow_PreviewKeyDown) copy the property editor's
-        /// selected fields instead of this tree's whole-node copy, when a field is actively
-        /// selected there. See NodeEditorPanel.TryHandleFieldCopyShortcut.
-        /// </summary>
-        public bool TryHandleFieldCopyShortcut() => nodeEditorPanel?.TryHandleFieldCopyShortcut() == true;
+        // ---- property-editor field copy/paste, as seen by MainForm's Ctrl+C / Ctrl+V ------------
+        //
+        // Pure pass-throughs to the node editor panel. MainForm decides which of the two
+        // clipboards a keystroke belongs to and shows the matching MainConfirmCopy /
+        // MainConfirmPaste prompt itself; DoCopy/DoPaste below still prompt for the tree's own
+        // clipboard exactly as they always did, so a keystroke never prompts twice.
 
         /// <summary>
-        /// Lets a global Ctrl+V (MainForm.MainWindow_PreviewKeyDown) paste a staged field copy
-        /// into the property editor's matching card instead of this tree's whole-node paste, when
-        /// a field copy is staged. See NodeEditorPanel.TryHandleFieldPasteShortcut.
+        /// True when the property editor has selected field rows, i.e. Ctrl+C means "copy those
+        /// fields" rather than "copy the selected tree node".
         /// </summary>
-        public bool TryHandleFieldPasteShortcut() => nodeEditorPanel?.TryHandleFieldPasteShortcut() == true;
+        public bool HasSelectedEditorFields => nodeEditorPanel?.HasSelectedFields == true;
+
+        /// <summary>
+        /// True when a property-editor field copy is staged, i.e. Ctrl+V means "paste those field
+        /// values" rather than "paste the tree clipboard".
+        /// </summary>
+        public bool HasCopiedEditorFields => nodeEditorPanel?.HasCopiedFields == true;
+
+        /// <summary>
+        /// True when keyboard focus is inside one of the property editor's value boxes, where
+        /// Ctrl+C/Ctrl+V must stay ordinary WPF text copy/paste - no WZ clipboard, no prompt.
+        /// </summary>
+        public bool IsNodeEditorValueBoxFocused => nodeEditorPanel?.IsValueTextBoxFocused == true;
+
+        /// <summary>Copies the property editor's selected fields. Caller confirms first.</summary>
+        public void CopySelectedEditorFields() => nodeEditorPanel?.CopySelectedFieldsShortcut();
+
+        /// <summary>
+        /// Applies the staged field copy onto the current node's matching card - staged into the
+        /// TextBoxes only, never written to the WZ until 儲存數值 is pressed. Caller confirms first.
+        /// </summary>
+        public void PasteCopiedEditorFields() => nodeEditorPanel?.PasteCopiedFieldsShortcut();
 
         /// <summary>
         /// The name of the node the clipboard contents were copied out of, or null when the
