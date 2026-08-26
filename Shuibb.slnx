@@ -1,0 +1,32 @@
+<Solution>
+  <Folder Name="/HaRepacker/">
+    <Project Path="HaRepacker/Harepacker-resurrected.csproj" />
+  </Folder>
+  <Folder Name="/MapleLib/">
+    <Project Path="MapleLib/MapleLib.Tests/MapleLib.Tests.csproj" />
+    <Project Path="MapleLib/MapleLib/MapleLib.csproj" />
+  </Folder>
+  <Folder Name="/MapleLib/spine-runtimes-2.1.25/" />
+  <Folder Name="/MapleLib/spine-runtimes-2.1.25/spine-csharp/">
+    <Project Path="MapleLib/spine-runtimes-2.1.25/spine-csharp/spine-csharp 2.1.25.csproj" />
+  </Folder>
+  <Folder Name="/MapleLib/spine-runtimes-4.1-ns/" />
+  <Folder Name="/MapleLib/spine-runtimes-4.1-ns/spine-csharp/">
+    <Project Path="MapleLib/spine-runtimes-4.1-ns/spine-csharp/spine-csharp-4.1-ns.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/derivetest/derivetest.csproj" />
+    <Project Path="tests/nodetest/nodetest.csproj" />
+    <Project Path="tests/opentwice/opentwice.csproj" />
+    <Project Path="tests/svtest/svtest.csproj" />
+    <Project Path="tests/switchtest/switchtest.csproj" />
+    <Project Path="tests/typeahead/typeahead.csproj" />
+  </Folder>
+  <Folder Name="/tools/">
+    <Project Path="tools/iltransplant/iltransplant.csproj" />
+  </Folder>
+  <Project Path="HaSharedLibrary/HaSharedLibrary.csproj" />
+  <Project Path="RealESRGAN_AI_Upscale/RealESRGAN_AI_Upscale.csproj" />
+  <Project Path="SkillPreview/SkillPreview.csproj" />
+  <Project Path="TokiAiAssistant/TokiAiAssistant.csproj" />
+</Solution>

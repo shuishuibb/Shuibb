@@ -1,0 +1,529 @@
+using HaCreator.MapSimulator.Animation;
+using HaCreator.MapSimulator.Character;
+using HaCreator.MapSimulator.UI;
+using HaCreator.MapSimulator;
+using HaSharedLibrary.Render;
+using HaSharedLibrary.Render.DX;
+using Microsoft.Xna.Framework;
+using Microsoft.Xna.Framework.Graphics;
+using Microsoft.Xna.Framework.Input;
+using Spine;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+
+namespace HaCreator.MapSimulator.UI
+{
+    /// <summary>
+    /// Base class for UI windows (Inventory, Equipment, Skills, Quest, etc.)
+    /// Provides common functionality like dragging, closing, visibility toggle
+    /// </summary>
+    public abstract class UIWindowBase : BaseDXDrawableItem, IUIObjectEvents
+    {
+        #region Fields
+        protected readonly List<UIObject> uiButtons = new List<UIObject>();
+        protected UIObject closeButton;
+        protected SpriteFont WindowFont;
+
+        private bool _isVisible = false;
+        private Point? _mouseOffsetOnDragStart = null;
+        private AnimationDisplayerWindowOverlayOwner _animationDisplayerWindowOverlayOwner;
+
+        // Toggle cooldown
+        private int _lastToggleTime = 0;
+        private const int TOGGLE_COOLDOWN_MS = 200;
+
+        // Overridable frame (for dynamic frame switching like expanded inventory)
+        private IDXObject _overrideFrame = null;
+        #endregion
+
+        #region Properties
+        /// <summary>
+        /// Whether the window is currently visible
+        /// </summary>
+        public new bool IsVisible
+        {
+            get => _isVisible;
+            set => SetVisibility(value, invokeBeforeShow: true);
+        }
+
+        /// <summary>
+        /// Window name for identification
+        /// </summary>
+        public abstract string WindowName { get; }
+
+        /// <summary>
+        /// Whether the window can be dragged by holding its frame.
+        /// </summary>
+        public virtual bool SupportsDragging { get; protected set; } = true;
+
+        /// <summary>
+        /// Whether the window currently owns keyboard input and should block chat or window hotkeys.
+        /// </summary>
+        public virtual bool CapturesKeyboardInput => false;
+
+        /// <summary>
+        /// Whether the visible window behaves like a client modal dialog and blocks lower owners.
+        /// </summary>
+        public virtual bool IsModalDialogOwner => false;
+
+        /// <summary>
+        /// Whether the window should be skipped when the manager hides the topmost or all windows.
+        /// Used for client-owned overlay hosts that should stay resident.
+        /// </summary>
+        public virtual bool ExcludeFromWindowManagerHide => false;
+
+        /// <summary>
+        /// Optional callback invoked whenever the window is shown through any path.
+        /// </summary>
+        public Action<UIWindowBase> BeforeShow { get; set; }
+
+        /// <summary>
+        /// Character build for stat windows (AbilityUI, AbilityUIBigBang)
+        /// Override in derived classes that need character stats
+        /// </summary>
+        public virtual CharacterBuild CharacterBuild { get; set; }
+
+        /// <summary>
+        /// Gets or sets the current frame to draw. Setting this overrides the base frame.
+        /// Used for dynamic frame switching (e.g., expanded inventory view).
+        /// </summary>
+        protected IDXObject Frame
+        {
+            get => _overrideFrame ?? Frame0;
+            set => _overrideFrame = value;
+        }
+
+        /// <summary>
+        /// Gets the current frame for dimension calculations
+        /// </summary>
+        protected IDXObject CurrentFrame => _overrideFrame ?? LastFrameDrawn;
+        #endregion
+
+        #region Constructor
+        /// <summary>
+        /// Constructor
+        /// </summary>
+        /// <param name="frame">The window background frame</param>
+        protected UIWindowBase(IDXObject frame)
+            : base(frame, false)
+        {
+        }
+
+        /// <summary>
+        /// Constructor with position
+        /// </summary>
+        /// <param name="frame">The window background frame</param>
+        /// <param name="position">Initial position</param>
+        protected UIWindowBase(IDXObject frame, Point position)
+            : base(frame, false)
+        {
+            this.Position = position;
+        }
+        #endregion
+
+        #region Initialization
+        /// <summary>
+        /// Initialize the close button
+        /// </summary>
+        /// <param name="btnClose">The close button UIObject</param>
+        public virtual void InitializeCloseButton(UIObject btnClose)
+        {
+            this.closeButton = btnClose;
+            if (btnClose != null)
+            {
+                uiButtons.Add(btnClose);
+                btnClose.ButtonClickReleased += OnCloseButtonClicked;
+            }
+        }
+
+        /// <summary>
+        /// Add a UI button to the window
+        /// </summary>
+        /// <param name="button">The button to add</param>
+        protected void AddButton(UIObject button)
+        {
+            if (button != null)
+            {
+                uiButtons.Add(button);
+            }
+        }
+        #endregion
+
+        #region Drawing
+        /// <summary>
+        /// Draw the window (matches MinimapUI exactly)
+        /// </summary>
+        public override void Draw(SpriteBatch sprite, SkeletonMeshRenderer skeletonMeshRenderer, GameTime gameTime,
+            int mapShiftX, int mapShiftY, int centerX, int centerY,
+            ReflectionDrawableBoundary drawReflectionInfo,
+            RenderParameters renderParameters,
+            int TickCount)
+        {
+            if (!_isVisible)
+                return;
+
+            // Draw the main window frame
+            // If override frame is set, draw it instead of base frame
+            if (_overrideFrame != null)
+            {
+                _overrideFrame.DrawBackground(sprite, skeletonMeshRenderer, gameTime,
+                    this.Position.X, this.Position.Y,
+                    Color.White, false, drawReflectionInfo);
+            }
+            else
+            {
+                // Draw the main window frame (use 0, 0 like MinimapUI - position is controlled by this.Position)
+                base.Draw(sprite, skeletonMeshRenderer, gameTime,
+                    0, 0, centerX, centerY,
+                    drawReflectionInfo,
+                    renderParameters,
+                    TickCount);
+            }
+
+            _animationDisplayerWindowOverlayOwner?.DrawWindow(
+                WindowName,
+                AnimationDisplayerWindowOverlayPass.Underlay,
+                sprite,
+                skeletonMeshRenderer,
+                gameTime,
+                Position,
+                TickCount);
+
+            // Draw window contents (implemented by derived classes)
+            DrawContents(sprite, skeletonMeshRenderer, gameTime,
+                mapShiftX, mapShiftY, centerX, centerY,
+                drawReflectionInfo, renderParameters, TickCount);
+
+            // Draw buttons (position relative to window, like MinimapUI)
+            foreach (UIObject uiBtn in uiButtons)
+            {
+                // Skip hidden buttons
+                if (!uiBtn.ButtonVisible)
+                    continue;
+
+                BaseDXDrawableItem buttonToDraw = uiBtn.GetBaseDXDrawableItemByState();
+
+                // Position drawn is relative to the window
+                int drawRelativeX = -(this.Position.X) - uiBtn.X;
+                int drawRelativeY = -(this.Position.Y) - uiBtn.Y;
+
+                buttonToDraw.Draw(sprite, skeletonMeshRenderer,
+                    gameTime,
+                    drawRelativeX,
+                    drawRelativeY,
+                    centerX, centerY,
+                    null,
+                    renderParameters,
+                    TickCount);
+            }
+
+            _animationDisplayerWindowOverlayOwner?.DrawWindow(
+                WindowName,
+                AnimationDisplayerWindowOverlayPass.Overlay,
+                sprite,
+                skeletonMeshRenderer,
+                gameTime,
+                Position,
+                TickCount);
+
+            DrawOverlay(sprite, skeletonMeshRenderer, gameTime,
+                mapShiftX, mapShiftY, centerX, centerY,
+                drawReflectionInfo, renderParameters, TickCount);
+        }
+
+        /// <summary>
+        /// Override in derived classes to draw window-specific content
+        /// </summary>
+        protected virtual void DrawContents(SpriteBatch sprite, SkeletonMeshRenderer skeletonMeshRenderer, GameTime gameTime,
+            int mapShiftX, int mapShiftY, int centerX, int centerY,
+            ReflectionDrawableBoundary drawReflectionInfo,
+            RenderParameters renderParameters,
+            int TickCount)
+        {
+            // Base implementation does nothing - override in derived classes
+        }
+
+        /// <summary>
+        /// Override in derived classes to draw overlays that must appear above buttons.
+        /// </summary>
+        protected virtual void DrawOverlay(SpriteBatch sprite, SkeletonMeshRenderer skeletonMeshRenderer, GameTime gameTime,
+            int mapShiftX, int mapShiftY, int centerX, int centerY,
+            ReflectionDrawableBoundary drawReflectionInfo,
+            RenderParameters renderParameters,
+            int TickCount)
+        {
+            // Base implementation does nothing - override in derived classes
+        }
+        #endregion
+
+        #region Visibility
+        /// <summary>
+        /// Toggle window visibility
+        /// </summary>
+        /// <param name="tickCount">Current tick count for cooldown</param>
+        public void ToggleVisibility(int tickCount)
+        {
+            if (tickCount - _lastToggleTime > TOGGLE_COOLDOWN_MS)
+            {
+                _lastToggleTime = tickCount;
+                if (_isVisible)
+                {
+                    Hide();
+                }
+                else
+                {
+                    Show();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Show the window
+        /// </summary>
+        public virtual void Show()
+        {
+            SetVisibility(true, invokeBeforeShow: true);
+        }
+
+        /// <summary>
+        /// Hide the window
+        /// </summary>
+        public virtual void Hide()
+        {
+            SetVisibility(false, invokeBeforeShow: false);
+        }
+
+        internal void AttachAnimationDisplayerWindowOverlayOwner(AnimationDisplayerWindowOverlayOwner owner)
+        {
+            _animationDisplayerWindowOverlayOwner = owner;
+        }
+
+        /// <summary>
+        /// Reset drag state (called when another UI element takes priority)
+        /// </summary>
+        public void ResetDragState()
+        {
+            _mouseOffsetOnDragStart = null;
+        }
+
+        private void SetVisibility(bool visible, bool invokeBeforeShow)
+        {
+            if (_isVisible == visible)
+            {
+                if (visible && invokeBeforeShow)
+                {
+                    // Some scripted owners refresh an already-visible registered window
+                    // to replace dialog content while keeping the same host alive.
+                    // Those refreshes still need the pre-show seam to fire.
+                    BeforeShow?.Invoke(this);
+                }
+                return;
+            }
+
+            if (visible && invokeBeforeShow)
+            {
+                BeforeShow?.Invoke(this);
+            }
+
+            _isVisible = visible;
+            if (!visible)
+            {
+                ResetImePresentationPlacement();
+                _animationDisplayerWindowOverlayOwner?.ClearWindow(WindowName);
+            }
+        }
+        #endregion
+
+        #region Mouse Events
+        /// <summary>
+        /// Handle mouse events (buttons, dragging)
+        /// Matches MinimapUI behavior exactly
+        /// </summary>
+        public virtual bool CheckMouseEvent(int shiftCenteredX, int shiftCenteredY, MouseState mouseState, MouseCursorItem mouseCursor, int renderWidth, int renderHeight)
+        {
+            if (!_isVisible)
+                return false;
+
+            // Check button clicks first
+            foreach (UIObject uiBtn in uiButtons)
+            {
+                bool bHandled = uiBtn.CheckMouseEvent(shiftCenteredX, shiftCenteredY, this.Position.X, this.Position.Y, mouseState);
+                if (bHandled)
+                {
+                    mouseCursor?.SetMouseCursorMovedToClickableItem();
+                    return true;
+                }
+            }
+
+            // Handle UI movement (exactly like MinimapUI)
+            if (SupportsDragging && mouseState.LeftButton == ButtonState.Pressed)
+            {
+                // Get current frame dimensions (use override frame if set)
+                IDXObject currentFrame = CurrentFrame;
+                int frameWidth = currentFrame?.Width ?? 200;
+                int frameHeight = currentFrame?.Height ?? 200;
+
+                // If drag has not started, initialize the offset
+                if (_mouseOffsetOnDragStart == null)
+                {
+                    Rectangle rect = new Rectangle(
+                        this.Position.X,
+                        this.Position.Y,
+                        frameWidth,
+                        frameHeight);
+
+                    if (!rect.Contains(mouseState.X, mouseState.Y))
+                    {
+                        return false;
+                    }
+                    _mouseOffsetOnDragStart = new Point(mouseState.X - this.Position.X, mouseState.Y - this.Position.Y);
+                }
+
+                // Calculate the mouse position relative to the window
+                // and move the window Position
+                int newX = mouseState.X - _mouseOffsetOnDragStart.Value.X;
+                int newY = mouseState.Y - _mouseOffsetOnDragStart.Value.Y;
+
+                // Enforce screen boundary constraints
+                newX = Math.Max(0, Math.Min(newX, renderWidth - frameWidth));
+                newY = Math.Max(0, Math.Min(newY, renderHeight - frameHeight));
+
+                this.Position = new Point(newX, newY);
+            }
+            else
+            {
+                // If the mouse button is not pressed, reset the initial drag offset
+                _mouseOffsetOnDragStart = null;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// Check if a point is within the window bounds
+        /// </summary>
+        public bool ContainsPoint(int x, int y)
+        {
+            if (!_isVisible)
+                return false;
+
+            if (GetWindowBounds().Contains(x, y))
+            {
+                return true;
+            }
+
+            return GetAdditionalInteractiveBounds().Any(bounds => bounds.Contains(x, y));
+        }
+
+        public virtual void HandleCommittedText(string text)
+        {
+        }
+
+        public virtual void HandleCompositionState(ImeCompositionState state)
+        {
+            HandleCompositionText(state?.Text ?? string.Empty);
+        }
+
+        public virtual void HandleCompositionText(string text)
+        {
+        }
+
+        public virtual void ClearCompositionText()
+        {
+        }
+
+        public virtual void HandleImeCandidateList(ImeCandidateListState state)
+        {
+        }
+
+        public virtual void ClearImeCandidateList()
+        {
+        }
+
+        public virtual void RefreshImePresentationPlacement()
+        {
+        }
+
+        public virtual bool CanStartDragAt(int x, int y)
+        {
+            return GetWindowBounds().Contains(x, y);
+        }
+
+        protected virtual IEnumerable<Rectangle> GetAdditionalInteractiveBounds()
+        {
+            yield break;
+        }
+
+        protected Rectangle GetWindowBounds()
+        {
+            int frameWidth = CurrentFrame?.Width ?? 200;
+            int frameHeight = CurrentFrame?.Height ?? 200;
+
+            return new Rectangle(
+                this.Position.X,
+                this.Position.Y,
+                frameWidth,
+                frameHeight);
+        }
+        #endregion
+
+        #region Event Handlers
+        /// <summary>
+        /// Called when close button is clicked
+        /// </summary>
+        protected virtual void OnCloseButtonClicked(UIObject sender)
+        {
+            Hide();
+        }
+
+        protected virtual void ResetImePresentationPlacement()
+        {
+        }
+        #endregion
+
+        #region Abstract Methods
+        /// <summary>
+        /// Update window state (called each frame)
+        /// </summary>
+        /// <param name="gameTime">Game time</param>
+        public virtual void Update(GameTime gameTime)
+        {
+            // Base implementation does nothing - override in derived classes
+        }
+
+        /// <summary>
+        /// Set the font for text rendering (used by stat windows)
+        /// Override in derived classes that display text
+        /// </summary>
+        /// <param name="font">The font to use</param>
+        public virtual void SetFont(SpriteFont font)
+        {
+            WindowFont = font;
+        }
+
+        protected bool CanDrawWindowText => WindowFont != null;
+
+        protected float WindowLineSpacing => WindowFont?.LineSpacing ?? 0f;
+
+        protected Vector2 MeasureWindowText(SpriteBatch sprite, string text, float scale = 1.0f)
+        {
+            if (WindowFont == null || string.IsNullOrEmpty(text))
+            {
+                return Vector2.Zero;
+            }
+
+            return ClientTextDrawing.Measure(sprite?.GraphicsDevice, text, scale, WindowFont);
+        }
+
+        protected void DrawWindowText(SpriteBatch sprite, string text, Vector2 position, Color color, float scale = 1.0f, float? maxWidth = null)
+        {
+            if (WindowFont == null || string.IsNullOrWhiteSpace(text))
+            {
+                return;
+            }
+
+            ClientTextDrawing.Draw(sprite, text, position, color, scale, WindowFont, maxWidth);
+        }
+        #endregion
+    }
+}

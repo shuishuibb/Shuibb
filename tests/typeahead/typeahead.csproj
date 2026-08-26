@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <UseWPF>true</UseWPF>
+    <Nullable>disable</Nullable>
+    <AssemblyName>typeahead</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\HaRepacker\Harepacker-resurrected.csproj" />
+    <ProjectReference Include="..\..\MapleLib\MapleLib\MapleLib.csproj" />
+    <ProjectReference Include="..\..\HaSharedLibrary\HaSharedLibrary.csproj" />
+  </ItemGroup>
+</Project>

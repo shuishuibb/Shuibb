@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <UseWPF>true</UseWPF>
+    <Nullable>disable</Nullable>
+    <AssemblyName>opentwice</AssemblyName>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- The DEPLOYED binaries: the host is untouched, the fix is transplanted into MapleLib.dll. -->
+    <ProjectReference Include="..\..\HaRepacker\Harepacker-resurrected.csproj" />
+    <ProjectReference Include="..\..\MapleLib\MapleLib\MapleLib.csproj" />
+    <ProjectReference Include="..\..\HaSharedLibrary\HaSharedLibrary.csproj" />
+  </ItemGroup>
+</Project>

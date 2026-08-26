@@ -1,0 +1,459 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <OutputType>WinExe</OutputType>
+    <AssemblyName>WvsMaps</AssemblyName>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <UseWindowsForms>true</UseWindowsForms>
+    <UseWPF>true</UseWPF>
+    <ImportWindowsDesktopTargets>true</ImportWindowsDesktopTargets>
+
+    <RuntimeIdentifiers>win-x64;win-x86;win-arm64</RuntimeIdentifiers>
+    <PublishAot>false</PublishAot>
+    <_SuppressWinFormsTrimError>false</_SuppressWinFormsTrimError>
+    <_SuppressWpfTrimError>false</_SuppressWpfTrimError>
+
+    <!-- Required for WinForms -->
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <!-- Suppress CS8981: lowercase type names warning (bsc, enH0, etc.) -->
+    <NoWarn>$(NoWarn);CS8981</NoWarn>
+  </PropertyGroup>
+
+    <!-- x64-specific configuration -->
+  <PropertyGroup Condition="'$(RuntimeIdentifier)' == 'win-x64'">
+    <PublishAot>false</PublishAot>
+  </PropertyGroup>
+  <!-- x86-specific configuration -->
+  <PropertyGroup Condition="'$(RuntimeIdentifier)' == 'win-x86'">
+    <PublishAot>false</PublishAot>
+  </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Debug|x86' ">
+    <CodeAnalysisRuleSet>AllRules.ruleset</CodeAnalysisRuleSet>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+  <PropertyGroup Condition=" '$(Configuration)|$(Platform)' == 'Release|x86' ">
+    <CodeAnalysisRuleSet>AllRules.ruleset</CodeAnalysisRuleSet>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <Win32Resource>
+    </Win32Resource>
+  </PropertyGroup>
+  
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Debug|x64'">
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <CodeAnalysisLogFile>bin\x86\Debug\WvsMaps.exe.CodeAnalysisLog.xml</CodeAnalysisLogFile>
+    <CodeAnalysisRuleSet>AllRules.ruleset</CodeAnalysisRuleSet>
+    <CodeAnalysisRuleSetDirectories>;C:\Program Files (x86)\Microsoft Visual Studio 10.0\Team Tools\Static Analysis Tools\\Rule Sets</CodeAnalysisRuleSetDirectories>
+    <CodeAnalysisRuleDirectories>;C:\Program Files (x86)\Microsoft Visual Studio 10.0\Team Tools\Static Analysis Tools\FxCop\\Rules</CodeAnalysisRuleDirectories>
+    <CodeAnalysisIgnoreBuiltInRules>false</CodeAnalysisIgnoreBuiltInRules>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Release|x64'">
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <CodeAnalysisLogFile>bin\x86\Release\WvsMaps.exe.CodeAnalysisLog.xml</CodeAnalysisLogFile>
+    <CodeAnalysisRuleSet>AllRules.ruleset</CodeAnalysisRuleSet>
+    <CodeAnalysisRuleSetDirectories>;C:\Program Files (x86)\Microsoft Visual Studio 10.0\Team Tools\Static Analysis Tools\\Rule Sets</CodeAnalysisRuleSetDirectories>
+    <CodeAnalysisRuleDirectories>;C:\Program Files (x86)\Microsoft Visual Studio 10.0\Team Tools\Static Analysis Tools\FxCop\\Rules</CodeAnalysisRuleDirectories>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Debug|AnyCPU'">
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <CodeAnalysisRuleSet>AllRules.ruleset</CodeAnalysisRuleSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Release|AnyCPU'">
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <CodeAnalysisRuleSet>AllRules.ruleset</CodeAnalysisRuleSet>
+    <WarningLevel>3</WarningLevel>
+  </PropertyGroup>
+  <PropertyGroup>
+    <StartupObject>HaCreator.Program</StartupObject>
+  </PropertyGroup>
+  <PropertyGroup>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+  </PropertyGroup>
+  <PropertyGroup>
+    <SignManifests>false</SignManifests>
+  </PropertyGroup>
+  <PropertyGroup>
+    <ManifestCertificateThumbprint>92BDF5A49B95221059718A85DF060FA1DFD1B7CE</ManifestCertificateThumbprint>
+  </PropertyGroup>
+  <PropertyGroup>
+    <ManifestKeyFile>HaCreator_TemporaryKey.pfx</ManifestKeyFile>
+  </PropertyGroup>
+  <PropertyGroup>
+    <GenerateManifests>true</GenerateManifests>
+    <FileVersion>7.1.1</FileVersion>
+    <PackAsTool>False</PackAsTool>
+    <ApplicationIcon>logo.ico</ApplicationIcon>
+    <PackageIcon>logo.png</PackageIcon>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Update="CustomControls\WatermarkTextBox.cs">
+      <SubType>Component</SubType>
+    </Compile>
+    <Compile Update="GUI\EditorPanels\BlackBorderPanel.cs">
+      <SubType>UserControl</SubType>
+    </Compile>
+    <Compile Update="GUI\EditorPanels\BackgroundPanel.cs">
+      <SubType>UserControl</SubType>
+    </Compile>
+    <Compile Update="GUI\EditorPanels\CommonPanel.cs">
+      <SubType>UserControl</SubType>
+    </Compile>
+    <Compile Update="GUI\EditorPanels\LifePanel.cs">
+      <SubType>UserControl</SubType>
+    </Compile>
+    <Compile Update="GUI\EditorPanels\ObjPanel.cs">
+      <SubType>UserControl</SubType>
+    </Compile>
+    <Compile Update="GUI\EditorPanels\PortalPanel.cs">
+      <SubType>UserControl</SubType>
+    </Compile>
+    <Compile Update="GUI\EditorPanels\TilePanel.cs">
+      <SubType>UserControl</SubType>
+    </Compile>
+    <Compile Update="GUI\Input\IntegerInput.cs">
+      <SubType>Component</SubType>
+    </Compile>
+    <Compile Update="CustomControls\BetterCheckedListBox.cs">
+      <SubType>Component</SubType>
+    </Compile>
+    <Compile Update="CustomControls\DirectXHolder.cs">
+      <SubType>UserControl</SubType>
+    </Compile>
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\HaSharedLibrary\HaSharedLibrary.csproj" />
+    <ProjectReference Include="..\HaRepacker\Harepacker-resurrected.csproj" />
+    <ProjectReference Include="..\MapleLib\MapleLib\MapleLib.csproj" />
+    <ProjectReference Include="..\MapleLib\spine-runtimes-2.1.25\spine-csharp\spine-csharp 2.1.25.csproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Resource Include="Images\About.png" />
+    <Resource Include="Images\diagram_parallax.png" />
+    <Resource Include="Images\Exit.png" />
+    <Resource Include="Images\Folder.png" />
+    <Resource Include="Images\help_icon.png" />
+    <Resource Include="Images\magnet_32.png" />
+    <Resource Include="Images\Play.png" />
+    <Resource Include="Images\redo1.png" />
+    <Resource Include="Images\RegenMinimap.png" />
+    <Resource Include="Images\Save.png" />
+    <Resource Include="Images\Settings.png" />
+    <Resource Include="Images\Settings_big.png" />
+    <Resource Include="Images\Undo.png" />
+    <Resource Include="Images\Untitled1.png" />
+    <Resource Include="Images\wz.ico" />
+    <Resource Include="Images\Minimap.png" />
+    <Resource Include="Images\ColorSwatchCircle.png" />
+    <Resource Include="Images\ColorSwatchSquare1.png" />
+    <Resource Include="Images\ColorSwatchSquare2.png" />
+  </ItemGroup>
+  <ItemGroup>
+    <Resource Include="Images\Foothold.png" />
+  </ItemGroup>
+  <ItemGroup>
+    <Resource Include="Images\arrow_down.png" />
+    <Resource Include="Images\arrow_up.png" />
+  </ItemGroup>
+  <ItemGroup>
+    <Resource Include="Images\UserObjs.png" />
+  </ItemGroup>
+  <ItemGroup>
+    <Resource Include="Images\export-icon.png" />
+  </ItemGroup>
+  <ItemGroup>
+    <Resource Include="Images\new_icon.png" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- AI Prompt files - must be copied to output for runtime loading -->
+    <Content Include="MapEditor\AI\Prompts\*.txt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <Link>AI\Prompts\%(Filename)%(Extension)</Link>
+    </Content>
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.DotNet.ILCompiler" Version="10.0.5" />
+    <PackageReference Include="MonoGame.Framework.WindowsDX">
+      <Version>3.8.4.1</Version>
+    </PackageReference>
+    <PackageReference Include="NAudio">
+      <Version>2.3.0</Version>
+    </PackageReference>
+    <PackageReference Include="SharpDX">
+      <Version>4.2.0</Version>
+    </PackageReference>
+    <PackageReference Include="SharpDX.Direct2D1">
+      <Version>4.2.0</Version>
+    </PackageReference>
+    <PackageReference Include="SharpDX.Direct3D11">
+      <Version>4.2.0</Version>
+    </PackageReference>
+    <PackageReference Include="SharpDX.Direct3D9">
+      <Version>4.2.0</Version>
+    </PackageReference>
+    <PackageReference Include="SharpDX.DXGI">
+      <Version>4.2.0</Version>
+    </PackageReference>
+    <PackageReference Include="SharpDX.Mathematics">
+      <Version>4.2.0</Version>
+    </PackageReference>
+    <PackageReference Include="SharpDX.MediaFoundation">
+      <Version>4.2.0</Version>
+    </PackageReference>
+    <PackageReference Include="SharpDX.XAudio2">
+      <Version>4.2.0</Version>
+    </PackageReference>
+    <PackageReference Include="SharpDX.XInput">
+      <Version>4.2.0</Version>
+    </PackageReference>
+    <PackageReference Include="SixLabors.ImageSharp" Version="3.1.12" />
+    <PackageReference Include="SourceGear.sqlite3" Version="3.50.4.5" />
+    <PackageReference Include="System.Data.SQLite" Version="2.0.3" />
+  </ItemGroup>
+  <PropertyGroup>
+    <SQLiteNativeRid Condition="'$(RuntimeIdentifier)' != ''">$(RuntimeIdentifier)</SQLiteNativeRid>
+    <SQLiteNativeRid Condition="'$(SQLiteNativeRid)' == '' and '$(Platform)' == 'x86'">win-x86</SQLiteNativeRid>
+    <SQLiteNativeRid Condition="'$(SQLiteNativeRid)' == '' and '$(Platform)' == 'ARM64'">win-arm64</SQLiteNativeRid>
+    <SQLiteNativeRid Condition="'$(SQLiteNativeRid)' == ''">win-x64</SQLiteNativeRid>
+  </PropertyGroup>
+  <Target Name="CopySQLiteNativeLibrary" AfterTargets="Build">
+    <ItemGroup>
+      <SQLiteNativeLibrary Include="$(OutDir)runtimes\$(SQLiteNativeRid)\native\e_sqlite3.dll"
+                           Condition="Exists('$(OutDir)runtimes\$(SQLiteNativeRid)\native\e_sqlite3.dll')" />
+    </ItemGroup>
+    <Copy SourceFiles="@(SQLiteNativeLibrary)"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true"
+          Condition="'@(SQLiteNativeLibrary)' != ''" />
+  </Target>
+  <ItemGroup>
+    <Content Include="logo.ico" />
+    <Content Include="MapEditor\AI\Prompts\BackgroundAgentPrompt.txt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>AI\Prompts\BackgroundAgentPrompt.txt</TargetPath>
+    </Content>
+    <Content Include="MapEditor\AI\Prompts\ComprehensiveTestPrompt.txt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>AI\Prompts\ComprehensiveTestPrompt.txt</TargetPath>
+    </Content>
+    <Content Include="MapEditor\AI\Prompts\LifeAgentPrompt.txt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>AI\Prompts\LifeAgentPrompt.txt</TargetPath>
+    </Content>
+    <Content Include="MapEditor\AI\Prompts\MapEditorSystemPrompt.txt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>AI\Prompts\MapEditorSystemPrompt.txt</TargetPath>
+    </Content>
+    <Content Include="MapEditor\AI\Prompts\ObjectAgentPrompt.txt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>AI\Prompts\ObjectAgentPrompt.txt</TargetPath>
+    </Content>
+    <Content Include="MapEditor\AI\Prompts\OrchestratorPrompt.txt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>AI\Prompts\OrchestratorPrompt.txt</TargetPath>
+    </Content>
+    <Content Include="MapEditor\AI\Prompts\PlatformAgentPrompt.txt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>AI\Prompts\PlatformAgentPrompt.txt</TargetPath>
+    </Content>
+    <Content Include="MapEditor\AI\Prompts\PortalAgentPrompt.txt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>AI\Prompts\PortalAgentPrompt.txt</TargetPath>
+    </Content>
+    <Content Include="MapEditor\AI\Prompts\SettingsAgentPrompt.txt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>AI\Prompts\SettingsAgentPrompt.txt</TargetPath>
+    </Content>
+    <Content Include="MapEditor\AI\Prompts\TileAgentPrompt.txt">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <TargetPath>AI\Prompts\TileAgentPrompt.txt</TargetPath>
+    </Content>
+
+    <Resource Include="Images\Quest\2022240_buff_icon.png" />
+    <Content Include="Images\Quest\BtMarkNpc.png" />
+    <None Include="..\logo.png">
+      <Pack>True</Pack>
+      <PackagePath>\</PackagePath>
+    </None>
+    <Resource Include="Images\Quest\shop.meso.png" />
+    <Resource Include="Images\Quest\QuestIcon.0.5.png" />
+    <Resource Include="Images\Quest\QuestIcon.1.0.png" />
+    <Resource Include="Images\Quest\QuestIcon.10.0.png" />
+    <Resource Include="Images\Quest\QuestIcon.11.0.png" />
+    <Resource Include="Images\Quest\QuestIcon.2.0.png" />
+    <Resource Include="Images\Quest\QuestIcon.3.0.png" />
+    <Resource Include="Images\Quest\QuestIcon.4.0.png" />
+    <Resource Include="Images\Quest\QuestIcon.5.0.png" />
+    <Resource Include="Images\Quest\QuestIcon.6.0.png" />
+    <Resource Include="Images\Quest\QuestIcon.7.0.png" />
+    <Resource Include="Images\Quest\QuestIcon.8.0.png" />
+    <Resource Include="Images\Quest\QuestIcon.9.0.png" />
+    <Resource Include="Images\Quest\summary_icon.basic.png" />
+    <Resource Include="Images\Quest\summary_icon.prob.png" />
+    <Resource Include="Images\Quest\summary_icon.select.png" />
+    <Resource Include="Images\Quest\summary_icon.summary.png" />
+    <Resource Include="Images\Quest\questIcon_0.png" />
+    <Resource Include="Images\box_edit-big.png" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Update="GUI\About.cs">
+      <DependentUpon>About.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\CancelableWaitWindow.cs">
+      <DependentUpon>CancelableWaitWindow.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\DataSourceSettings.cs">
+      <DependentUpon>DataSourceSettings.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\ExceptionHandler.cs">
+      <DependentUpon>ExceptionHandler.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\InfoEditor.cs">
+      <DependentUpon>InfoEditor.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\Initialization.cs">
+      <DependentUpon>Initialization.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\LayerChange.cs">
+      <DependentUpon>LayerChange.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\ManageUserObjects.cs">
+      <DependentUpon>ManageUserObjects.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\MapPhysicsEditor.cs">
+      <DependentUpon>MapPhysicsEditor.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\MigrationWizard.cs">
+      <DependentUpon>MigrationWizard.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\New.cs">
+      <DependentUpon>New.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\NewPlatform.cs">
+      <DependentUpon>NewPlatform.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\PackToWz.cs">
+      <DependentUpon>PackToWz.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\Repack.cs">
+      <DependentUpon>Repack.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\Save.cs">
+      <DependentUpon>Save.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\TileSetBrowser.cs">
+      <DependentUpon>TileSetBrowser.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\UnpackWzToImg.cs">
+      <DependentUpon>UnpackWzToImg.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\UserSettingsForm.cs">
+      <DependentUpon>UserSettingsForm.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\WaitWindow.cs">
+      <DependentUpon>WaitWindow.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\EditorPanels\AISettingsDialog.cs">
+      <DependentUpon>AISettingsDialog.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\EditorPanels\BackgroundPanel.cs">
+      <DependentUpon>BackgroundPanel.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\EditorPanels\BlackBorderPanel.cs">
+      <DependentUpon>BlackBorderPanel.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\EditorPanels\CommonPanel.cs">
+      <DependentUpon>CommonPanel.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\EditorPanels\LifePanel.cs">
+      <DependentUpon>LifePanel.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\EditorPanels\ObjectViewerPanel.cs">
+      <DependentUpon>ObjectViewerPanel.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\EditorPanels\ObjPanel.cs">
+      <DependentUpon>ObjPanel.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\EditorPanels\PortalPanel.cs">
+      <DependentUpon>PortalPanel.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\EditorPanels\TilePanel.cs">
+      <DependentUpon>TilePanel.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\EditorPanels\UpscaleImageForm.cs">
+      <DependentUpon>UpscaleImageForm.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\Input\IntInputBox.cs">
+      <DependentUpon>IntInputBox.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\Input\NameValueInput.cs">
+      <DependentUpon>NameValueInput.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\InstanceEditor\BackgroundInstanceEditor.cs">
+      <DependentUpon>BackgroundInstanceEditor.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\InstanceEditor\FootholdEditor.cs">
+      <DependentUpon>FootholdEditor.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\InstanceEditor\GeneralInstanceEditor.cs">
+      <DependentUpon>GeneralInstanceEditor.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\InstanceEditor\LifeInstanceEditor.cs">
+      <DependentUpon>LifeInstanceEditor.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\InstanceEditor\LoadItemSelector.cs">
+      <DependentUpon>LoadItemSelector.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\InstanceEditor\LoadJobSelector.cs">
+      <DependentUpon>LoadJobSelector.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\InstanceEditor\LoadMapSelector.cs">
+      <DependentUpon>LoadMapSelector.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\InstanceEditor\LoadMobSelector.cs">
+      <DependentUpon>LoadMobSelector.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\InstanceEditor\LoadNpcSelector.cs">
+      <DependentUpon>LoadNpcSelector.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\InstanceEditor\LoadQuestSelector.cs">
+      <DependentUpon>LoadQuestSelector.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\InstanceEditor\LoadSkillSelector.cs">
+      <DependentUpon>LoadSkillSelector.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\InstanceEditor\MassZmEditor.cs">
+      <DependentUpon>MassZmEditor.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\InstanceEditor\MirrorFieldDataEditor.cs">
+      <DependentUpon>MirrorFieldDataEditor.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\InstanceEditor\ObjectInstanceEditor.cs">
+      <DependentUpon>ObjectInstanceEditor.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\InstanceEditor\ObjQuestInput.cs">
+      <DependentUpon>ObjQuestInput.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\InstanceEditor\PnSelector.cs">
+      <DependentUpon>PnSelector.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\InstanceEditor\PortalInstanceEditor.cs">
+      <DependentUpon>PortalInstanceEditor.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\InstanceEditor\ReactorInstanceEditor.cs">
+      <DependentUpon>ReactorInstanceEditor.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\InstanceEditor\RopeInstanceEditor.cs">
+      <DependentUpon>RopeInstanceEditor.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\InstanceEditor\TileInstanceEditor.cs">
+      <DependentUpon>TileInstanceEditor.xaml</DependentUpon>
+    </Compile>
+    <Compile Update="GUI\InstanceEditor\TooltipInstanceEditor.cs">
+      <DependentUpon>TooltipInstanceEditor.xaml</DependentUpon>
+    </Compile>
+  </ItemGroup>
+</Project>
