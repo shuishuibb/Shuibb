@@ -79,6 +79,21 @@ namespace HaRepacker.GUI.WorldMap
         /// <summary>link\linkMap - the world map this link points at, or null.</summary>
         public string LinkMap { get; init; }
 
+        /// <summary>
+        /// link\linkImg - the artwork drawn on the world map for this link, or null when the
+        /// entry has none. The real WZ property, not a copy: moving the picture writes back into
+        /// this canvas's own origin.
+        /// </summary>
+        public WzCanvasProperty LinkImage { get; init; }
+
+        /// <summary>
+        /// linkImg's origin vector, or null when it has none. Distinct from
+        /// GetCanvasOriginPosition(), which reports (0,0) for both "origin is (0,0)" and "there is
+        /// no origin" - the editor has to tell those apart, because it must never create one just
+        /// because someone opened the map.
+        /// </summary>
+        public WzVectorProperty LinkImageOrigin => LinkImage?["origin"] as WzVectorProperty;
+
         public int SpotX => Spot.X.Value;
         public int SpotY => Spot.Y.Value;
 
@@ -249,13 +264,16 @@ namespace HaRepacker.GUI.WorldMap
                 if (entry["spot"] is not WzVectorProperty spot)
                     continue;
 
+                var nested = entry["link"] as IPropertyContainer;
                 links.Add(new WorldMapLink
                 {
                     Entry = entry,
                     EntryName = entry.Name,
                     Spot = spot,
                     ToolTip = entry["toolTip"].ReadString(null),
-                    LinkMap = (entry["link"] as IPropertyContainer)?["linkMap"].ReadString(null)
+                    LinkMap = nested?["linkMap"].ReadString(null),
+                    // Only a real canvas counts; anything else leaves the link marker-only.
+                    LinkImage = nested?["linkImg"] as WzCanvasProperty
                 });
             }
 
@@ -291,6 +309,34 @@ namespace HaRepacker.GUI.WorldMap
         /// </summary>
         public static (int X, int Y) CanvasToWorld(PointF baseOrigin, double canvasX, double canvasY)
             => ((int)Math.Round(canvasX - baseOrigin.X), (int)Math.Round(canvasY - baseOrigin.Y));
+    }
+
+    /// <summary>
+    /// Where a MapLink's linkImg artwork sits, and what its origin has to become when the user
+    /// drags it somewhere else.
+    ///
+    /// A WZ canvas origin is the anchor point *inside* the bitmap, so the picture's top-left is
+    /// the anchor minus the origin - the same convention this codebase already draws with
+    /// (HaRepacker\FHMapper\FHMapper.cs: DrawImage(bmp, x - origin.X, y - origin.Y), and
+    /// AnimationBuilder's Size - origin). The anchor for a link is its own spot, converted into
+    /// canvas space.
+    ///
+    /// The consequence to keep straight: dragging the picture right by 20 lowers origin.X by 20.
+    /// Both directions live here so no mouse handler ever open-codes that sign and inverts the
+    /// drag.
+    /// </summary>
+    public static class WorldMapLinkImagePlacement
+    {
+        /// <summary>Top-left corner the artwork should be drawn at.</summary>
+        public static (double Left, double Top) ToCanvasPosition((double X, double Y) anchor, int originX, int originY)
+            => (anchor.X - originX, anchor.Y - originY);
+
+        /// <summary>
+        /// The origin that puts the artwork's top-left at the given canvas position - the inverse
+        /// of <see cref="ToCanvasPosition"/>, rounded because origin is stored as int x/y.
+        /// </summary>
+        public static (int X, int Y) ToOrigin((double X, double Y) anchor, double left, double top)
+            => ((int)Math.Round(anchor.X - left), (int)Math.Round(anchor.Y - top));
     }
 
     /// <summary>

@@ -62,6 +62,10 @@ namespace HaRepacker.GUI.WorldMap
         private TextBox spotXBox;
         private TextBox spotYBox;
         private StackPanel linkDetails;
+        private StackPanel linkOriginSection;
+        private TextBox originXBox;
+        private TextBox originYBox;
+        private TextBlock originMissingText;
         private StackPanel mapNoSection;
         private StackPanel mapNoList;
 
@@ -78,6 +82,36 @@ namespace HaRepacker.GUI.WorldMap
 
         /// <summary>The item the inspector describes when exactly one kind is selected.</summary>
         private IWorldMapMovable primarySelected;
+
+        /// <summary>
+        /// The linkImg artwork for each MapLink that has one, drawn between the base map and the
+        /// markers. Kept apart from <see cref="markers"/> because a picture is dragged by its own
+        /// origin, never as part of a marker group.
+        /// </summary>
+        private readonly Dictionary<WorldMapLink, Image> linkImages = new Dictionary<WorldMapLink, Image>();
+
+        /// <summary>
+        /// A dashed frame drawn over the selected link's artwork. A separate, non-hit-testable
+        /// shape so the bitmap itself is never altered.
+        /// </summary>
+        private readonly Dictionary<WorldMapLink, Rectangle> linkImageOutlines = new Dictionary<WorldMapLink, Rectangle>();
+
+        /// <summary>What the in-progress drag is moving, so the two never mix.</summary>
+        private enum WorldMapDragKind
+        {
+            None,
+
+            /// <summary>The selection's spot vectors - MapList spots and/or MapLink spots.</summary>
+            ItemPosition,
+
+            /// <summary>One MapLink's linkImg, via its canvas origin. Never a group.</summary>
+            LinkImage
+        }
+
+        private WorldMapDragKind dragKind = WorldMapDragKind.None;
+        private WorldMapLink draggingLinkImage;
+        private double dragStartImageLeft;
+        private double dragStartImageTop;
 
         private bool isPanning;
         private Point panStartPointer;
@@ -187,6 +221,8 @@ namespace HaRepacker.GUI.WorldMap
             selectedItems.Clear();
             primarySelected = null;
             markers.Clear();
+            linkImages.Clear();
+            linkImageOutlines.Clear();
             worldCanvas.Children.Clear();
             baseImage.Source = null;
             worldCanvas.Children.Add(baseImage);
@@ -232,12 +268,150 @@ namespace HaRepacker.GUI.WorldMap
             foreach (Shape marker in markers.Values)
                 worldCanvas.Children.Remove(marker);
             markers.Clear();
+            foreach (Image image in linkImages.Values)
+                worldCanvas.Children.Remove(image);
+            linkImages.Clear();
+            foreach (Rectangle outline in linkImageOutlines.Values)
+                worldCanvas.Children.Remove(outline);
+            linkImageOutlines.Clear();
+
+            // linkImg artwork first so it sits under every marker - a big picture must not cover
+            // the spots' click targets. Explicit ZIndex rather than relying on insertion order.
+            int undecodable = RenderLinkImages();
 
             foreach (WorldMapSpot spot in document.Spots)
                 AddMarker(spot, CreateSpotMarker(spot));
 
             foreach (WorldMapLink link in document.Links)
                 AddMarker(link, CreateLinkMarker(link));
+
+            if (undecodable > 0)
+                statusText.Text = "有 " + undecodable + " 個 MapLink 的 linkImg 無法顯示（其餘功能不受影響）。";
+        }
+
+        /// <summary>
+        /// Decodes each linkImg once, here - never during a drag - and parks it on the canvas.
+        /// Returns how many could not be decoded; a broken _inlink/_outlink costs that link its
+        /// picture, nothing more: its marker still shows and still drags.
+        /// </summary>
+        private int RenderLinkImages()
+        {
+            int undecodable = 0;
+
+            foreach (WorldMapLink link in document.Links)
+            {
+                if (link.LinkImage == null)
+                    continue;
+
+                BitmapSource source = TryDecodeCanvas(link.LinkImage);
+                if (source == null)
+                {
+                    undecodable++;
+                    continue;
+                }
+
+                var image = new Image
+                {
+                    Source = source,
+                    Width = source.PixelWidth,
+                    Height = source.PixelHeight,
+                    Stretch = Stretch.None,
+                    SnapsToDevicePixels = true,
+                    Cursor = Cursors.SizeAll,
+                    ToolTip = BuildLinkImageTooltip(link),
+                    Tag = link
+                };
+                RenderOptions.SetBitmapScalingMode(image, BitmapScalingMode.NearestNeighbor);
+                image.MouseLeftButtonDown += LinkImage_MouseLeftButtonDown;
+
+                Panel.SetZIndex(image, 1);
+                linkImages[link] = image;
+                worldCanvas.Children.Add(image);
+
+                var outline = new Rectangle
+                {
+                    Width = image.Width,
+                    Height = image.Height,
+                    Stroke = Brushes.White,
+                    StrokeThickness = 1.0,
+                    StrokeDashArray = new DoubleCollection { 3.0, 3.0 },
+                    Fill = Brushes.Transparent,
+                    IsHitTestVisible = false,
+                    Visibility = Visibility.Collapsed
+                };
+                Panel.SetZIndex(outline, 1);
+                linkImageOutlines[link] = outline;
+                worldCanvas.Children.Add(outline);
+
+                PositionLinkImage(link);
+            }
+
+            return undecodable;
+        }
+
+        private static BitmapSource TryDecodeCanvas(WzCanvasProperty canvas)
+        {
+            try
+            {
+                // Same decoder the base map uses; a UOL/_inlink is resolved by MapleLib rather
+                // than by hunting the image for some other canvas.
+                System.Drawing.Bitmap bitmap = canvas.GetLinkedWzCanvasBitmap();
+                if (bitmap == null)
+                    return null;
+
+                using (bitmap)
+                {
+                    BitmapSource source = bitmap.ToWpfBitmap();
+                    source.Freeze();
+                    return source;
+                }
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        private static string BuildLinkImageTooltip(WorldMapLink link)
+        {
+            string tooltip = "MapLink " + link.EntryName + " linkImg";
+            WzVectorProperty origin = link.LinkImageOrigin;
+            tooltip += origin == null
+                ? "\nOrigin: 尚無"
+                : "\nOrigin: " + origin.X.Value + "," + origin.Y.Value;
+            if (!string.IsNullOrEmpty(link.LinkMap))
+                tooltip += "\n→ " + link.LinkMap;
+            return tooltip;
+        }
+
+        /// <summary>
+        /// Places the artwork from its link's current spot and its own origin. Called whenever
+        /// either changes - moving the spot slides the picture with it because the anchor moved,
+        /// while the origin value stays exactly as it was.
+        /// </summary>
+        private void PositionLinkImage(WorldMapLink link)
+        {
+            if (!linkImages.TryGetValue(link, out Image image))
+                return;
+
+            (double Left, double Top) position = ComputeLinkImagePosition(link, link.SpotX, link.SpotY);
+            Canvas.SetLeft(image, position.Left);
+            Canvas.SetTop(image, position.Top);
+
+            if (linkImageOutlines.TryGetValue(link, out Rectangle outline))
+            {
+                Canvas.SetLeft(outline, position.Left);
+                Canvas.SetTop(outline, position.Top);
+            }
+        }
+
+        private (double Left, double Top) ComputeLinkImagePosition(WorldMapLink link, int spotX, int spotY)
+        {
+            (double x, double y) anchor = WorldMapCoordinateConverter.WorldToCanvas(document.BaseOrigin, spotX, spotY);
+            WzVectorProperty origin = link.LinkImageOrigin;
+            int originX = origin?.X.Value ?? 0;
+            int originY = origin?.Y.Value ?? 0;
+            return WorldMapLinkImagePlacement.ToCanvasPosition(anchor, originX, originY);
         }
 
         private void AddMarker(IWorldMapMovable item, Shape marker)
@@ -350,6 +524,17 @@ namespace HaRepacker.GUI.WorldMap
                 height = Math.Max(height, y + CanvasPadding);
             }
 
+            // linkImg artwork can extend well past its own anchor, so its far corner counts too.
+            // Only the canvas grows - a picture placed at a negative position still renders
+            // (worldCanvas does not clip) and its origin is never adjusted to make it fit.
+            foreach (KeyValuePair<WorldMapLink, Image> entry in linkImages)
+            {
+                (double Left, double Top) position = ComputeLinkImagePosition(
+                    entry.Key, entry.Key.SpotX, entry.Key.SpotY);
+                width = Math.Max(width, position.Left + entry.Value.Width + CanvasPadding);
+                height = Math.Max(height, position.Top + entry.Value.Height + CanvasPadding);
+            }
+
             worldCanvas.Width = Math.Max(width, 1.0);
             worldCanvas.Height = Math.Max(height, 1.0);
         }
@@ -427,7 +612,10 @@ namespace HaRepacker.GUI.WorldMap
                     isDraggingItems = true;
                 }
 
-                DragSelectionBy(deltaX, deltaY);
+                if (dragKind == WorldMapDragKind.LinkImage)
+                    DragLinkImageBy(deltaX, deltaY);
+                else
+                    DragSelectionBy(deltaX, deltaY);
                 return;
             }
 
@@ -442,12 +630,21 @@ namespace HaRepacker.GUI.WorldMap
         private void Viewport_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
         {
             if (isDraggingItems)
-                CommitDrag();
+            {
+                if (dragKind == WorldMapDragKind.LinkImage)
+                    CommitLinkImageDrag();
+                else
+                    CommitDrag();
+            }
             else if (isPendingDrag)
+            {
                 PopulateInspector(); // click without a move: selection only, nothing written
+            }
 
             isPendingDrag = false;
             isDraggingItems = false;
+            dragKind = WorldMapDragKind.None;
+            draggingLinkImage = null;
             dragStartPositions.Clear();
 
             isPanning = false;
@@ -523,10 +720,144 @@ namespace HaRepacker.GUI.WorldMap
             foreach (IWorldMapMovable item in selectedItems)
                 dragStartPositions[item] = (item.Position.X.Value, item.Position.Y.Value);
 
+            dragKind = WorldMapDragKind.ItemPosition;
             dragStartPointerOnCanvas = pointerOnCanvas;
             isPendingDrag = true;
             isDraggingItems = false;
             viewport.CaptureMouse();
+        }
+
+        /// <summary>
+        /// Clicking the artwork selects its MapLink - the inspector then describes that link - but
+        /// the drag it starts moves only this one picture's origin, whatever else is selected.
+        /// </summary>
+        private void LinkImage_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            if (sender is not Image image || image.Tag is not WorldMapLink link)
+                return;
+
+            e.Handled = true; // never let this reach the viewport and start a pan
+            viewport.Focus();
+
+            if (e.ClickCount >= 2)
+            {
+                isPendingDrag = false;
+                isDraggingItems = false;
+                dragKind = WorldMapDragKind.None;
+                NavigateFrom(link);
+                return;
+            }
+
+            if (!selectedItems.Contains(link))
+            {
+                selectedItems.Clear();
+                selectedItems.Add(link);
+            }
+            primarySelected = link;
+            RefreshSelectionVisuals();
+            PopulateInspector();
+
+            // Deliberately not BeginPendingDrag: a picture is never part of a group move.
+            draggingLinkImage = link;
+            dragStartImageLeft = Canvas.GetLeft(image);
+            dragStartImageTop = Canvas.GetTop(image);
+            dragKind = WorldMapDragKind.LinkImage;
+            dragStartPointerOnCanvas = e.GetPosition(worldCanvas);
+            isPendingDrag = true;
+            isDraggingItems = false;
+            viewport.CaptureMouse();
+        }
+
+        /// <summary>
+        /// Live preview only: the picture follows the pointer by moving its Canvas.Left/Top.
+        /// Nothing is written and nothing is dirtied until the button comes up.
+        /// </summary>
+        private void DragLinkImageBy(double deltaX, double deltaY)
+        {
+            if (draggingLinkImage == null || !linkImages.TryGetValue(draggingLinkImage, out Image image))
+                return;
+
+            double left = dragStartImageLeft + deltaX;
+            double top = dragStartImageTop + deltaY;
+            Canvas.SetLeft(image, left);
+            Canvas.SetTop(image, top);
+
+            (int x, int y) = OriginForPosition(draggingLinkImage, left, top);
+            ShowOrigin(x, y);
+        }
+
+        private (int X, int Y) OriginForPosition(WorldMapLink link, double left, double top)
+        {
+            (double x, double y) anchor = WorldMapCoordinateConverter.WorldToCanvas(
+                document.BaseOrigin, link.SpotX, link.SpotY);
+            return WorldMapLinkImagePlacement.ToOrigin(anchor, left, top);
+        }
+
+        /// <summary>
+        /// Turns where the picture ended up back into an origin and writes it. Only linkImg's own
+        /// origin is touched - the link's spot is left exactly as it was, which is what keeps the
+        /// two drags independent.
+        /// </summary>
+        private void CommitLinkImageDrag()
+        {
+            WorldMapLink link = draggingLinkImage;
+            if (link == null || !linkImages.TryGetValue(link, out Image image))
+                return;
+
+            (int x, int y) = OriginForPosition(link, Canvas.GetLeft(image), Canvas.GetTop(image));
+
+            WzVectorProperty origin = link.LinkImageOrigin;
+            if (origin == null)
+            {
+                // Dragging is an explicit edit, so creating the missing origin here is fair - but
+                // only through the tree, never as a model-only property the tree cannot see.
+                origin = TryCreateLinkImageOrigin(link);
+                if (origin == null)
+                {
+                    PositionLinkImage(link); // snap back; nothing was changed
+                    return;
+                }
+            }
+
+            if (origin.X.Value == x && origin.Y.Value == y)
+            {
+                PositionLinkImage(link);
+                return;
+            }
+
+            origin.X.Value = x;
+            origin.Y.Value = y;
+            if (origin.ParentImage != null)
+                origin.ParentImage.Changed = true;
+
+            PositionLinkImage(link);
+            UpdateCanvasBounds();
+            PropertiesChanged?.Invoke(this, new WzImageProperty[] { origin });
+            PopulateInspector();
+            statusText.Text = "MapLink " + link.EntryName + " 的 linkImg origin 已更新為 " + x + ", " + y + "。";
+        }
+
+        /// <summary>
+        /// Adds an origin to a linkImg that has none, through WzNode so the tree gains the node
+        /// too. Returns null - and says why - when there is no tree node to attach it to, rather
+        /// than creating something the tree would never show.
+        /// </summary>
+        private WzVectorProperty TryCreateLinkImageOrigin(WorldMapLink link)
+        {
+            if (link.LinkImage?.HRTag is not WzNode canvasNode)
+            {
+                statusText.Text = "找不到 linkImg 的樹節點，無法建立 origin（請先展開該節點後再試）。";
+                return null;
+            }
+
+            var origin = new WzVectorProperty("origin", new WzIntProperty("x", 0), new WzIntProperty("y", 0));
+            WzNode added = AddChildNode(canvasNode, origin);
+            if (added == null)
+            {
+                statusText.Text = "無法建立 linkImg origin。";
+                return null;
+            }
+            return added.Tag as WzVectorProperty;
         }
 
         private void ClearSelection()
@@ -564,6 +895,13 @@ namespace HaRepacker.GUI.WorldMap
                     ? (ReferenceEquals(entry.Key, primarySelected) ? 3.0 : 2.0)
                     : 1.0;
             }
+
+            foreach (KeyValuePair<WorldMapLink, Rectangle> entry in linkImageOutlines)
+            {
+                entry.Value.Visibility = selectedItems.Contains(entry.Key)
+                    ? Visibility.Visible
+                    : Visibility.Collapsed;
+            }
         }
 
         // ---- dragging ----------------------------------------------------------------------------
@@ -582,7 +920,17 @@ namespace HaRepacker.GUI.WorldMap
                 WorldMapGroupMove.Offset(dragStartPositions, worldDeltaX, worldDeltaY);
 
             foreach (KeyValuePair<IWorldMapMovable, (int X, int Y)> entry in moved)
+            {
                 PositionMarker(entry.Key, entry.Value.X, entry.Value.Y);
+                // The artwork is anchored to its link's spot, so it slides along - its origin is
+                // untouched, only the anchor it hangs off has moved.
+                if (entry.Key is WorldMapLink link && linkImages.TryGetValue(link, out Image image))
+                {
+                    (double Left, double Top) position = ComputeLinkImagePosition(link, entry.Value.X, entry.Value.Y);
+                    Canvas.SetLeft(image, position.Left);
+                    Canvas.SetTop(image, position.Top);
+                }
+            }
 
             if (primarySelected != null && moved.TryGetValue(primarySelected, out (int X, int Y) primary))
                 ShowCoordinates(primary.X, primary.Y);
@@ -615,10 +963,14 @@ namespace HaRepacker.GUI.WorldMap
                 if (item.Position.ParentImage != null)
                     item.Position.ParentImage.Changed = true;
                 written.Add(item.Position);
+
+                if (item is WorldMapLink link)
+                    PositionLinkImage(link);
             }
 
             if (written.Count > 0)
             {
+                UpdateCanvasBounds();
                 PropertiesChanged?.Invoke(this, written);
                 statusText.Text = "已移動 " + written.Count + " 個項目。";
             }
@@ -650,6 +1002,11 @@ namespace HaRepacker.GUI.WorldMap
                 mapNoList.Children.Clear();
                 linkDetails.Children.Clear();
                 linkDetails.Visibility = Visibility.Collapsed;
+                linkOriginSection.Visibility = Visibility.Collapsed;
+                originXBox.IsEnabled = false;
+                originYBox.IsEnabled = false;
+                originXBox.Text = string.Empty;
+                originYBox.Text = string.Empty;
                 mapNoSection.Visibility = Visibility.Collapsed;
 
                 if (selectedItems.Count == 0)
@@ -757,6 +1114,22 @@ namespace HaRepacker.GUI.WorldMap
             spotYBox.IsEnabled = true;
             spotXBox.Text = link.SpotX.ToString(CultureInfo.InvariantCulture);
             spotYBox.Text = link.SpotY.ToString(CultureInfo.InvariantCulture);
+
+            // linkImg's own placement, separate from the spot above.
+            if (link.LinkImage != null)
+            {
+                linkOriginSection.Visibility = Visibility.Visible;
+                WzVectorProperty origin = link.LinkImageOrigin;
+                bool hasOrigin = origin != null;
+
+                // No origin yet: shown as blank and read-only. Merely looking at a MapLink must
+                // never create one - only an explicit drag does.
+                originXBox.IsEnabled = hasOrigin;
+                originYBox.IsEnabled = hasOrigin;
+                originMissingText.Visibility = hasOrigin ? Visibility.Collapsed : Visibility.Visible;
+                if (hasOrigin)
+                    ShowOrigin(origin.X.Value, origin.Y.Value);
+            }
 
             // Only what the entry actually carries.
             if (!string.IsNullOrEmpty(link.ToolTip))
@@ -1062,6 +1435,66 @@ namespace HaRepacker.GUI.WorldMap
             statusText.Text = item.DisplayName + " 座標已更新為 " + x + ", " + y + "。";
         }
 
+        private void OriginBox_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key != Key.Enter)
+                return;
+            CommitLinkImageOrigin();
+            e.Handled = true;
+        }
+
+        private void OriginBox_LostFocus(object sender, RoutedEventArgs e) => CommitLinkImageOrigin();
+
+        /// <summary>
+        /// Types an origin straight in. Writes only linkImg's origin - the link's spot is not
+        /// involved - and repositions the artwork immediately.
+        /// </summary>
+        private void CommitLinkImageOrigin()
+        {
+            if (isPopulatingInspector || isDraggingItems)
+                return;
+            if (primarySelected is not WorldMapLink link || selectedItems.Count != 1)
+                return;
+
+            WzVectorProperty origin = link.LinkImageOrigin;
+            if (origin == null)
+                return;
+
+            if (!int.TryParse(originXBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out int x)
+                || !int.TryParse(originYBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out int y))
+            {
+                ShowOrigin(origin.X.Value, origin.Y.Value);
+                statusText.Text = "Origin 必須是整數";
+                return;
+            }
+            if (origin.X.Value == x && origin.Y.Value == y)
+                return;
+
+            origin.X.Value = x;
+            origin.Y.Value = y;
+            if (origin.ParentImage != null)
+                origin.ParentImage.Changed = true;
+
+            PositionLinkImage(link);
+            UpdateCanvasBounds();
+            PropertiesChanged?.Invoke(this, new WzImageProperty[] { origin });
+            statusText.Text = "MapLink " + link.EntryName + " 的 linkImg origin 已更新為 " + x + ", " + y + "。";
+        }
+
+        private void ShowOrigin(int x, int y)
+        {
+            isPopulatingInspector = true;
+            try
+            {
+                originXBox.Text = x.ToString(CultureInfo.InvariantCulture);
+                originYBox.Text = y.ToString(CultureInfo.InvariantCulture);
+            }
+            finally
+            {
+                isPopulatingInspector = false;
+            }
+        }
+
         /// <summary>
         /// Dirties the owning .img so it saves, and tells MainPanel which leaf to redden. The
         /// property passed in is the one the tree shows - a spot is a single WzVectorProperty
@@ -1272,13 +1705,33 @@ namespace HaRepacker.GUI.WorldMap
             typeBox.SelectionChanged += TypeBox_SelectionChanged;
             inspector.Children.Add(typeBox);
 
-            inspector.Children.Add(FieldLabel("X"));
+            // "Spot" rather than plain X/Y: a MapLink also has a linkImg origin below, and the two
+            // must not be mistaken for each other.
+            inspector.Children.Add(FieldLabel("Spot X"));
             spotXBox = CoordinateBox();
             inspector.Children.Add(spotXBox);
 
-            inspector.Children.Add(FieldLabel("Y"));
+            inspector.Children.Add(FieldLabel("Spot Y"));
             spotYBox = CoordinateBox();
             inspector.Children.Add(spotYBox);
+
+            linkOriginSection = new StackPanel { Visibility = Visibility.Collapsed };
+            linkOriginSection.Children.Add(FieldLabel("LinkImg Origin X"));
+            originXBox = OriginBox();
+            linkOriginSection.Children.Add(originXBox);
+            linkOriginSection.Children.Add(FieldLabel("LinkImg Origin Y"));
+            originYBox = OriginBox();
+            linkOriginSection.Children.Add(originYBox);
+            originMissingText = new TextBlock
+            {
+                Text = "尚無 origin（拖曳圖片即可建立）",
+                TextWrapping = TextWrapping.Wrap,
+                Opacity = 0.75,
+                Margin = new Thickness(0.0, 0.0, 0.0, 10.0),
+                Visibility = Visibility.Collapsed
+            };
+            linkOriginSection.Children.Add(originMissingText);
+            inspector.Children.Add(linkOriginSection);
 
             linkDetails = new StackPanel { Visibility = Visibility.Collapsed };
             inspector.Children.Add(linkDetails);
@@ -1328,6 +1781,20 @@ namespace HaRepacker.GUI.WorldMap
             };
             box.KeyDown += SpotCoordinateBox_KeyDown;
             box.LostFocus += SpotCoordinateBox_LostFocus;
+            return box;
+        }
+
+        private TextBox OriginBox()
+        {
+            var box = new TextBox
+            {
+                Height = 24.0,
+                VerticalContentAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(0.0, 0.0, 0.0, 10.0),
+                IsEnabled = false
+            };
+            box.KeyDown += OriginBox_KeyDown;
+            box.LostFocus += OriginBox_LostFocus;
             return box;
         }
 

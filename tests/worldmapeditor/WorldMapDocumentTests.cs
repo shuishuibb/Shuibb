@@ -565,6 +565,210 @@ public sealed class WorldMapDocumentTests
         Assert.Equal((95, -45), moved[document.Links[0]]);
     }
 
+    // ---- MapLink linkImg -------------------------------------------------------------------------
+
+    /// <summary>Adds link\linkImg to an existing MapLink entry, optionally with an origin.</summary>
+    private static WzCanvasProperty AddLinkImage(WzImage image, string linkKey, int? originX, int? originY)
+    {
+        var entry = (WzSubProperty)((WzSubProperty)image["MapLink"])[linkKey];
+        var nested = entry["link"] as WzSubProperty;
+        if (nested == null)
+        {
+            nested = new WzSubProperty("link");
+            entry.AddProperty(nested);
+        }
+
+        var linkImg = new WzCanvasProperty("linkImg");
+        if (originX.HasValue && originY.HasValue)
+        {
+            linkImg.AddProperty(new WzVectorProperty("origin",
+                new WzIntProperty("x", originX.Value), new WzIntProperty("y", originY.Value)));
+        }
+        nested.AddProperty(linkImg);
+        image.Changed = false;
+        return linkImg;
+    }
+
+    [Fact]
+    public void Load_ReadsLinkImgAndItsOriginAsRealProperties()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(0f, 0f), ("0", 1, 2, 0, null));
+        AddMapLink(image, "0", 100, 50, null, "WorldMap050");
+        WzCanvasProperty canvas = AddLinkImage(image, "0", 20, 10);
+
+        WorldMapLink link = Assert.Single(WorldMapDocument.Load(image).Links);
+
+        // The real property, not a copy - editing the origin has to write back into this canvas.
+        Assert.Same(canvas, link.LinkImage);
+        Assert.Equal(20, link.LinkImageOrigin.X.Value);
+        Assert.Equal(10, link.LinkImageOrigin.Y.Value);
+    }
+
+    [Fact]
+    public void Load_MapLinkWithoutLinkImg_LeavesItNullAndStillReadsTheLink()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(0f, 0f), ("0", 1, 2, 0, null));
+        AddMapLink(image, "0", 100, 50, null, "WorldMap050");
+
+        WorldMapLink link = Assert.Single(WorldMapDocument.Load(image).Links);
+
+        Assert.Null(link.LinkImage);
+        Assert.Null(link.LinkImageOrigin);
+        Assert.Equal(100, link.SpotX); // the marker still works
+    }
+
+    [Fact]
+    public void LinkImageWithoutOrigin_IsReportedAsMissingAndNothingIsCreatedByLooking()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(0f, 0f), ("0", 1, 2, 0, null));
+        AddMapLink(image, "0", 100, 50, null, null);
+        WzCanvasProperty canvas = AddLinkImage(image, "0", originX: null, originY: null);
+
+        WorldMapLink link = Assert.Single(WorldMapDocument.Load(image).Links);
+
+        // Distinguishable from origin (0,0) - GetCanvasOriginPosition() cannot tell those apart,
+        // which is why the editor uses LinkImageOrigin for the "does it exist" question.
+        Assert.Null(link.LinkImageOrigin);
+        Assert.Null(canvas["origin"]);
+        Assert.False(image.Changed);
+    }
+
+    [Fact]
+    public void LinkImagePlacement_TopLeftIsTheAnchorMinusTheOrigin()
+    {
+        // This project's canvas convention, as used by FHMapper (DrawImage(bmp, x - origin.X, ...))
+        // and AnimationBuilder: origin is the anchor point inside the bitmap.
+        (double left, double top) = WorldMapLinkImagePlacement.ToCanvasPosition((200.0, 100.0), 20, 10);
+
+        Assert.Equal(180.0, left);
+        Assert.Equal(90.0, top);
+    }
+
+    [Fact]
+    public void LinkImagePlacement_OriginIsTheInverseOfPosition()
+    {
+        (int x, int y) = WorldMapLinkImagePlacement.ToOrigin((200.0, 100.0), 180.0, 90.0);
+
+        Assert.Equal(20, x);
+        Assert.Equal(10, y);
+    }
+
+    [Fact]
+    public void DraggingTheArtworkRight_LowersOriginX_SoItStaysWhereItWasDropped()
+    {
+        // Dragged right: left 180 -> 200 against an unchanged anchor of 200.
+        (int x, int y) = WorldMapLinkImagePlacement.ToOrigin((200.0, 100.0), 200.0, 90.0);
+
+        Assert.Equal(0, x); // 20 -> 0, i.e. origin moved the opposite way
+        Assert.Equal(10, y);
+
+        // Round-tripping puts the picture back exactly where the user let go.
+        (double left, double top) = WorldMapLinkImagePlacement.ToCanvasPosition((200.0, 100.0), x, y);
+        Assert.Equal(200.0, left);
+        Assert.Equal(90.0, top);
+    }
+
+    [Fact]
+    public void DraggingTheArtworkDown_LowersOriginY()
+    {
+        // Dragged down 15: top 90 -> 105 against an unchanged anchor of 100.
+        (int x, int y) = WorldMapLinkImagePlacement.ToOrigin((200.0, 100.0), 180.0, 105.0);
+
+        Assert.Equal(20, x);
+        Assert.Equal(-5, y);
+    }
+
+    [Theory]
+    [InlineData(30.0, 0.0)]   // right
+    [InlineData(-30.0, 0.0)]  // left
+    [InlineData(0.0, 30.0)]   // down
+    [InlineData(0.0, -30.0)]  // up
+    public void DragDirectionAlwaysMatchesTheResultingPosition(double deltaX, double deltaY)
+    {
+        // The property that actually matters to the user: drop it somewhere, and recomputing its
+        // placement from the stored origin must put it back there - never mirrored.
+        (double X, double Y) anchor = (200.0, 100.0);
+        (double startLeft, double startTop) = WorldMapLinkImagePlacement.ToCanvasPosition(anchor, 20, 10);
+
+        double droppedLeft = startLeft + deltaX;
+        double droppedTop = startTop + deltaY;
+
+        (int originX, int originY) = WorldMapLinkImagePlacement.ToOrigin(anchor, droppedLeft, droppedTop);
+        (double left, double top) = WorldMapLinkImagePlacement.ToCanvasPosition(anchor, originX, originY);
+
+        Assert.Equal(droppedLeft, left);
+        Assert.Equal(droppedTop, top);
+    }
+
+    [Fact]
+    public void MovingTheArtwork_WritesOnlyTheOrigin_LeavingTheLinkSpotAlone()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(0f, 0f), ("0", 1, 2, 0, null));
+        AddMapLink(image, "0", 100, 50, null, null);
+        AddLinkImage(image, "0", 20, 10);
+        WorldMapLink link = Assert.Single(WorldMapDocument.Load(image).Links);
+        Assert.False(image.Changed);
+
+        // What CommitLinkImageDrag performs.
+        WzVectorProperty origin = link.LinkImageOrigin;
+        origin.X.Value = 0;
+        origin.Y.Value = -5;
+        origin.ParentImage.Changed = true;
+
+        Assert.Equal(0, link.LinkImageOrigin.X.Value);
+        Assert.Equal(-5, link.LinkImageOrigin.Y.Value);
+        Assert.Equal(100, link.SpotX); // spot untouched
+        Assert.Equal(50, link.SpotY);
+        Assert.True(image.Changed);
+    }
+
+    [Fact]
+    public void MovingTheLinkSpot_LeavesTheArtworkOriginAlone_ButItsAnchorMoves()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(0f, 0f), ("0", 1, 2, 0, null));
+        AddMapLink(image, "0", 100, 50, null, null);
+        AddLinkImage(image, "0", 20, 10);
+        WorldMapLink link = Assert.Single(WorldMapDocument.Load(image).Links);
+
+        (double beforeLeft, double beforeTop) = WorldMapLinkImagePlacement.ToCanvasPosition(
+            WorldMapCoordinateConverter.WorldToCanvas(new PointF(0f, 0f), link.SpotX, link.SpotY),
+            link.LinkImageOrigin.X.Value, link.LinkImageOrigin.Y.Value);
+
+        // What CommitDrag performs for a MapLink marker.
+        link.Position.X.Value = 140;
+        link.Position.Y.Value = 50;
+        link.Position.ParentImage.Changed = true;
+
+        Assert.Equal(20, link.LinkImageOrigin.X.Value); // origin value unchanged
+        Assert.Equal(10, link.LinkImageOrigin.Y.Value);
+
+        (double afterLeft, double afterTop) = WorldMapLinkImagePlacement.ToCanvasPosition(
+            WorldMapCoordinateConverter.WorldToCanvas(new PointF(0f, 0f), link.SpotX, link.SpotY),
+            link.LinkImageOrigin.X.Value, link.LinkImageOrigin.Y.Value);
+
+        // ...but the artwork follows the anchor by the same 40px the spot moved.
+        Assert.Equal(beforeLeft + 40.0, afterLeft);
+        Assert.Equal(beforeTop, afterTop);
+    }
+
+    [Fact]
+    public void ADocumentWhoseLinkImgCannotDecode_StillLoadsWithItsMarker()
+    {
+        // A canvas with no image data at all stands in for a broken _inlink/_outlink: parsing must
+        // still yield the link so its marker renders and drags.
+        WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(0f, 0f), ("0", 1, 2, 0, null));
+        AddMapLink(image, "0", 100, 50, null, "WorldMap050");
+        AddLinkImage(image, "0", 5, 5);
+
+        WorldMapDocument document = WorldMapDocument.Load(image);
+        WorldMapLink link = Assert.Single(document.Links);
+
+        Assert.NotNull(link.LinkImage);
+        Assert.Equal(100, link.SpotX);
+        Assert.Equal("WorldMap050", link.LinkMap);
+        Assert.False(image.Changed);
+    }
+
     // ---- mapNo structure -------------------------------------------------------------------------
 
     [Fact]
