@@ -214,6 +214,17 @@ namespace HaRepacker
 
             Debug.WriteLine(AddSortMenu.DropDown.Items.Count.ToString());
             AddSortMenu_WithoutPropSort = new ToolStripMenuItem(UiLocalization.Translate("Sort"), Properties.Resources.sort, SortAllChildViewNode2);
+
+            foreach (ToolStripMenuItem command in new[]
+            {
+                Rename, Remove, AddImage, AddDirectory, AddByteFloat, AddCanvas, AddLong, AddInt,
+                AddConvex, AddDouble, AddNull, AddSound, AddString, AddSub, AddUshort, AddUOL,
+                AddVector, Animate, SaveAnimation, FixInlink, AskAiAboutNode, MapObjectInfoMenuItem,
+                NpcInfoMenuItem, EquipmentStringInfoMenuItem
+            })
+            {
+                command.Tag = true;
+            }
         }
 
         private void SaveFile_Click(object sender, EventArgs e)
@@ -343,10 +354,7 @@ namespace HaRepacker
                 MessageBox.Show(UiLocalization.Translate("Please select only one node."));
                 return;
             }
-
-            string name;
-            if (NameInputBox.Show("Add Image", 0, out name))
-                nodes[0].AddObject(new WzImage(name) { Changed = true }, getMainPanel().UndoRedoMan);
+            getMainPanel().AddWzImageToSelectedNode(nodes[0]);
         }
 
         private void AddDirectory_Click(object sender, EventArgs e)

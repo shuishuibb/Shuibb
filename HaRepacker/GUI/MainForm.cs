@@ -634,11 +634,13 @@ namespace HaRepacker.GUI
                             // down to the text box, which does the ordinary text copy/paste.
                             return;
                         case ClipboardShortcutRoute.FieldCopy:
-                            if (Warning.Warn(HaRepacker.Properties.Resources.MainConfirmCopy))
+                            // Required (SuppressWarnings cannot skip it) - same contract as the
+                            // whole-node commands: every structural copy/paste confirms.
+                            if (Warning.ConfirmRequired("確定要複製所選的欄位嗎？"))
                                 MainPanel.CopySelectedEditorFields();
                             break;
                         case ClipboardShortcutRoute.FieldPaste:
-                            if (Warning.Warn(HaRepacker.Properties.Resources.MainConfirmPaste))
+                            if (Warning.ConfirmRequired("確定要貼上已複製的欄位嗎？"))
                                 MainPanel.PasteCopiedEditorFields();
                             break;
                         default:
@@ -648,8 +650,9 @@ namespace HaRepacker.GUI
                             }
                             else
                             {
+                                // DoPaste owns its single WPF sync now (and a cancelled paste
+                                // must refresh nothing).
                                 MainPanel?.DoPaste();
-                                MainPanel?.RefreshNativeDataTree();
                             }
                             break;
                     }
@@ -2120,10 +2123,8 @@ namespace HaRepacker.GUI
 
         private void RemoveSelectedNodes()
         {
-            if (!Warning.Warn(HaRepacker.Properties.Resources.MainConfirmRemoveNode))
-            {
-                return;
-            }
+            // PromptRemoveSelectedTreeNodes confirms (once, with the count) - a second dialog
+            // here made the main-menu path ask twice while every other entry asked once.
             MainPanel.PromptRemoveSelectedTreeNodes();
         }
 
@@ -2981,10 +2982,9 @@ namespace HaRepacker.GUI
 
         private void PasteToolStripMenuItem_Click(object sender, EventArgs e)
         {
+            // DoPaste owns its single WPF sync now; adding one here would refresh even when the
+            // user cancels the confirmation.
             MainPanel.DoPaste();
-            // The Ctrl+V paths refresh the WPF mirror; this one never did, so a paste from the
-            // menu left the visible tree showing the pre-paste state.
-            MainPanel.RefreshNativeDataTree();
         }
         /// <summary>
         /// Wz string searcher tool

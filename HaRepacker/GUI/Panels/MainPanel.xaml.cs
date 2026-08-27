@@ -217,26 +217,49 @@ namespace HaRepacker.GUI.Panels
             // revealing to explicit navigation (search, type-ahead, WorldMap jumps), which calls
             // SelectAndRevealNativeNode itself.
             treeRevealGeneration++; // stale queued reveals/restores from earlier refreshes die
-            MutationViewportSnapshot viewportSnapshot = CaptureMutationViewport();
+            // Up BEFORE anything is torn down: focus-restore RequestBringIntoView can fire the
+            // moment containers start dying, not just after the rebuild.
+            suppressTreeAutoReveal = true;
+            bool releaseQueued = false;
+            try
+            {
+                MutationViewportSnapshot viewportSnapshot = CaptureMutationViewport();
 
-            var expandedNodes = nativeTreeItems
-                .Where(pair => pair.Value.IsExpanded)
-                .Select(pair => pair.Key)
-                .ToHashSet();
-            WzNode activeNode = DataTree.SelectedNode as WzNode;
+                var expandedNodes = nativeTreeItems
+                    .Where(pair => pair.Value.IsExpanded)
+                    .Select(pair => pair.Key)
+                    .ToHashSet();
+                WzNode activeNode = DataTree.SelectedNode as WzNode;
 
-            nativeSelectedNodes.Clear();
-            nativeSelectedNodes.AddRange(DataTree.SelectedNodes.Cast<WzNode>());
-            if (nativeSelectedNodes.Count == 0 && activeNode != null)
-                nativeSelectedNodes.Add(activeNode);
+                nativeSelectedNodes.Clear();
+                nativeSelectedNodes.AddRange(DataTree.SelectedNodes.Cast<WzNode>());
+                if (nativeSelectedNodes.Count == 0 && activeNode != null)
+                    nativeSelectedNodes.Add(activeNode);
 
-            nativeTreeItems.Clear();
-            dataTreeView.Items.Clear();
-            foreach (WzNode node in DataTree.Nodes) dataTreeView.Items.Add(CreateNativeTreeItem(node));
-            foreach (WzNode node in DataTree.Nodes) RestoreNativeExpansion(node, expandedNodes);
-            UpdateNativeSelectionVisuals();
+                nativeTreeItems.Clear();
+                dataTreeView.Items.Clear();
+                foreach (WzNode node in DataTree.Nodes) dataTreeView.Items.Add(CreateNativeTreeItem(node));
+                foreach (WzNode node in DataTree.Nodes) RestoreNativeExpansion(node, expandedNodes);
+                UpdateNativeSelectionVisuals();
 
-            QueueMutationViewportRestore(viewportSnapshot);
+                // Applied SYNCHRONOUSLY, in this same dispatcher frame: WPF only presents a frame
+                // after this method returns, so by restoring (and materializing enough rows for the
+                // target offset to exist) before returning, the clamp-to-top / clamp-to-bottom
+                // intermediate states are never rendered at all. The old queued restore fixed the
+                // FINAL offset but let every intermediate frame through - that was the visible
+                // "jump away and come back" during Delete/Paste/Undo.
+                ApplyMutationViewportRestore(viewportSnapshot, materializeForTarget: true);
+                BeginMutationViewportPin(viewportSnapshot);
+                releaseQueued = true;
+            }
+            finally
+            {
+                if (!releaseQueued)
+                {
+                    hasMutationViewportPin = false;
+                    suppressTreeAutoReveal = false;
+                }
+            }
         }
 
         // ---- mutation viewport preservation ------------------------------------------------------
@@ -299,92 +322,98 @@ namespace HaRepacker.GUI.Panels
             return new MutationViewportSnapshot(true, viewer.VerticalOffset, viewer.HorizontalOffset, anchor, anchorY);
         }
 
-        private void QueueMutationViewportRestore(MutationViewportSnapshot snapshot)
+        /// <summary>Snapshot re-asserted after every background fill chunk while it is pinned.</summary>
+        private MutationViewportSnapshot pinnedMutationViewport;
+        private bool hasMutationViewportPin;
+
+        /// <summary>
+        /// Keeps the mutation snapshot pinned while queued 200-item fill chunks are still
+        /// landing (each append can shove the offset; FillPendingNativeTreeItems re-asserts the
+        /// pin inside the same dispatcher operation, so no rendered frame ever shows the shove),
+        /// and releases the pin plus the auto-reveal suppression at ContextIdle - which the
+        /// dispatcher only reaches after every queued Background fill has drained.
+        /// </summary>
+        private void BeginMutationViewportPin(in MutationViewportSnapshot snapshot)
+        {
+            hasMutationViewportPin = snapshot.HasViewer && HasPendingNativeTreeFills;
+            if (hasMutationViewportPin)
+                pinnedMutationViewport = snapshot;
+
+            int releaseGen = treeRevealGeneration;
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                if (releaseGen != treeRevealGeneration)
+                    return; // a newer refresh or a tab switch owns the viewport now
+                hasMutationViewportPin = false;
+                suppressTreeAutoReveal = false;
+            }), DispatcherPriority.ContextIdle);
+        }
+
+        /// <summary>
+        /// Puts the viewport back where the snapshot says, right now, on the calling (UI)
+        /// thread. materializeForTarget grows the chunk-filled tree until the target offset
+        /// exists (scrolling past the built extent would clamp to the bottom); the fill
+        /// callback passes false because it IS the fill - no recursion. Never focuses, never
+        /// BringIntoView; a dead anchor leaves the plain offset restore standing and the
+        /// extent change clamps naturally.
+        /// </summary>
+        private void ApplyMutationViewportRestore(in MutationViewportSnapshot snapshot, bool materializeForTarget)
         {
             if (!snapshot.HasViewer)
                 return;
-
-            int restoreGen = treeRevealGeneration;
-            // Swallow the focus-restore RequestBringIntoView the rebuild can trigger, exactly
-            // like the tab-switch restore does. Whichever restore/refresh owns the newest
-            // generation is responsible for lifting the flag again.
-            suppressTreeAutoReveal = true;
-
-            // One pass is not enough: big expanded nodes refill in queued 200-item chunks, and
-            // each append makes the VirtualizingStackPanel re-estimate positions and shove the
-            // offset around (measured +3200px per chunk when clamped at the bottom, and a one-off
-            // +1197px drift even when not). So the restore re-asserts itself after every pending
-            // fill chunk - at Background priority the passes interleave FIFO with the fills - and
-            // only releases once the tree is fully built and the offset has stuck.
-            Action pass = null;
-            pass = () =>
+            try
             {
-                bool done = false;
-                try
-                {
-                    if (restoreGen != treeRevealGeneration)
-                    {
-                        done = true;
-                        return; // a newer refresh or a tab switch owns the viewport now
-                    }
-                    if (FindNativeTreeScrollViewer() is not ScrollViewer viewer)
-                    {
-                        done = true;
-                        return;
-                    }
+                if (FindNativeTreeScrollViewer() is not ScrollViewer viewer)
+                    return;
 
-                    // Scrolling to an offset beyond the currently-built extent would clamp to
-                    // the bottom; materialize just enough chunks for the target to exist.
+                if (materializeForTarget)
+                {
+                    // Fill until BOTH the target offset exists AND the anchor's container has
+                    // been built - after an undo re-inserts rows above the viewport, the anchor
+                    // sits beyond the first chunk, and without its container the pixel
+                    // correction below silently degrades to a plain offset restore (measured:
+                    // the viewport then shows the wrong ID region after undo).
                     int fillGuard = 0;
                     while (HasPendingNativeTreeFills && fillGuard++ < 512)
                     {
                         viewer.UpdateLayout();
-                        if (viewer.ExtentHeight >= snapshot.VerticalOffset + viewer.ViewportHeight)
+                        bool extentCoversTarget = viewer.ExtentHeight >= snapshot.VerticalOffset + viewer.ViewportHeight;
+                        bool anchorBuilt = snapshot.AnchorNode == null || nativeTreeItems.ContainsKey(snapshot.AnchorNode);
+                        if (extentCoversTarget && anchorBuilt)
                             break;
                         FillPendingNativeTreeItems();
                     }
+                }
 
-                    viewer.ScrollToVerticalOffset(snapshot.VerticalOffset);
-                    viewer.ScrollToHorizontalOffset(snapshot.HorizontalOffset);
-
-                    // If the old top-visible row still exists, nudge so it sits at the same
-                    // pixel it did before - keeps the picture stable when rows were added or
-                    // removed above the viewport. A deleted anchor leaves the offset restore
-                    // standing, and the extent change clamps naturally.
-                    if (snapshot.AnchorNode != null
-                        && nativeTreeItems.TryGetValue(snapshot.AnchorNode, out TreeViewItem anchorItem))
+                viewer.ScrollToVerticalOffset(snapshot.VerticalOffset);
+                viewer.ScrollToHorizontalOffset(snapshot.HorizontalOffset);
+                // If the old top-visible row still exists, nudge so it sits at the same pixel
+                // it did before - keeps the picture stable when rows were added or removed
+                // above the viewport.
+                if (snapshot.AnchorNode != null
+                    && nativeTreeItems.TryGetValue(snapshot.AnchorNode, out TreeViewItem anchorItem))
+                {
+                    viewer.UpdateLayout(); // commit the offset write so the measure below is real
+                    // An anchor virtualized out of the realized window cannot be measured, and
+                    // reveal-then-scroll-back tricks (BringIntoView / BringIndexIntoView) are
+                    // exactly the behavior this restore exists to prevent - so an unmeasurable
+                    // anchor simply leaves the plain offset restore standing.
+                    if (anchorItem.IsVisible)
                     {
-                        viewer.UpdateLayout(); // commit the offset write so the measure below is real
-                        if (anchorItem.IsVisible)
+                        double y = anchorItem.TransformToAncestor(viewer).Transform(new System.Windows.Point()).Y;
+                        double desired = viewer.VerticalOffset + y - snapshot.AnchorViewportY;
+                        if (Math.Abs(desired - viewer.VerticalOffset) > 0.5 || Math.Abs(y - snapshot.AnchorViewportY) > 0.5)
                         {
-                            double y = anchorItem.TransformToAncestor(viewer).Transform(new System.Windows.Point()).Y;
-                            double delta = y - snapshot.AnchorViewportY;
-                            if (Math.Abs(delta) > 0.5)
-                                viewer.ScrollToVerticalOffset(Math.Max(0, viewer.VerticalOffset + delta));
+                            viewer.ScrollToVerticalOffset(Math.Max(0, desired));
+                            viewer.UpdateLayout(); // committed before any frame can present
                         }
                     }
-
-                    if (!HasPendingNativeTreeFills)
-                        done = true; // fully built; this offset is final
                 }
-                catch
-                {
-                    // Best effort; never let a viewport nicety become a crash.
-                    done = true;
-                }
-                finally
-                {
-                    if (!done)
-                    {
-                        Dispatcher.BeginInvoke(pass, DispatcherPriority.Background);
-                    }
-                    else if (restoreGen == treeRevealGeneration)
-                    {
-                        suppressTreeAutoReveal = false;
-                    }
-                }
-            };
-            Dispatcher.BeginInvoke(pass, DispatcherPriority.Loaded);
+            }
+            catch
+            {
+                // Best effort; never let a viewport nicety become a crash.
+            }
         }
 
         /// <summary>
@@ -831,6 +860,15 @@ namespace HaRepacker.GUI.Panels
         // not have to be touched.
         private System.Windows.Media.Brush nativeChangedNodeBrush;
 
+        /// <summary>
+        /// Set by commands that perform their own WPF sync (incremental or full), so the
+        /// context-menu bridge below does not stack a second, unconditional full rebuild on
+        /// top - which both doubled the work and fired even when the user cancelled.
+        /// Cancel paths count as owned too: a cancelled command owes the tree nothing.
+        /// </summary>
+        private bool nativeTreeSyncOwnedByCommand;
+        private void MarkNativeTreeSyncOwned() { nativeTreeSyncOwnedByCommand = true; }
+
         private ContextMenu BuildNativeContextMenu(System.Windows.Forms.ContextMenuStrip source)
         {
             if (source == null) return null;
@@ -852,7 +890,16 @@ namespace HaRepacker.GUI.Panels
                 if (child is System.Windows.Forms.ToolStripSeparator) item.Items.Add(new Separator());
                 else if (child is System.Windows.Forms.ToolStripMenuItem childCommand) item.Items.Add(BuildNativeMenuItem(childCommand));
             }
-            item.Click += (_, _) => { source.PerformClick(); Dispatcher.BeginInvoke(RefreshNativeDataTree); };
+            item.Click += (_, _) =>
+            {
+                // Only a command that does NOT do its own WPF sync gets the legacy catch-all
+                // refresh (batch tools and similar); Remove/Rename/Paste/FixLink/Add own theirs,
+                // and a cancelled command syncs nothing at all.
+                nativeTreeSyncOwnedByCommand = source.Tag is bool skipBridgeRefresh && skipBridgeRefresh;
+                source.PerformClick();
+                if (!nativeTreeSyncOwnedByCommand)
+                    Dispatcher.BeginInvoke(RefreshNativeDataTree);
+            };
             return item;
         }
 
@@ -946,6 +993,13 @@ namespace HaRepacker.GUI.Panels
             {
                 pendingNativeFills.Remove(target);
             }
+
+            // While a mutation restore is pinned, put the viewport straight back before this
+            // dispatcher operation ends - appends make the VirtualizingStackPanel re-estimate
+            // and drag the offset (measured +3200px/chunk at the bottom edge, one-off +1197px
+            // otherwise), and correcting it in a LATER operation lets a wrong frame render.
+            if (hasMutationViewportPin)
+                ApplyMutationViewportRestore(pinnedMutationViewport, materializeForTarget: false);
 
             if (pendingNativeFills.Count > 0)
                 Dispatcher.BeginInvoke(new Action(FillPendingNativeTreeItems), DispatcherPriority.Background);
@@ -1114,11 +1168,128 @@ namespace HaRepacker.GUI.Panels
             return null;
         }
 
+        /// <summary>
+        /// Incremental WPF sync for one newly added WzNode: inserts a single TreeViewItem into
+        /// the already-materialized parent branch instead of rebuilding the whole tree. A parent
+        /// that was never materialized, or whose children are still the lazy placeholder, needs
+        /// nothing - the normal lazy populate builds the correct picture later.
+        /// </summary>
+        private void NativeTreeSyncAddedNode(WzNode added)
+        {
+            if (added?.Parent is not WzNode parent)
+                return; // top-level additions go through the file-load path, which refreshes
+            if (!nativeTreeItems.TryGetValue(parent, out TreeViewItem parentItem))
+                return; // branch never materialized
+
+            // Children not built yet (lazy placeholder): make sure the parent is expandable and
+            // leave the rest to the populate that runs on expansion.
+            if (parentItem.Items.Count == 1 && parentItem.Items[0] is string)
+                return;
+            if (parentItem.Items.Count == 0 && !parentItem.IsExpanded)
+            {
+                parentItem.Items.Add(UiLocalization.Translate("Loading…"));
+                return;
+            }
+
+            // The pending fill owns the unbuilt suffix, including an item just appended to the
+            // model. Let it create that suffix once instead of inserting a duplicate here.
+            if (pendingNativeFills != null && pendingNativeFills.ContainsKey(parentItem))
+                return;
+
+            TreeViewItem newItem = CreateNativeTreeItem(added);
+            int index = parent.Nodes.IndexOf(added);
+            if (index >= 0 && index <= parentItem.Items.Count)
+                parentItem.Items.Insert(index, newItem);
+            else
+                parentItem.Items.Add(newItem);
+        }
+
+        private void NativeTreeSyncChildren(WzNode parent)
+        {
+            if (parent == null || !nativeTreeItems.TryGetValue(parent, out TreeViewItem parentItem))
+                return;
+
+            if (parentItem.IsExpanded)
+            {
+                PopulateNativeTreeItem(parentItem, parent);
+                return;
+            }
+
+            RemoveNativeDescendantItems(parentItem);
+            if (pendingNativeFills != null)
+                pendingNativeFills.Remove(parentItem);
+            parentItem.Items.Clear();
+            if (parent.Nodes.Count > 0)
+                parentItem.Items.Add(UiLocalization.Translate("Loading…"));
+            UpdateNativeSelectionVisuals();
+        }
+
+        /// <summary>
+        /// Incremental WPF sync for one WzNode about to be removed: takes its TreeViewItem (and
+        /// the subtree's map entries, selection paint, pending fills) out without touching the
+        /// rest of the tree. Call BEFORE DeleteWzNode, while the node still knows its parent.
+        /// A node that was never materialized costs nothing.
+        /// </summary>
+        private void NativeTreeSyncRemovedNode(WzNode dead)
+        {
+            nativeSelectedNodes.Remove(dead);
+            nativeSelectionPainted.Remove(dead);
+            if (ReferenceEquals(nativeSelectionAnchor, dead))
+                nativeSelectionAnchor = null;
+
+            if (!nativeTreeItems.TryGetValue(dead, out TreeViewItem item))
+                return;
+
+            RemoveNativeDescendantItems(item);
+            if (pendingNativeFills != null)
+                pendingNativeFills.Remove(item);
+            nativeTreeItems.Remove(dead);
+
+            if (item.Parent is ItemsControl owner)
+                owner.Items.Remove(item);
+            else
+                dataTreeView.Items.Remove(item);
+        }
+
+        /// <summary>
+        /// The one funnel for "add a WZ object under this tree node": model + WinForms node via
+        /// WzNode.AddObject, then a single incremental WPF insert - no full tree rebuild, and
+        /// the context-menu bridge sees the sync as owned.
+        /// </summary>
+        private WzNode AddObjectToNode(System.Windows.Forms.TreeNode target, WzObject obj)
+        {
+            MarkNativeTreeSyncOwned();
+            WzNode parent = (WzNode)target;
+            MutationViewportSnapshot viewport = CaptureMutationViewport();
+            treeRevealGeneration++;
+            suppressTreeAutoReveal = true;
+            bool releaseQueued = false;
+            try
+            {
+                WzNode added = parent.AddObject(obj, UndoRedoMan);
+                if (added == null)
+                    return null;
+
+                NativeTreeSyncChildren(parent);
+                ApplyMutationViewportRestore(viewport, materializeForTarget: true);
+                BeginMutationViewportPin(viewport);
+                releaseQueued = true;
+                return added;
+            }
+            finally
+            {
+                if (!releaseQueued)
+                    suppressTreeAutoReveal = false;
+            }
+        }
+
         private void RemoveNativeDescendantItems(TreeViewItem parent)
         {
             foreach (TreeViewItem child in parent.Items.OfType<TreeViewItem>())
             {
                 RemoveNativeDescendantItems(child);
+                if (pendingNativeFills != null)
+                    pendingNativeFills.Remove(child);
                 if (child.Tag is WzNode node)
                     nativeTreeItems.Remove(node);
             }
@@ -1126,10 +1297,10 @@ namespace HaRepacker.GUI.Panels
 
         private void DataTreeView_PreviewKeyDown(object sender, System.Windows.Input.KeyEventArgs e)
         {
-            if (e.Key == Key.Delete) { PromptRemoveSelectedTreeNodes(); e.Handled = true; RefreshNativeDataTree(); }
+            if (e.Key == Key.Delete) { PromptRemoveSelectedTreeNodes(); e.Handled = true; }
             else if (e.Key == Key.F5) { StartAnimateSelectedCanvas(); e.Handled = true; }
             else if ((Keyboard.Modifiers & ModifierKeys.Control) != 0 && e.Key == Key.C) { DoCopy(); e.Handled = true; }
-            else if ((Keyboard.Modifiers & ModifierKeys.Control) != 0 && e.Key == Key.V) { DoPaste(); e.Handled = true; RefreshNativeDataTree(); }
+            else if ((Keyboard.Modifiers & ModifierKeys.Control) != 0 && e.Key == Key.V) { DoPaste(); e.Handled = true; }
             // Ctrl+F is deliberately not handled here. MainForm's Window-level PreviewKeyDown
             // tunnels first and marks the key handled, so this branch could never run anyway -
             // and leaving it would risk toggling the find panel twice for one keypress if that
@@ -1727,7 +1898,7 @@ namespace HaRepacker.GUI.Panels
             {
                 WzFile topMostWzFileParent = (WzFile)obj;
 
-                ((WzNode)target).AddObject(new WzDirectory(name, topMostWzFileParent), UndoRedoMan);
+                AddObjectToNode(target, new WzDirectory(name, topMostWzFileParent));
                 added = true;
                 break;
             }
@@ -1751,7 +1922,7 @@ namespace HaRepacker.GUI.Panels
             }
             else if (!NameInputBox.Show(Properties.Resources.MainAddImg, 0, out name))
                 return;
-            ((WzNode)target).AddObject(new WzImage(name) { Changed = true }, UndoRedoMan);
+            AddObjectToNode(target, new WzImage(name) { Changed = true });
         }
 
         /// <summary>
@@ -1769,7 +1940,7 @@ namespace HaRepacker.GUI.Panels
             }
             else if (!FloatingPointInputBox.Show(Properties.Resources.MainAddFloat, out name, out d))
                 return;
-            ((WzNode)target).AddObject(new WzFloatProperty(name, (float)d), UndoRedoMan);
+            AddObjectToNode(target, new WzFloatProperty(name, (float)d));
         }
 
         /// <summary>
@@ -1808,9 +1979,9 @@ namespace HaRepacker.GUI.Panels
                 WzCanvasProperty canvas = new(proposedName);
                 canvas.PngProperty = pngProperty;
 
-                WzNode newInsertedNode = wzNode.AddObject(canvas, UndoRedoMan);
+                WzNode newInsertedNode = AddObjectToNode(wzNode, canvas);
                 // Add an additional WzVectorProperty with X Y of 0,0
-                newInsertedNode.AddObject(new WzVectorProperty(WzCanvasProperty.OriginPropertyName, new WzIntProperty("X", 0), new WzIntProperty("Y", 0)), UndoRedoMan);
+                AddObjectToNode(newInsertedNode, new WzVectorProperty(WzCanvasProperty.OriginPropertyName, new WzIntProperty("X", 0), new WzIntProperty("Y", 0)));
 
                 i++;
             }
@@ -1834,7 +2005,7 @@ namespace HaRepacker.GUI.Panels
                 "", 0,
                 out name, out value))
                 return;
-            ((WzNode)target).AddObject(new WzIntProperty(name, (int)value), UndoRedoMan);
+            AddObjectToNode(target, new WzIntProperty(name, (int)value));
         }
 
         /// <summary>
@@ -1852,7 +2023,7 @@ namespace HaRepacker.GUI.Panels
             }
             else if (!LongInputBox.Show(Properties.Resources.MainAddInt, out name, out value))
                 return;
-            ((WzNode)target).AddObject(new WzLongProperty(name, (long)value), UndoRedoMan);
+            AddObjectToNode(target, new WzLongProperty(name, (long)value));
         }
 
         /// <summary>
@@ -1869,7 +2040,7 @@ namespace HaRepacker.GUI.Panels
             }
             else if (!NameInputBox.Show(Properties.Resources.MainAddConvex, 0, out name))
                 return;
-            ((WzNode)target).AddObject(new WzConvexProperty(name), UndoRedoMan);
+            AddObjectToNode(target, new WzConvexProperty(name));
         }
 
         /// <summary>
@@ -1887,7 +2058,7 @@ namespace HaRepacker.GUI.Panels
             }
             else if (!FloatingPointInputBox.Show(Properties.Resources.MainAddDouble, out name, out d))
                 return;
-            ((WzNode)target).AddObject(new WzDoubleProperty(name, (double)d), UndoRedoMan);
+            AddObjectToNode(target, new WzDoubleProperty(name, (double)d));
         }
 
         /// <summary>
@@ -1904,7 +2075,7 @@ namespace HaRepacker.GUI.Panels
             }
             else if (!NameInputBox.Show(Properties.Resources.MainAddNull, 0, out name))
                 return;
-            ((WzNode)target).AddObject(new WzNullProperty(name), UndoRedoMan);
+            AddObjectToNode(target, new WzNullProperty(name));
         }
 
         /// <summary>
@@ -1922,7 +2093,7 @@ namespace HaRepacker.GUI.Panels
             }
             else if (!SoundInputBox.Show(Properties.Resources.MainAddSound, out name, out path))
                 return;
-            ((WzNode)target).AddObject(new WzBinaryProperty(name, path), UndoRedoMan);
+            AddObjectToNode(target, new WzBinaryProperty(name, path));
         }
 
         /// <summary>
@@ -1940,7 +2111,7 @@ namespace HaRepacker.GUI.Panels
             }
             else if (!NameValueInputBox.Show(Properties.Resources.MainAddString, out name, out value))
                 return;
-            ((WzNode)target).AddObject(new WzStringProperty(name, value), UndoRedoMan);
+            AddObjectToNode(target, new WzStringProperty(name, value));
         }
 
         /// <summary>
@@ -1957,7 +2128,7 @@ namespace HaRepacker.GUI.Panels
             }
             else if (!NameInputBox.Show(Properties.Resources.MainAddSub, 0, out name))
                 return;
-            ((WzNode)target).AddObject(new WzSubProperty(name), UndoRedoMan);
+            AddObjectToNode(target, new WzSubProperty(name));
         }
 
         /// <summary>
@@ -1977,7 +2148,7 @@ namespace HaRepacker.GUI.Panels
                 "", 0,
                 out name, out value))
                 return;
-            ((WzNode)target).AddObject(new WzShortProperty(name, (short)value), UndoRedoMan);
+            AddObjectToNode(target, new WzShortProperty(name, (short)value));
         }
 
         /// <summary>
@@ -1995,7 +2166,7 @@ namespace HaRepacker.GUI.Panels
             }
             else if (!NameValueInputBox.Show(Properties.Resources.MainAddLink, out name, out value))
                 return;
-            ((WzNode)target).AddObject(new WzUOLProperty(name, value), UndoRedoMan);
+            AddObjectToNode(target, new WzUOLProperty(name, value));
         }
 
         /// <summary>
@@ -2013,7 +2184,7 @@ namespace HaRepacker.GUI.Panels
             }
             else if (!VectorInputBox.Show(Properties.Resources.MainAddVec, out name, out pt))
                 return;
-            ((WzNode)target).AddObject(new WzVectorProperty(name, new WzIntProperty("X", ((System.Drawing.Point)pt).X), new WzIntProperty("Y", ((System.Drawing.Point)pt).Y)), UndoRedoMan);
+            AddObjectToNode(target, new WzVectorProperty(name, new WzIntProperty("X", ((System.Drawing.Point)pt).X), new WzIntProperty("Y", ((System.Drawing.Point)pt).Y)));
         }
 
         /// <summary>
@@ -2037,7 +2208,7 @@ namespace HaRepacker.GUI.Panels
             {
                 propertyName += ".lua"; // it must end with .lua regardless
             }
-            ((WzNode)target).AddObject(new WzImage(propertyName), UndoRedoMan);*/
+            AddObjectToNode(target, new WzImage(propertyName));*/
         }
 
         /// <summary>
@@ -2045,28 +2216,87 @@ namespace HaRepacker.GUI.Panels
         /// </summary>
         public void PromptRemoveSelectedTreeNodes()
         {
-            if (!Warning.Warn(Properties.Resources.MainConfirmRemove))
-            {
+            // What the selection would actually delete - files and orphans are skipped, exactly
+            // as the old loop skipped them. Computed before any dialog so a cancel, or a
+            // selection with nothing deletable, has zero side effects.
+            List<WzNode> doomed = new List<WzNode>();
+            foreach (object selected in DataTree.SelectedNodes)
+                if (selected is WzNode node && !(node.Tag is WzFile) && node.Parent != null)
+                    doomed.Add(node);
+            if (doomed.Count == 0 && DataTree.SelectedNode is WzNode active
+                && !(active.Tag is WzFile) && active.Parent != null)
+                doomed.Add(active);
+            if (doomed.Count == 0)
                 return;
-            }
+
+            MarkNativeTreeSyncOwned(); // delete syncs incrementally below - cancelled or not
+            string deleteConfirm = doomed.Count == 1
+                ? "確定要刪除所選的節點嗎？此操作可透過復原還原。"
+                : "確定要刪除所選的 " + doomed.Count + " 個節點嗎？此操作可透過復原還原。";
+            if (!Warning.ConfirmRequired(deleteConfirm))
+                return; // cancel: model, selection, viewport, undo history all untouched
+
+            // Where the selection lands afterwards - decided by identity BEFORE the model
+            // changes, never by index math (indexes shift under delete/sort/reparse).
+            WzNode fallback = ComputeDeleteFallbackSelection(doomed);
+
+            // Rows above the viewport disappearing shift the content; the snapshot's anchor
+            // correction at the end keeps the user's row on its pixel. No full rebuild: each
+            // doomed node's TreeViewItem is removed individually.
+            MutationViewportSnapshot deleteViewport = CaptureMutationViewport();
 
             List<UndoRedoAction> actions = new List<UndoRedoAction>();
-
-            System.Windows.Forms.TreeNode[] nodeArr = new System.Windows.Forms.TreeNode[DataTree.SelectedNodes.Count];
-            DataTree.SelectedNodes.CopyTo(nodeArr, 0);
-
-            // Deleting 100 nodes is one user action: whatever refreshes the deletions trigger
-            // collapse into the single one the caller issues afterwards.
-            using (NativeTreeUpdateScope())
+            using (NativeTreeUpdateScope()) // safety: coalesce any stray refresh
             {
-                foreach (WzNode node in nodeArr)
-                    if (!(node.Tag is WzFile) && node.Parent != null)
-                    {
-                        actions.Add(UndoRedoManager.ObjectRemoved((WzNode)node.Parent, node));
-                        node.DeleteWzNode();
-                    }
+                foreach (WzNode node in doomed)
+                {
+                    actions.Add(UndoRedoManager.ObjectRemoved((WzNode)node.Parent, node));
+                    NativeTreeSyncRemovedNode(node); // WPF item out first, while parent is known
+                    node.DeleteWzNode();
+                }
+
+                UndoRedoMan.AddUndoBatch(actions);
+
+                // The dead nodes must not linger in the multi-selection model; the fallback
+                // becomes the active node. This moves SELECTION only - selection and viewport
+                // are independent: no EnsureVisible, no BringIntoView, no focus steal.
+                DataTree.SelectedNodes = new System.Collections.ArrayList();
+                if (fallback != null)
+                    DataTree.SelectedNode = fallback;
+                UpdateNativeSelectionVisuals();
+
+                ApplyMutationViewportRestore(deleteViewport, materializeForTarget: false);
             }
-            UndoRedoMan.AddUndoBatch(actions);
+        }
+
+        /// <summary>
+        /// Delete's selection fallback: if the active node survives, keep it; otherwise the next
+        /// surviving sibling, else the previous one, else the nearest surviving ancestor. All by
+        /// object identity against the doomed set - never TreeNode.Index.
+        /// </summary>
+        private WzNode ComputeDeleteFallbackSelection(List<WzNode> doomed)
+        {
+            var doomedSet = new HashSet<WzNode>(doomed);
+            WzNode active = DataTree.SelectedNode as WzNode ?? doomed[doomed.Count - 1];
+            if (!doomedSet.Contains(active))
+                return active;
+
+            if (active.Parent is System.Windows.Forms.TreeNode parent)
+            {
+                int index = parent.Nodes.IndexOf(active);
+                for (int i = index + 1; i < parent.Nodes.Count; i++)
+                    if (parent.Nodes[i] is WzNode next && !doomedSet.Contains(next))
+                        return next;
+                for (int i = index - 1; i >= 0; i--)
+                    if (parent.Nodes[i] is WzNode previous && !doomedSet.Contains(previous))
+                        return previous;
+
+                // No surviving sibling: the nearest ancestor that is not itself being deleted.
+                for (System.Windows.Forms.TreeNode up = parent; up != null; up = up.Parent)
+                    if (up is WzNode ancestor && !doomedSet.Contains(ancestor))
+                        return ancestor;
+            }
+            return null;
         }
 
         /// <summary>
@@ -2079,6 +2309,7 @@ namespace HaRepacker.GUI.Panels
 
             string newName = "";
             WzNode wzNode = node;
+            MarkNativeTreeSyncOwned(); // rename updates the WPF header itself
             if (RenameInputBox.Show(Properties.Resources.MainConfirmRename, wzNode.Text, out newName))
             {
                 // Cancel never reaches here; a same-name confirm is a no-op and records nothing.
@@ -2289,6 +2520,7 @@ namespace HaRepacker.GUI.Panels
         {
             // One repair per panel at a time: a second copy racing the first over the same
             // canvases would double-apply payloads and double-count the totals.
+            MarkNativeTreeSyncOwned(); // the async repair refreshes once itself when it applies
             if (linkRepairInProgress)
             {
                 BatchInfo("補圖仍在進行中，請等它完成後再執行。");
@@ -4116,7 +4348,7 @@ namespace HaRepacker.GUI.Panels
 
                 if (parent is WzObject parentObject && parentObject.HRTag is WzNode parentNode)
                 {
-                    if (parentNode.AddObject(placeholder, UndoRedoMan) == null)
+                    if (AddObjectToNode(parentNode, placeholder) == null)
                         continue;
                 }
                 else
@@ -5256,8 +5488,20 @@ namespace HaRepacker.GUI.Panels
         /// </summary>
         public void DoCopy()
         {
-            if (!Warning.Warn(Properties.Resources.MainConfirmCopy) || bPasteTaskActive)
+            // Count first: confirming and then wiping the clipboard over an empty selection
+            // would be a side effect for nothing.
+            int copyCount = DataTree.SelectedNodes.Count;
+            if (copyCount == 0 && DataTree.SelectedNode is WzNode)
+                copyCount = 1;
+            if (copyCount == 0 || bPasteTaskActive)
                 return;
+
+            MarkNativeTreeSyncOwned(); // copy never syncs the tree - cancelled or not
+            string copyConfirm = copyCount == 1
+                ? "確定要複製所選的節點嗎？"
+                : "確定要複製所選的 " + copyCount + " 個節點嗎？";
+            if (!Warning.ConfirmRequired(copyConfirm))
+                return; // cancel: clipboard, selection, viewport, undo history all untouched
 
             // "Last Ctrl+C wins": a whole-node tree copy always cancels a pending field copy
             // staged in the property editor, so a following Ctrl+V goes back to this tree paste
@@ -5280,7 +5524,10 @@ namespace HaRepacker.GUI.Panels
             clipboardParentName = null;
             bool firstCopiedNode = true;
 
-            foreach (WzNode node in DataTree.SelectedNodes)
+            System.Collections.IEnumerable copySource = DataTree.SelectedNodes.Count > 0
+                ? (System.Collections.IEnumerable)DataTree.SelectedNodes
+                : new[] { (WzNode)DataTree.SelectedNode };
+            foreach (WzNode node in copySource)
             {
                 WzObject clone = CloneWzObject((WzObject)((WzNode)node).Tag);
                 if (clone != null)
@@ -5442,9 +5689,10 @@ namespace HaRepacker.GUI.Panels
                 BatchInfo("剪貼簿是空的，請先複製節點。");
                 return;
             }
-            if (!Warning.Warn(Properties.Resources.MainConfirmPaste))
-                return;
 
+            // Resolving the targets is a pure read of the current selection - it must happen
+            // before the confirmation so the dialog can name the destination, and it commits
+            // nothing: cancelling below leaves no parse, no clone, no undo entry, no refresh.
             WzNode[] targets = GetSelectedBatchNodes();
             if (targets.Length == 0 && DataTree.SelectedNode is WzNode activeNode)
                 targets = new WzNode[] { activeNode };
@@ -5454,8 +5702,19 @@ namespace HaRepacker.GUI.Panels
                 return;
             }
 
+            MarkNativeTreeSyncOwned(); // paste syncs incrementally below - cancelled or not
+            string pasteConfirm = targets.Length == 1
+                ? "確定要將剪貼簿中的節點貼到『" + targets[0].Text + "』嗎？"
+                : "確定要將剪貼簿中的節點貼到所選的 " + targets.Length + " 個目標嗎？";
+            if (!Warning.ConfirmRequired(pasteConfirm))
+                return;
+
             bPasteTaskActive = true;
-            using var pasteTreeBatch = NativeTreeUpdateScope(); // one rebuild per paste, however many targets
+            // Content may appear above the viewport; the snapshot lets the anchor correction at
+            // the end keep the user's row on its pixel. No rebuild happens in between - every
+            // pasted node is inserted into the WPF tree individually by PasteIntoNode.
+            MutationViewportSnapshot pasteViewport = CaptureMutationViewport();
+            using var pasteTreeBatch = NativeTreeUpdateScope(); // safety: coalesce any stray refresh
             try
             {
                 // Reset replace option
@@ -5466,6 +5725,11 @@ namespace HaRepacker.GUI.Panels
                 {
                     pasted += PasteIntoNode(RedirectPasteTarget(targets[i]));
                 }
+
+                // The WPF tree was updated node-by-node as each paste landed; what remains is
+                // keeping the user's viewport row on its pixel if content appeared above it.
+                if (pasted > 0)
+                    ApplyMutationViewportRestore(pasteViewport, materializeForTarget: false);
 
                 // Deliberately silent on success, however many targets: the pasted nodes turn red
                 // in the tree, which is the feedback. Only a paste that achieved nothing is worth
@@ -5524,9 +5788,13 @@ namespace HaRepacker.GUI.Panels
                                 break;
 
                             case ReplaceResult.Yes: // Replace just this
+                                NativeTreeSyncRemovedNode(child);
                                 child.DeleteWzNode();
                                 if (parent.AddNode(node, false))
+                                {
+                                    NativeTreeSyncAddedNode(node);
                                     pasted++;
+                                }
                                 replaceBoxResult = ReplaceResult.NoneSelectedYet; // reset after use
                                 break;
 
@@ -5535,9 +5803,13 @@ namespace HaRepacker.GUI.Panels
                                 break;
 
                             case ReplaceResult.YesToAll:
+                                NativeTreeSyncRemovedNode(child);
                                 child.DeleteWzNode();
                                 if (parent.AddNode(node, false))
+                                {
+                                    NativeTreeSyncAddedNode(node);
                                     pasted++;
+                                }
                                 break;
                         }
 
@@ -5547,7 +5819,10 @@ namespace HaRepacker.GUI.Panels
                     else // not not in this 
                     {
                         if (parent.AddNode(node, false))
+                        {
+                            NativeTreeSyncAddedNode(node);
                             pasted++;
+                        }
                     }
                 }
             }

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.IO;
 using System.Linq;
 using System.Runtime.ExceptionServices;
@@ -40,7 +40,9 @@ public sealed class LinkRepairPipelineTests
             ExceptionDispatchInfo.Capture(captured).Throw();
     }
 
-    private static readonly byte[] RealPixels = { 0x78, 0x9C, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01 };
+    // A REAL zlib stream that inflates to the 64 bytes a 4x4 BGRA32 canvas needs - unlike the
+    // minimal empty-deflate marker the older suite uses, this one survives an actual decode.
+    private static readonly byte[] RealPixels = { 0x78, 0x9C, 0x13, 0x14, 0xA4, 0x0C, 0x00, 0x00, 0x8A, 0x60, 0x04, 0x41 };
 
     private static WzImage BuildLinkedImage(params string[] linkedNames)
     {
@@ -109,7 +111,7 @@ public sealed class LinkRepairPipelineTests
     }
 
     [Fact]
-    public void RepeatedTargets_EachGetTheirOwnCopy()
+    public void RepeatedTargets_EachDestinationHoldsTheCorrectPayload()
     {
         RunSta(() =>
         {
@@ -130,6 +132,59 @@ public sealed class LinkRepairPipelineTests
             }
             // The source itself is untouched.
             Assert.Equal(RealPixels, ((WzCanvasProperty)image["stand"]).PngProperty.GetCompressedBytes(false));
+        });
+    }
+
+    /// <summary>
+    /// The repaired payload is aliased, not copied: SetCompressedBytes stores the caller's array
+    /// reference (WzPngProperty.cs, compressedImageBytes = bytes) and GetCompressedBytes hands the
+    /// internal array back out - so every destination repaired from one target, cached or not,
+    /// shares a single byte[] with the source. That is safe ONLY because nothing in the codebase
+    /// mutates a compressed array in place (every "modify" path rebinds a fresh array; the save
+    /// path only reads). This test pins both halves of that contract: the sharing itself, and
+    /// that replacing one destination's payload afterwards cannot leak into its siblings or the
+    /// source. If payloads are ever deep-copied instead, the Assert.Same lines can simply be
+    /// dropped - the isolation asserts below them must keep passing either way.
+    /// </summary>
+    [Fact]
+    public void SharedPayload_ReplacingOneDestination_LeavesTheOthersAndTheSourceIntact()
+    {
+        RunSta(() =>
+        {
+            WzImage image = BuildLinkedImage("attack1", "attack2");
+            var root = new WzNode(image);
+
+            int repaired = 0, failed = 0;
+            MainPanel.CheckImageNodeRecursively_linkRepair(root, ref repaired, ref failed);
+            Assert.Equal(2, repaired);
+
+            var source = (WzCanvasProperty)image["stand"];
+            var a = (WzCanvasProperty)image["attack1"];
+            var b = (WzCanvasProperty)image["attack2"];
+
+            // The deliberate aliasing, made explicit: one immutable array, three holders.
+            byte[] aBytes = a.PngProperty.GetCompressedBytes(false);
+            byte[] bBytes = b.PngProperty.GetCompressedBytes(false);
+            Assert.Same(aBytes, bBytes);
+            Assert.Same(aBytes, source.PngProperty.GetCompressedBytes(false));
+
+            // Now "edit" one destination the way every supported path does - by handing it a
+            // NEW array (SetCompressedBytes is what the change-image flow ends in).
+            byte[] replacement = { 0x78, 0x9C, 0x63, 0x00, 0x00, 0x00, 0x02, 0x00, 0x02 };
+            a.PngProperty.SetCompressedBytes(replacement, 1, 1, WzPngFormat.Format2);
+
+            // The sibling and the source still hold the original payload, byte for byte.
+            Assert.Equal(RealPixels, b.PngProperty.GetCompressedBytes(false));
+            Assert.Equal(RealPixels, source.PngProperty.GetCompressedBytes(false));
+            Assert.Equal(4, b.PngProperty.Width);
+            Assert.Equal(4, source.PngProperty.Width);
+            Assert.Equal(replacement, a.PngProperty.GetCompressedBytes(false));
+            Assert.Equal(1, a.PngProperty.Width);
+
+            // And the untouched holders still decode.
+            using var decoded = b.PngProperty.GetImage(false);
+            Assert.NotNull(decoded);
+            Assert.Equal(4, decoded.Width);
         });
     }
 
