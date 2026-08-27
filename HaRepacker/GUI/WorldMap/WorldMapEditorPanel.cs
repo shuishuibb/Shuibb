@@ -110,6 +110,15 @@ namespace HaRepacker.GUI.WorldMap
             new Dictionary<WorldMapLink, WorldMapAlphaMask>();
 
         /// <summary>
+        /// Whether the linkImg artwork is drawn. A view preference that lives as long as this
+        /// panel: it deliberately survives Clear, 重設視圖 and navigating to another WorldMap, so
+        /// artwork the user switched off stays off until they switch it back on.
+        /// </summary>
+        private bool linkImagesVisible = true;
+
+        private Button toggleLinkImagesButton;
+
+        /// <summary>
         /// Display slot for each entry that has no spot yet, so they fan out instead of stacking
         /// on one pixel. Display only - see WorldMapPlaceholderLayout.
         /// </summary>
@@ -381,7 +390,12 @@ namespace HaRepacker.GUI.WorldMap
                     // transparent picture swallows clicks meant for whatever is underneath it.
                     // The viewport resolves clicks by real pixel opacity instead - see
                     // HitTestLinkImage.
-                    IsHitTestVisible = false
+                    IsHitTestVisible = false,
+
+                    // Freshly drawn artwork has to honour the current show/hide preference.
+                    Visibility = WorldMapLinkImageVisibility.ShouldShowImage(linkImagesVisible)
+                        ? Visibility.Visible
+                        : Visibility.Collapsed
                 };
                 RenderOptions.SetBitmapScalingMode(image, BitmapScalingMode.NearestNeighbor);
 
@@ -452,6 +466,11 @@ namespace HaRepacker.GUI.WorldMap
         /// </summary>
         private WorldMapLink HitTestLinkImage(Point pointerOnCanvas)
         {
+            // Hidden artwork must not keep catching clicks: with the pictures off, the area they
+            // covered behaves like plain background again.
+            if (!WorldMapLinkImageVisibility.ShouldShowImage(linkImagesVisible))
+                return null;
+
             if (linkImageOrder.Count == 0)
                 return null;
 
@@ -1180,10 +1199,48 @@ namespace HaRepacker.GUI.WorldMap
 
             foreach (KeyValuePair<WorldMapLink, Rectangle> entry in linkImageOutlines)
             {
-                entry.Value.Visibility = selectedItems.Contains(entry.Key)
+                entry.Value.Visibility = WorldMapLinkImageVisibility.ShouldShowOutline(
+                    linkImagesVisible, selectedItems.Contains(entry.Key))
                     ? Visibility.Visible
                     : Visibility.Collapsed;
             }
+        }
+
+        /// <summary>
+        /// Flips the linkImg artwork on or off. Pure display: no re-render, no re-decode, no
+        /// reposition, and the pending previews, the document and the WZ are all left alone.
+        /// </summary>
+        private void ToggleLinkImages()
+        {
+            linkImagesVisible = !linkImagesVisible;
+            UpdateLinkImageVisibility();
+            statusText.Text = WorldMapLinkImageVisibility.StatusText(linkImagesVisible);
+        }
+
+        /// <summary>
+        /// Applies the current preference to the artwork already on the canvas and to the button.
+        /// Markers - spot dots and MapLink diamonds - are untouched on purpose: only the pictures
+        /// go away.
+        /// </summary>
+        private void UpdateLinkImageVisibility()
+        {
+            Visibility imageVisibility = WorldMapLinkImageVisibility.ShouldShowImage(linkImagesVisible)
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+
+            foreach (Image image in linkImages.Values)
+                image.Visibility = imageVisibility;
+
+            foreach (KeyValuePair<WorldMapLink, Rectangle> entry in linkImageOutlines)
+            {
+                entry.Value.Visibility = WorldMapLinkImageVisibility.ShouldShowOutline(
+                    linkImagesVisible, selectedItems.Contains(entry.Key))
+                    ? Visibility.Visible
+                    : Visibility.Collapsed;
+            }
+
+            if (toggleLinkImagesButton != null)
+                toggleLinkImagesButton.Content = WorldMapLinkImageVisibility.ButtonText(linkImagesVisible);
         }
 
         // ---- dragging ----------------------------------------------------------------------------
@@ -2070,6 +2127,12 @@ namespace HaRepacker.GUI.WorldMap
             selectAllButton.Click += delegate { SelectAllSpots(); };
             DockPanel.SetDock(selectAllButton, Dock.Right);
             bar.Children.Add(selectAllButton);
+
+            toggleLinkImagesButton = PanelButton(WorldMapLinkImageVisibility.ButtonText(linkImagesVisible));
+            toggleLinkImagesButton.Margin = new Thickness(0.0, 0.0, 8.0, 0.0);
+            toggleLinkImagesButton.Click += delegate { ToggleLinkImages(); };
+            DockPanel.SetDock(toggleLinkImagesButton, Dock.Right);
+            bar.Children.Add(toggleLinkImagesButton);
 
             zoomText = new TextBlock
             {

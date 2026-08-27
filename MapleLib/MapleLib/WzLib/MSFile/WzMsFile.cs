@@ -684,14 +684,26 @@ namespace MapleLib.WzLib.MSFile
             foreach (WzMsEntry entry in Entries)
             {
                 byte[] decryptedData = DecryptDataToArray(entry);
+
+                // A pack also carries non-image bookkeeping entries with no payload at all
+                // (Mob/pack_ignore.txt). There is nothing for WzImage to read in those, and
+                // letting one through costs the whole file: reading the header byte off an empty
+                // stream throws EndOfStreamException out of the load.
+                if (decryptedData.Length == 0)
+                    continue;
+
                 Stream decrypted = new MemoryStream(decryptedData, writable: false); // dont close this stream!
                 WzBinaryReader reader = new(decrypted, WzTool.GetIvByMapleVersion(mapleVersion));
 
                 int lastSlashIndex = entry.Name.LastIndexOf('/'); // Mob/0100000.img
                 string entryImgName = (lastSlashIndex >= 0) ? entry.Name.Substring(lastSlashIndex + 1) : entry.Name;
 
+                // Deliberately left unparsed, the same way an image inside a .wz is: each one owns
+                // a private stream over its decrypted bytes, so it can parse whenever it is first
+                // opened. Parsing all of them here made opening a pack read every image up front
+                // and build its whole node tree with it - on Mob_00000.ms that was 2.9s of the
+                // 3.4s load, for images the user may never open.
                 var wzImage = new WzImage(entryImgName, reader);
-                wzImage.ParseImage();
                 //wzImage.Changed = true;
                 wzDir.AddImage(wzImage);
             }

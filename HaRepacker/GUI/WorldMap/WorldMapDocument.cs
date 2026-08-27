@@ -832,4 +832,29 @@ namespace HaRepacker.GUI.WorldMap
         private static bool IsWorldMapContainerName(string name)
             => name != null && name.StartsWith(WorldMapDirectoryName, StringComparison.OrdinalIgnoreCase);
     }
+
+    /// <summary>
+    /// The show/hide rule for linkImg artwork. A view preference and nothing else - it never
+    /// reaches the WZ, the document or the pending previews.
+    /// </summary>
+    public static class WorldMapLinkImageVisibility
+    {
+        /// <summary>Artwork is drawn, and is the only state in which it can be clicked.</summary>
+        public static bool ShouldShowImage(bool linkImagesVisible) => linkImagesVisible;
+
+        /// <summary>
+        /// The dashed selection frame needs both: hiding the artwork must not leave a frame
+        /// floating over the map with nothing inside it.
+        /// </summary>
+        public static bool ShouldShowOutline(bool linkImagesVisible, bool isSelected)
+            => linkImagesVisible && isSelected;
+
+        /// <summary>The toggle button says what the next click will do.</summary>
+        public static string ButtonText(bool linkImagesVisible)
+            => linkImagesVisible ? "隱藏 linkImg" : "顯示 linkImg";
+
+        /// <summary>The status line says what just happened.</summary>
+        public static string StatusText(bool linkImagesVisible)
+            => linkImagesVisible ? "已顯示 linkImg。" : "已隱藏 linkImg。";
+    }
 }

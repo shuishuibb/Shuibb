@@ -1228,30 +1228,42 @@ namespace HaRepacker.GUI
                     else if (filePathLowerCase.EndsWith(".ms") || filePathLowerCase.EndsWith(".mn"))
                     {
                         // Raw .ms file before being packed into .wz
+                        try
+                        {
+                            var fileStream = File.OpenRead(filePath);
+                            var memoryStream = new MemoryStream(); // leave open
+                            fileStream.CopyTo(memoryStream);
+                            memoryStream.Position = 0;
 
-                        var fileStream = File.OpenRead(filePath);
-                        var memoryStream = new MemoryStream(); // leave open
-                        fileStream.CopyTo(memoryStream);
-                        memoryStream.Position = 0;
+                            string msFileName = Path.GetFileName(filePath);
 
-                        string msFileName = Path.GetFileName(filePath);
+                            var msFile = new MapleLib.WzLib.MSFile.WzMsFile(memoryStream, msFileName, filePath, true);
+                            msFile.ReadEntries();
 
-                        var msFile = new MapleLib.WzLib.MSFile.WzMsFile(memoryStream, msFileName, filePath, true);
-                        msFile.ReadEntries();
+                            // Use the new static method to load as WzFile
+                            var wzFile = msFile.LoadAsWzFile();
 
-                        // Use the new static method to load as WzFile
-                        var wzFile = msFile.LoadAsWzFile();
+                            wzFileManager.LoadWzFile(msFileName, wzFile);
 
-                        wzFileManager.LoadWzFile(msFileName, wzFile);
+                            AddLoadedWzObjectToMainPanel(wzFile, currentDispatcher);
 
-                        AddLoadedWzObjectToMainPanel(wzFile, currentDispatcher);
+                            // write the file to temporary windows directory
+                            //string tempFilePath = Path.Combine(Path.GetTempPath(), msFileName.Replace(".ms", ".wz"));
+                            //wzFile.SaveToDisk(tempFilePath);
 
-                        // write the file to temporary windows directory
-                        //string tempFilePath = Path.Combine(Path.GetTempPath(), msFileName.Replace(".ms", ".wz"));
-                        //wzFile.SaveToDisk(tempFilePath);
-
-                        // add to the list of WZ to load
-                        //wzfilePathsToLoad.Add(tempFilePath);
+                            // add to the list of WZ to load
+                            //wzfilePathsToLoad.Add(tempFilePath);
+                        }
+                        catch (Exception ex)
+                        {
+                            // The .wz path below already guards itself; this one did not. An
+                            // exception here escapes this async void method into
+                            // Program.CurrentDomain_UnhandledException, which shows the crash
+                            // dialog and exits - losing every file already open in the tree
+                            // because one pack could not be read.
+                            MessageBox.Show(Path.GetFileName(filePath) + " - " + ex.Message,
+                                HaRepacker.Properties.Resources.Error, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        }
                     }
 
                     // List.wz file (pre-bb maplestory enc)
