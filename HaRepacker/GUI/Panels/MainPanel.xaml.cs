@@ -381,22 +381,72 @@ namespace HaRepacker.GUI.Panels
                 AddVisibleNativeNodes(child, result);
         }
 
+        /// <summary>
+        /// The nodes currently carrying the selection highlight, so a selection change can repaint
+        /// exactly those instead of going looking for them.
+        /// </summary>
+        private readonly HashSet<WzNode> nativeSelectionPainted = new HashSet<WzNode>();
+
+        /// <summary>
+        /// Moves the selection highlight onto <see cref="nativeSelectedNodes"/>, touching only the
+        /// items whose state actually changed.
+        ///
+        /// This used to sweep every materialised TreeViewItem on every selection change, so the
+        /// cost of a single arrow keypress grew with how much of the tree the user had opened -
+        /// one expanded boss image (Mob 8880100.img is 2,594 nodes) was enough to make a held
+        /// arrow key stutter, because each keypress re-set Foreground and Background on thousands
+        /// of items that had nothing to do with the change.
+        /// </summary>
         private void UpdateNativeSelectionVisuals()
+        {
+            HashSet<WzNode> selected = nativeSelectedNodes.Count == 0
+                ? null
+                : new HashSet<WzNode>(nativeSelectedNodes);
+
+            foreach (WzNode node in nativeSelectionPainted)
+            {
+                if (selected != null && selected.Contains(node))
+                    continue; // still selected - leave it painted
+                if (!nativeTreeItems.TryGetValue(node, out TreeViewItem item))
+                    continue;
+
+                if (item.IsSelected)
+                    item.IsSelected = false;
+                item.ClearValue(Control.BackgroundProperty);
+                ApplyNativeNodeForeground(node, item);
+            }
+
+            nativeSelectionPainted.Clear();
+            if (selected == null)
+                return;
+
+            // Looks the item up rather than assuming one exists: a selected node under a collapsed
+            // parent has no container yet, and gets painted when one is built.
+            foreach (WzNode node in nativeSelectedNodes)
+            {
+                if (!nativeTreeItems.TryGetValue(node, out TreeViewItem item))
+                    continue;
+
+                item.Background = System.Windows.SystemColors.HighlightBrush;
+                item.Foreground = System.Windows.SystemColors.HighlightTextBrush;
+                nativeSelectionPainted.Add(node);
+            }
+        }
+
+        /// <summary>
+        /// Repaints every materialised item's foreground from its WzNode. Needed after an edit
+        /// marks nodes red somewhere across the tree, where the set of changed nodes is not known
+        /// here - unlike a selection change, which knows exactly what moved. Selected items are
+        /// skipped: they wear the highlight foreground until they are deselected, and
+        /// UpdateNativeSelectionVisuals applies the red at that point.
+        /// </summary>
+        private void RefreshNativeNodeForegrounds()
         {
             foreach ((WzNode node, TreeViewItem item) in nativeTreeItems)
             {
-                if (nativeSelectedNodes.Contains(node))
-                {
-                    item.Background = System.Windows.SystemColors.HighlightBrush;
-                    item.Foreground = System.Windows.SystemColors.HighlightTextBrush;
-                }
-                else
-                {
-                    if (item.IsSelected)
-                        item.IsSelected = false;
-                    item.ClearValue(Control.BackgroundProperty);
-                    ApplyNativeNodeForeground(node, item);
-                }
+                if (nativeSelectionPainted.Contains(node))
+                    continue;
+                ApplyNativeNodeForeground(node, item);
             }
         }
 
@@ -962,9 +1012,45 @@ namespace HaRepacker.GUI.Panels
             if (node?.Tag is not WzObject selectedObject)
                 return;
 
-            ShowObjectValue(selectedObject);
+            // Cheap enough to do straight away, so the status bar keeps up with the caret.
             _bindingPropertyItem.WzFileType = node.GetTypeName();
             SetSelectedWzTypeName(_bindingPropertyItem.WzFileType);
+
+            QueueShowObjectValue(selectedObject);
+        }
+
+        /// <summary>The selection the editor still has to draw, always the newest one.</summary>
+        private WzObject pendingObjectValue;
+
+        /// <summary>The queued render, so a burst of selection changes only ever schedules one.</summary>
+        private DispatcherOperation pendingObjectValueRender;
+
+        /// <summary>
+        /// Draws the right-hand editor for the latest selection, once.
+        ///
+        /// Every arrow keypress raises a selection change, and drawing one costs real work -
+        /// decoding a canvas, rebuilding the editor cards, resolving a skill. Running that per
+        /// keypress made holding an arrow key stutter, for nodes the user was only passing over.
+        /// The render is queued at Background priority and always reads the newest selection, so a
+        /// burst draws the node the user actually stopped on and skips everything in between. A
+        /// single click still renders on the very next idle moment, which is imperceptible.
+        /// </summary>
+        private void QueueShowObjectValue(WzObject obj)
+        {
+            pendingObjectValue = obj;
+
+            if (pendingObjectValueRender != null &&
+                pendingObjectValueRender.Status == DispatcherOperationStatus.Pending)
+                return; // already queued - it will pick up the selection above when it runs
+
+            pendingObjectValueRender = Dispatcher.BeginInvoke(new Action(() =>
+            {
+                pendingObjectValueRender = null;
+
+                WzObject target = pendingObjectValue;
+                if (target != null)
+                    ShowObjectValue(target);
+            }), DispatcherPriority.Background);
         }
 
         /// <summary>
@@ -4283,7 +4369,7 @@ namespace HaRepacker.GUI.Panels
                 // WPF mirror, instead of rebuilding the tree. A property under a collapsed parent
                 // has no TreeViewItem yet; its WzNode is marked all the same, and
                 // CreateNativeTreeItem applies the red when the user expands it later.
-                UpdateNativeSelectionVisuals();
+                RefreshNativeNodeForegrounds();
             }
         }
 
@@ -4526,7 +4612,7 @@ namespace HaRepacker.GUI.Panels
             // Repaints the items that exist in the WPF mirror. Deliberately not
             // RefreshNativeDataTree() - dragging a spot must not rebuild the whole tree.
             if (marked)
-                UpdateNativeSelectionVisuals();
+                RefreshNativeNodeForegrounds();
         }
 
         /// <summary>

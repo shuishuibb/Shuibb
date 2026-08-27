@@ -1,0 +1,7 @@
+assembly: C:\Users\66\Desktop\修改工具\Shuibb_SourceBaseline\tests\typeahead\bin\Release\net10.0-windows\WvsWzImg.dll
+target  : D:/3.私服檔案/技術谷4.0/Data/Mob/Mob_000.wz -> 8880100.img, typing '4'
+
+root = Mob_000.wz (2171 children)
+  [FAIL] found 8880100.img
+
+=== passed 0, failed 1 ===
