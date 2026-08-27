@@ -306,7 +306,12 @@ namespace SkillPreview
                 content.Children.Add(BuildStringCard(theme));
 
             // The node's own loose values first, then one card per group, in declaration order.
-            var loose = currentNode.WzProperties.Where(IsEditableScalar).ToList();
+            // Anything the STRING card above already owns is dropped here so name/desc are not
+            // offered twice - see KeysHandledByStringCard. A card left with nothing is not built
+            // at all, rather than showing an empty box with a save button.
+            var loose = NodeEditorStringFieldFilter.ExcludeHandled(
+                currentNode.WzProperties.Where(IsEditableScalar).ToList(),
+                KeysHandledByStringCard(currentNode));
             if (loose.Count > 0)
                 content.Children.Add(BuildGroupCard(theme, currentNode, currentNodeName, loose, isLooseFieldsCard: true));
 
@@ -314,7 +319,9 @@ namespace SkillPreview
             {
                 if (!(child is IPropertyContainer group))
                     continue;
-                var fields = group.WzProperties.Where(IsEditableScalar).ToList();
+                var fields = NodeEditorStringFieldFilter.ExcludeHandled(
+                    group.WzProperties.Where(IsEditableScalar).ToList(),
+                    KeysHandledByStringCard(group));
                 if (fields.Count == 0)
                     continue;
                 content.Children.Add(BuildGroupCard(theme, group, child.Name, fields));
@@ -324,6 +331,20 @@ namespace SkillPreview
             statusText.Text = groups.Count + " 組,共 " + fieldCount + " 個可編輯欄位"
                 + (stringEntry == null ? "" : stringIsReadOnly ? "  ·  String.wz 未開啟,文字唯讀" : "  ·  已連結 String.wz");
         }
+
+        /// <summary>
+        /// The keys the STRING card has taken over for this container - the ones it actually built
+        /// a box for, which is at most name and desc.
+        ///
+        /// Empty unless the container *is* the String entry the card is bound to. That reference
+        /// check is the whole point: a name/desc pair anywhere else in the WZ is an ordinary pair
+        /// of properties and must keep showing normally, and an item whose text lives in a
+        /// separate String.wz entry still lists its own fields untouched.
+        /// </summary>
+        private IReadOnlyCollection<string> KeysHandledByStringCard(IPropertyContainer container)
+            => stringEntry != null && ReferenceEquals(container, stringEntry)
+                ? stringBoxes.Keys
+                : Array.Empty<string>();
 
         private UIElement BuildStringCard(EditorTheme theme)
         {
@@ -348,7 +369,8 @@ namespace SkillPreview
                 stack.Children.Add(LabelledRow(theme, field == "name" ? "名稱" : "說明", box));
             }
 
-            var save = AccentButton(theme, "儲存文字");
+            // Inside the STRING 文字 card, "儲存" is unambiguous.
+            var save = AccentButton(theme, "儲存");
             save.Click += delegate { SaveStringFields(); };
             save.IsEnabled = !stringIsReadOnly;
             save.HorizontalAlignment = HorizontalAlignment.Right;
@@ -1056,6 +1078,38 @@ namespace SkillPreview
             input.Focus();
             dialog.ShowDialog();
             return result;
+        }
+    }
+
+    /// <summary>
+    /// Keeps the generic property cards from repeating fields the dedicated STRING card above
+    /// already edits.
+    ///
+    /// Selecting a String.wz entry such as Consume.img\2000000 used to show name and desc twice:
+    /// once in the STRING 文字 card and again in the node's own field list, because both are
+    /// reading the very same properties. Only the keys the STRING card actually bound are removed,
+    /// and only for the container it is bound to - this never hides a name/desc that belongs to
+    /// some unrelated node.
+    ///
+    /// Display filtering only: nothing is renamed, removed or moved in the WZ.
+    /// </summary>
+    public static class NodeEditorStringFieldFilter
+    {
+        public static List<WzImageProperty> ExcludeHandled(
+            IReadOnlyList<WzImageProperty> fields, IReadOnlyCollection<string> handledKeys)
+        {
+            var kept = new List<WzImageProperty>();
+            if (fields == null)
+                return kept;
+
+            foreach (WzImageProperty field in fields)
+            {
+                // Nothing handled -> everything is kept, which is the ordinary non-String case.
+                if (handledKeys != null && handledKeys.Count > 0 && handledKeys.Contains(field.Name))
+                    continue;
+                kept.Add(field);
+            }
+            return kept;
         }
     }
 }
