@@ -958,7 +958,10 @@ namespace HaRepacker.GUI.Panels
 
             if (DataTree.SelectedNode != null && DataTree.SelectedNode.Tag is WzImage && DataTree.SelectedNode.Nodes.Count == 0)
             {
-                ParseOnDataTreeSelectedItem(((WzNode)DataTree.SelectedNode), true);
+                // A huge IMG parses on a worker thread so the window keeps painting; everything
+                // else keeps the plain synchronous path.
+                if (!TryBeginAsyncImageParse((WzNode)DataTree.SelectedNode))
+                    ParseOnDataTreeSelectedItem(((WzNode)DataTree.SelectedNode), true);
             }
 
             // The node may only have become a real WzImage just now, and the editors were picked
@@ -1016,6 +1019,14 @@ namespace HaRepacker.GUI.Panels
             _bindingPropertyItem.WzFileType = node.GetTypeName();
             SetSelectedWzTypeName(_bindingPropertyItem.WzFileType);
 
+            // While this image parses on a worker, the editors must not touch it: several of
+            // them index into the image, WzImage's indexer parses on demand, and ParseImage
+            // locks the file's shared reader - the render would sit on that lock for the whole
+            // parse, freezing the UI the async parse just unblocked. The completion handler
+            // re-runs this method once the image is ready.
+            if (selectedObject is WzImage pendingImage && imagesBeingParsed.Contains(pendingImage))
+                return;
+
             QueueShowObjectValue(selectedObject);
         }
 
@@ -1048,6 +1059,11 @@ namespace HaRepacker.GUI.Panels
                 pendingObjectValueRender = null;
 
                 WzObject target = pendingObjectValue;
+                // Deferred, not dropped: while an image is still parsing on a worker, touching
+                // it here would block on the file's shared reader lock for the whole parse.
+                // The parse-completion handler re-renders it.
+                if (target is WzImage busy && imagesBeingParsed.Contains(busy))
+                    return;
                 if (target != null)
                     ShowObjectValue(target);
             }), DispatcherPriority.Background);
@@ -1057,6 +1073,134 @@ namespace HaRepacker.GUI.Panels
         /// Parse the data tree selected item on double clicking, or copy pasting into it.
         /// </summary>
         /// <param name="selectedNode"></param>
+        // ---- async parse for huge IMGs -------------------------------------------------------
+
+        /// <summary>
+        /// Images whose parse is currently running on a worker thread. Guards against a second
+        /// double-click starting a second ParseImage on the same image.
+        /// </summary>
+        private readonly HashSet<WzImage> imagesBeingParsed = new HashSet<WzImage>();
+
+        /// <summary>
+        /// Above this raw block size the double-click parse runs on a worker thread. Chosen from
+        /// measurement, not from the node count (which is unknown before parsing): the smallest
+        /// image that visibly froze the UI (Etc/Commodity.img, ~0.8s) has a 1.8MB block, while
+        /// ordinary equip/mob images sit far below 1MB and keep the cheap synchronous path.
+        /// </summary>
+        private const int AsyncParseMinBlockSize = 1024 * 1024;
+
+        /// <summary>
+        /// Starts a background parse for a big unparsed image. Returns false when the image is
+        /// small enough for the synchronous path; returns true (and does everything itself) when
+        /// the parse has been started - or is already running - on a worker.
+        ///
+        /// The split of the work: ParseImage (pure MapleLib reader work, ~85% of the stall) runs
+        /// on the worker; Reparse (the WinForms node model), the WPF mirror fill and the editors
+        /// stay on the UI thread, exactly as before. One caveat is accepted and documented: WZ
+        /// images of one file share that file's reader, and ParseImage locks it - a synchronous
+        /// parse of another image in the same file would wait for a running background parse.
+        /// </summary>
+        private bool TryBeginAsyncImageParse(WzNode node)
+        {
+            if (node?.Tag is not WzImage img || img.Parsed)
+                return false;
+            if (img.BlockSize < AsyncParseMinBlockSize)
+                return false;
+            if (imagesBeingParsed.Contains(img))
+                return true; // already loading - swallow the extra double-click entirely
+
+            imagesBeingParsed.Add(img);
+            nativeTreeItems.TryGetValue(node, out TreeViewItem loadingItem);
+            if (loadingItem != null)
+                loadingItem.Header = node.Text + "（載入中…）";
+
+            System.Threading.Tasks.Task.Run(() => img.ParseImage())
+                .ContinueWith(t =>
+                {
+                    Exception error = t.Exception; // observed either way, so a failure can never
+                                                   // escalate to an unobserved-task crash
+                    try
+                    {
+                        Dispatcher.BeginInvoke(new Action(() => CompleteAsyncImageParse(node, img, error)));
+                    }
+                    catch
+                    {
+                        // Dispatcher gone - the window is closing; nothing left to update.
+                    }
+                });
+            return true;
+        }
+
+        /// <summary>
+        /// UI-thread tail of the background parse: validates the world hasn't moved on, then does
+        /// what the synchronous path always did - Reparse, expand, refresh the editor.
+        /// </summary>
+        private void CompleteAsyncImageParse(WzNode node, WzImage img, Exception error)
+        {
+            imagesBeingParsed.Remove(img);
+
+            // Put the label back regardless of the outcome.
+            nativeTreeItems.TryGetValue(node, out TreeViewItem item);
+            if (item != null)
+                item.Header = node.Text;
+
+            // The user may have unloaded or reloaded the file, or replaced the node, while the
+            // worker was running. A result for a world that no longer exists is dropped whole -
+            // never grafted onto whatever tree is showing now.
+            bool alive;
+            try
+            {
+                alive = ReferenceEquals(node.Tag, img)
+                    && node.TreeView == DataTree
+                    && img.WzFileParent?.IsUnloaded != true;
+            }
+            catch
+            {
+                alive = false;
+            }
+            if (!alive)
+                return;
+
+            if (error != null)
+            {
+                // This image only; it stays unparsed, so double-clicking again retries.
+                string reason = error is AggregateException agg ? (agg.InnerException?.Message ?? agg.Message) : error.Message;
+                System.Windows.Forms.MessageBox.Show("無法解析 " + node.Text + "：\n" + reason,
+                    HaRepacker.Properties.Resources.Error,
+                    System.Windows.Forms.MessageBoxButtons.OK, System.Windows.Forms.MessageBoxIcon.Error);
+                return;
+            }
+
+            // BeginUpdate suppresses per-node native messages in case the WinForms tree has a
+            // window handle (created e.g. by a SelectedNode assignment) - with one, every one of
+            // thousands of adds would otherwise round-trip through the control.
+            DataTree.BeginUpdate();
+            try
+            {
+                node.Reparse();
+                node.Expand(); // keep the WinForms model's expansion state in step, as the sync path does
+            }
+            finally
+            {
+                DataTree.EndUpdate();
+            }
+
+            if (item != null)
+            {
+                if (node.Nodes.Count > 0 && item.Items.Count == 0)
+                    item.Items.Add(UiLocalization.Translate("Loading…"));
+                if (item.IsExpanded)
+                    PopulateNativeTreeItem(item, node); // already open - Expanded won't re-fire
+                else
+                    item.IsExpanded = true; // triggers the usual chunked PopulateNativeTreeItem fill
+            }
+
+            // Refresh the right side only when the user is still on this node - never steal a
+            // selection they have since moved elsewhere.
+            if (ReferenceEquals(DataTree.SelectedNode, node))
+                ShowSelectedDataTreeNode(node);
+        }
+
         private static void ParseOnDataTreeSelectedItem(WzNode selectedNode, bool expandDataTree = true)
         {
             if (selectedNode.Tag is ImgFileWzImageReference imgRef)
@@ -1769,23 +1913,36 @@ namespace HaRepacker.GUI.Panels
         {
             // handle multiple nodes...
             int nodeCount = DataTree.SelectedNodes.Count;
+            int repaired = 0, failed = 0;
             DateTime t0 = DateTime.Now;
             foreach (WzNode node in DataTree.SelectedNodes)
             {
-                CheckImageNodeRecursively_linkRepair(node);
+                CheckImageNodeRecursively_linkRepair(node, ref repaired, ref failed);
             }
 
             RefreshSelectedImageToImageRenderviewer(DataTree.SelectedNode.Tag, canvasPropBox);
 
             double ms = (DateTime.Now - t0).TotalMilliseconds;
-            MessageBox.Show(string.Format(UiLocalization.Translate("Completed.\nElapsed time: {0} ms (average: {1})"), ms, ms / nodeCount));
+            MessageBox.Show(string.Format(UiLocalization.Translate("Completed.\nElapsed time: {0} ms (average: {1})"), ms, ms / nodeCount)
+                + "\n" + repaired + " 個連結已補上圖片。"
+                + (failed > 0 ? "\n" + failed + " 個連結找不到來源圖片，原樣保留（未刪除 _inlink/_outlink）。" : ""));
         }
 
         /// <summary>
-        /// Check image node recursively, if it needs repairs for '_inlink' or '_outlink'
+        /// Check image node recursively, if it needs repairs for '_inlink' or '_outlink'.
+        ///
+        /// Resolution must run FIRST: the _inlink/_outlink string is the only pointer to the
+        /// source pixels, and ResolveSingleCanvas refuses a canvas that no longer carries one.
+        /// The old order deleted the child node up front - DeleteWzNode removes the underlying
+        /// property too, so the resolver then found nothing to resolve, quietly copied no pixels,
+        /// and the canvas was left blank with its link destroyed. Now the link is only cleaned up
+        /// after the pixels are confirmed in place, and a link that cannot be resolved is left
+        /// exactly as it was.
+        ///
+        /// Static on purpose - operates only on the nodes it is given (see ConvertImagesToBgra32
+        /// for why), which also lets the regression tests drive it directly.
         /// </summary>
-        /// <param name="node"></param>
-        private void CheckImageNodeRecursively_linkRepair(WzNode node) {
+        public static void CheckImageNodeRecursively_linkRepair(WzNode node, ref int repaired, ref int failed) {
             if (node.Tag is WzImage img) {
                 if (!img.Parsed) {
                     img.ParseImage();
@@ -1794,28 +1951,40 @@ namespace HaRepacker.GUI.Panels
             }
 
             if (node.Tag is WzCanvasProperty property) {
-                if (property.ContainsInlinkProperty() || property.ContainsOutlinkProperty()) // if its an inlink property, remove that before updating base image.
+                bool hadInlink = property.ContainsInlinkProperty();
+                bool hadOutlink = property.ContainsOutlinkProperty();
+                if (hadInlink || hadOutlink)
                 {
-                    // Delete UI nodes before resolving (they will be removed from the property)
-                    if (property.ContainsInlinkProperty()) {
-                        WzNode childInlinkNode = WzNode.GetChildNode(node, WzCanvasProperty.InlinkPropertyName);
-                        childInlinkNode?.DeleteWzNode(); // Delete '_inlink' node
-                    }
-                    if (property.ContainsOutlinkProperty()) {
-                        WzNode childOutlinkNode = WzNode.GetChildNode(node, WzCanvasProperty.OutlinkPropertyName);
-                        childOutlinkNode?.DeleteWzNode(); // Delete '_outlink' node
-                    }
+                    // Copies the linked pixels into this canvas and removes the _inlink/_outlink
+                    // properties - but only on success.
+                    if (WzLinkResolver.ResolveSingleCanvas(property))
+                    {
+                        // The properties are gone from the WZ; drop their now-dead tree nodes.
+                        if (hadInlink)
+                            WzNode.GetChildNode(node, WzCanvasProperty.InlinkPropertyName)?.DeleteWzNode();
+                        if (hadOutlink)
+                            WzNode.GetChildNode(node, WzCanvasProperty.OutlinkPropertyName)?.DeleteWzNode();
 
-                    // Use centralized link resolution logic
-                    WzLinkResolver.ResolveSingleCanvas(property);
+                        // DeleteWzNode can no longer flag the save for us - by the time it runs,
+                        // the property is already detached and has no ParentImage.
+                        if (property.ParentImage != null)
+                            property.ParentImage.Changed = true;
 
-                    // Updates
-                    node.ChangedNodeProperty();
+                        // Updates
+                        node.ChangedNodeProperty();
+                        repaired++;
+                    }
+                    else
+                    {
+                        // Source pixels not found (target missing, file not loaded). Keep the
+                        // link untouched rather than trading a working reference for a blank.
+                        failed++;
+                    }
                 }
             }
             else {
                 foreach (WzNode child in node.Nodes) {
-                    CheckImageNodeRecursively_linkRepair(child);
+                    CheckImageNodeRecursively_linkRepair(child, ref repaired, ref failed);
                 }
             }
             WzNode hash = WzNode.GetChildNode(node, "_hash");

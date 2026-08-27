@@ -1116,6 +1116,7 @@ namespace HaRepacker.GUI
             WzMapleVersion MapleVersionEncryptionSelected = GetSelectedEncryptionVersion();
 
             List<string> wzfilePathsToLoad = new List<string>();
+            List<string> msFilePathsToLoad = new List<string>();
 
             foreach (string filePath in fileNames) {
                 string filePathLowerCase = filePath.ToLower();
@@ -1227,48 +1228,10 @@ namespace HaRepacker.GUI
 
                     else if (filePathLowerCase.EndsWith(".ms") || filePathLowerCase.EndsWith(".mn"))
                     {
-                        // Raw .ms file before being packed into .wz
-                        try
-                        {
-                            var memoryStream = new MemoryStream(); // leave open - the pack reads from it from here on
-                            // The FileStream, however, is done the moment the copy finishes. It
-                            // used to be left undisposed, which kept the .ms on disk locked until
-                            // some later GC happened to finalize it.
-                            using (var fileStream = File.OpenRead(filePath))
-                            {
-                                fileStream.CopyTo(memoryStream);
-                            }
-                            memoryStream.Position = 0;
-
-                            string msFileName = Path.GetFileName(filePath);
-
-                            var msFile = new MapleLib.WzLib.MSFile.WzMsFile(memoryStream, msFileName, filePath, true);
-                            msFile.ReadEntries();
-
-                            // Use the new static method to load as WzFile
-                            var wzFile = msFile.LoadAsWzFile();
-
-                            wzFileManager.LoadWzFile(msFileName, wzFile);
-
-                            AddLoadedWzObjectToMainPanel(wzFile, currentDispatcher);
-
-                            // write the file to temporary windows directory
-                            //string tempFilePath = Path.Combine(Path.GetTempPath(), msFileName.Replace(".ms", ".wz"));
-                            //wzFile.SaveToDisk(tempFilePath);
-
-                            // add to the list of WZ to load
-                            //wzfilePathsToLoad.Add(tempFilePath);
-                        }
-                        catch (Exception ex)
-                        {
-                            // The .wz path below already guards itself; this one did not. An
-                            // exception here escapes this async void method into
-                            // Program.CurrentDomain_UnhandledException, which shows the crash
-                            // dialog and exits - losing every file already open in the tree
-                            // because one pack could not be read.
-                            MessageBox.Show(Path.GetFileName(filePath) + " - " + ex.Message,
-                                HaRepacker.Properties.Resources.Error, MessageBoxButtons.OK, MessageBoxIcon.Error);
-                        }
+                        // Raw .ms file before being packed into .wz. Read+decrypt+parse used to
+                        // run right here on the UI thread (~0.1-0.6s per pack, additive when
+                        // several are selected); they are collected and handled off-thread below.
+                        msFilePathsToLoad.Add(filePath);
                     }
 
                     // List.wz file (pre-bb maplestory enc)
@@ -1330,8 +1293,15 @@ namespace HaRepacker.GUI
 
             // Try opening one, to see if the user is having the right priviledge
 
-            // Load all original WZ files
             List<string> loadFailures = new List<string>();
+
+            // .ms packs first (before this they were decrypted inline on the UI thread, one after
+            // another). Same per-file failure isolation as the .wz batch: failures join the one
+            // summary at the end.
+            if (msFilePathsToLoad.Count > 0)
+                await OpenMsFilesAsync(msFilePathsToLoad, wzFileManager, currentDispatcher, loadFailures);
+
+            // Load all original WZ files
             await Task.Run(() =>
             {
                 List<WzFile> loadedWzFiles = new List<WzFile>();
@@ -1386,6 +1356,86 @@ namespace HaRepacker.GUI
             {
                 MessageBox.Show(string.Join("\n", loadFailures), HaRepacker.Properties.Resources.Warning, MessageBoxButtons.OK);
             }
+        }
+
+        /// <summary>
+        /// Full paths of .ms packs currently being opened, so the same physical file cannot race
+        /// itself into the manager twice. Only ever touched on the UI thread (reservation before
+        /// the work starts, release in the awaited completion), so no locking is needed.
+        /// </summary>
+        private static readonly HashSet<string> msOpensInFlight = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Opens .ms packs with the heavy part (file read, decrypt, entry parse) on worker
+        /// threads. At most two packs decrypt at once - each needs its whole file in memory, so
+        /// wider parallelism trades UI nothing for a large transient memory spike. Completions
+        /// are awaited in selection order, so files enter the manager and the tree in the same
+        /// order they were picked, and every registration still happens on the UI thread - the
+        /// duplicate check in WzFileManager.LoadWzFile stays as race-free as it was when the
+        /// whole path was synchronous.
+        /// </summary>
+        private async Task OpenMsFilesAsync(List<string> msFilePaths, WzFileManager wzFileManager,
+            Dispatcher currentDispatcher, List<string> failures)
+        {
+            var throttle = new SemaphoreSlim(2);
+            var work = new List<(string Path, string FullPath, Task<WzFile> Task)>();
+            foreach (string filePath in msFilePaths)
+            {
+                string fullPath;
+                try { fullPath = Path.GetFullPath(filePath); }
+                catch { fullPath = filePath; }
+
+                if (!msOpensInFlight.Add(fullPath))
+                {
+                    failures.Add(Path.GetFileName(filePath) + " - 這個檔案已在載入中。");
+                    continue;
+                }
+                work.Add((filePath, fullPath, Task.Run(async () =>
+                {
+                    await throttle.WaitAsync();
+                    try { return LoadMsFileOffThread(filePath); }
+                    finally { throttle.Release(); }
+                })));
+            }
+
+            foreach (var (filePath, fullPath, task) in work)
+            {
+                try
+                {
+                    WzFile wzFile = await task; // back on the UI thread here
+                    wzFileManager.LoadWzFile(Path.GetFileName(filePath), wzFile); // throws if already loaded
+                    AddLoadedWzObjectToMainPanel(wzFile, currentDispatcher);
+                }
+                catch (Exception ex)
+                {
+                    // One broken pack costs that pack, not the batch. Same summary as .wz loads.
+                    string reason = ex is AggregateException agg ? (agg.InnerException?.Message ?? agg.Message) : ex.Message;
+                    failures.Add(Path.GetFileName(filePath) + " - " + reason);
+                }
+                finally
+                {
+                    msOpensInFlight.Remove(fullPath);
+                }
+            }
+        }
+
+        /// <summary>
+        /// The worker-thread half of opening one .ms pack: pure file and MapleLib work, no UI.
+        /// The FileStream is released the moment the copy finishes (round-2 fix, kept here).
+        /// </summary>
+        private static WzFile LoadMsFileOffThread(string filePath)
+        {
+            var memoryStream = new MemoryStream(); // stays open - the pack reads from it from here on
+            using (var fileStream = File.OpenRead(filePath))
+            {
+                fileStream.CopyTo(memoryStream);
+            }
+            memoryStream.Position = 0;
+
+            string msFileName = Path.GetFileName(filePath);
+            var msFile = new MapleLib.WzLib.MSFile.WzMsFile(memoryStream, msFileName, filePath, true);
+            msFile.ReadEntries();
+            return msFile.LoadAsWzFile();
         }
         #endregion
 

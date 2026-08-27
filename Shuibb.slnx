@@ -23,6 +23,8 @@
     <Project Path="tests/nodetest/nodetest.csproj" />
     <Project Path="tests/nodeeditorcopypaste/nodeeditorcopypaste.csproj" />
     <Project Path="tests/propertydisplayname/propertydisplayname.csproj" />
+    <Project Path="tests/loadfreeze/loadfreeze.csproj" />
+    <Project Path="tests/linkrepair/linkrepair.csproj" />
     <Project Path="tests/exportsafety/exportsafety.csproj" />
     <Project Path="tests/savecommit/savecommit.csproj" />
     <Project Path="tests/searchsession/searchsession.csproj" />
