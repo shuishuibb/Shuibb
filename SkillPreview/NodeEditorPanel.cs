@@ -48,6 +48,23 @@ namespace SkillPreview
         private WzImage stringImage;
         private IPropertyContainer stringEntry;
         private bool stringIsReadOnly;
+
+        /// <summary>
+        /// Full path of the WZ file the STRING card is linked to, or null when no text is linked.
+        /// This is the file an edit would be written into - the regression tests for the
+        /// cross-source bug assert on it directly.
+        /// </summary>
+        public string LinkedStringFilePath
+        {
+            get
+            {
+                try { return stringImage?.WzFileParent?.FilePath; }
+                catch { return null; }
+            }
+        }
+
+        /// <summary>True when the linked text may only be shown, never written.</summary>
+        public bool IsLinkedStringReadOnly => stringIsReadOnly;
         private WzFile detachedStringWz;
 
         // group container -> (field name -> the box showing it). One dictionary per card so a
@@ -113,9 +130,26 @@ namespace SkillPreview
 
             currentNode = container;
             currentNodeName = nodeName;
-            ResolveStringEntry(fileManager, nodeName);
+            ResolveStringEntry(fileManager, nodeName, GetSourceFilePath(selected));
             Rebuild();
             return true;
+        }
+
+        /// <summary>
+        /// The on-disk path of the WZ file the selected node lives in - the anchor that decides
+        /// which source's String file its text may come from. Null when the node has no file
+        /// origin; the lookup then refuses to guess between sources.
+        /// </summary>
+        private static string GetSourceFilePath(WzObject selected)
+        {
+            try
+            {
+                return selected?.WzFileParent?.FilePath;
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private static IPropertyContainer ResolveEditableNode(WzObject selected, out string nodeName)
@@ -175,7 +209,7 @@ namespace SkillPreview
         /// String.wz/Consume.img calls it 2000012 - and equipment nests the id two levels down
         /// under Eqp/&lt;category&gt;. Both are handled here; a miss just means no text card.
         /// </summary>
-        private void ResolveStringEntry(WzFileManager fileManager, string nodeName)
+        private void ResolveStringEntry(WzFileManager fileManager, string nodeName, string sourceFilePath)
         {
             stringImage = null;
             stringEntry = null;
@@ -189,7 +223,7 @@ namespace SkillPreview
 
             try
             {
-                foreach (WzImage image in EnumerateStringImages(fileManager, out bool readOnly))
+                foreach (WzImage image in EnumerateStringImages(fileManager, sourceFilePath, out bool readOnly))
                 {
                     IPropertyContainer found = FindStringEntry(image, key);
                     if (found == null)
@@ -207,14 +241,11 @@ namespace SkillPreview
             }
         }
 
-        private IEnumerable<WzImage> EnumerateStringImages(WzFileManager fileManager, out bool readOnly)
+        private IEnumerable<WzImage> EnumerateStringImages(WzFileManager fileManager, string sourceFilePath, out bool readOnly)
         {
             var result = new List<WzImage>();
             readOnly = false;
 
-            // zh_TW first. A client that ships both locales has the same ids in both files, so
-            // whichever happens to be enumerated first would otherwise decide the language -
-            // and worse, decide which file an edit gets written into.
             var files = new List<WzFile>();
             foreach (WzFile file in fileManager.WzFileList)
             {
@@ -225,6 +256,20 @@ namespace SkillPreview
                     continue;
                 files.Add(file);
             }
+
+            // Same source only. WzFileList is one shared pool for the whole app, so with two Data
+            // sets open, both String files sit in it and both can hold the same item id - taking
+            // the first hit used to read the other source's text and, worse, write the edit into
+            // that other source's file. A node whose source can't be established links to nothing
+            // rather than to a file that might be the wrong one.
+            var samesource = new HashSet<string>(
+                NodeEditorStringSourceScope.PickSameSource(
+                    sourceFilePath, files.Select(f => f.FilePath).ToList()),
+                StringComparer.OrdinalIgnoreCase);
+            files.RemoveAll(f => !samesource.Contains(f.FilePath));
+
+            // zh_TW first. One source shipping both locales has the same ids in both files, so
+            // whichever happens to be enumerated first would otherwise decide the language.
             foreach (WzFile file in files.OrderByDescending(
                 f => f.FilePath.IndexOf("zh_tw", StringComparison.OrdinalIgnoreCase) >= 0))
             {

@@ -1230,9 +1230,14 @@ namespace HaRepacker.GUI
                         // Raw .ms file before being packed into .wz
                         try
                         {
-                            var fileStream = File.OpenRead(filePath);
-                            var memoryStream = new MemoryStream(); // leave open
-                            fileStream.CopyTo(memoryStream);
+                            var memoryStream = new MemoryStream(); // leave open - the pack reads from it from here on
+                            // The FileStream, however, is done the moment the copy finishes. It
+                            // used to be left undisposed, which kept the .ms on disk locked until
+                            // some later GC happened to finalize it.
+                            using (var fileStream = File.OpenRead(filePath))
+                            {
+                                fileStream.CopyTo(memoryStream);
+                            }
                             memoryStream.Position = 0;
 
                             string msFileName = Path.GetFileName(filePath);
@@ -1956,26 +1961,67 @@ namespace HaRepacker.GUI
             cancellationTokenSource = new CancellationTokenSource();
             ChangeApplicationState(false);
 
-            string[] wzFilesToDump = (string[])((object[])param)[0];
-            string baseDir = (string)((object[])param)[1];
-            WzMapleVersion version = (WzMapleVersion) ((object[])param)[2];
-            IWzFileSerializer serializer = (IWzFileSerializer)((object[])param)[3];
+            // Everything - the param unpacking included - runs inside the boundary: this is a
+            // plain background Thread, and anything that escaped it went straight to the crash
+            // dialog and Environment.Exit, taking every open file with it.
+            string baseDir = null;
+            string failure = ExportWorkerBoundary.Run(() =>
+            {
+                string[] wzFilesToDump = (string[])((object[])param)[0];
+                baseDir = (string)((object[])param)[1];
+                WzMapleVersion version = (WzMapleVersion)((object[])param)[2];
+                IWzFileSerializer serializer = (IWzFileSerializer)((object[])param)[3];
 
-            UpdateProgressBar(MainPanel.mainProgressBar, 0, false, true);
-            UpdateProgressBar(MainPanel.mainProgressBar, wzFilesToDump.Length, true, true);
+                UpdateProgressBar(MainPanel.mainProgressBar, 0, false, true);
+                UpdateProgressBar(MainPanel.mainProgressBar, wzFilesToDump.Length, true, true);
 
-            // Export
-            WzFileExporter.RunWzFilesExtraction(wzFilesToDump, baseDir, version, serializer, 
-                progressCallback: (x) => {
-                    UpdateProgressBar(MainPanel.mainProgressBar, 1, false, false);
-                },
-                cancellationToken: cancellationTokenSource.Token);
+                // Export
+                WzFileExporter.RunWzFilesExtraction(wzFilesToDump, baseDir, version, serializer,
+                    progressCallback: (x) => {
+                        UpdateProgressBar(MainPanel.mainProgressBar, 1, false, false);
+                    },
+                    cancellationToken: cancellationTokenSource.Token);
+            });
 
-            // Reset progress bar to 0
-            UpdateProgressBar(MainPanel.mainProgressBar, 0, false, true);
-            UpdateProgressBar(MainPanel.mainProgressBar, 0, true, true);
+            // Runs whether the export succeeded or not, so the UI never stays stuck exporting.
+            FinishExportWorker(failure, "匯出 WZ 檔案", baseDir);
+        }
 
+        /// <summary>
+        /// The shared tail of every export worker: put the progress bars back, let
+        /// ProgressBarThread re-enable the UI, and only then - once, on the UI thread - report
+        /// a failure. Files already written before the failure stay on disk; deleting a partial
+        /// export would be a bigger data risk than leaving it.
+        /// </summary>
+        private void FinishExportWorker(string failure, string operationName, string outputPath)
+        {
+            try
+            {
+                UpdateProgressBar(MainPanel.mainProgressBar, 0, false, true);
+                UpdateProgressBar(MainPanel.mainProgressBar, 0, true, true);
+            }
+            catch
+            {
+                // The window may be closing; the bars are gone with it.
+            }
             threadDone = true;
+
+            if (failure == null)
+                return;
+            try
+            {
+                Dispatcher.BeginInvoke(new Action(() =>
+                    MessageBox.Show(
+                        operationName + "失敗。\n\n輸出位置：\n" + (outputPath ?? "-")
+                            + "\n\n原因：\n" + failure
+                            + "\n\n已成功輸出的檔案會保留。",
+                        Properties.Resources.Error, MessageBoxButtons.OK, MessageBoxIcon.Error)));
+            }
+            catch
+            {
+                // Reporting is best-effort - a failure to show the message must not become a
+                // second escaping exception.
+            }
         }
 
         private const string WZ_EXTRACT_ERROR_FILE = "WzExtract_Errors.txt";
@@ -2018,18 +2064,23 @@ namespace HaRepacker.GUI
             cancellationTokenSource = new CancellationTokenSource();
             ChangeApplicationState(false);
 
-            List<DataFolderWzShard> shards = (List<DataFolderWzShard>)((object[])param)[0];
-            string baseDir = (string)((object[])param)[1];
-            WzMapleVersion version = (WzMapleVersion)((object[])param)[2];
-            DataFolderExportProgress progress = (DataFolderExportProgress)((object[])param)[3];
-            int maxDegreeOfParallelism = (int)((object[])param)[4];
-
-            UpdateProgressBar(MainPanel.mainProgressBar, 0, false, true);
-            UpdateProgressBar(MainPanel.mainProgressBar, shards.Count, true, true);
-            progress.Reset(shards.Count);
-
-            try
+            // The old try/finally had no catch: CreateDirectory on a vanished output folder, or
+            // ErrorLogger.SaveToFile on a locked log, escaped this background Thread and closed
+            // the whole app. Per-file parse failures were already collected by the exporter;
+            // this boundary is for the environment-level ones.
+            string baseDir = null;
+            string failure = ExportWorkerBoundary.Run(() =>
             {
+                List<DataFolderWzShard> shards = (List<DataFolderWzShard>)((object[])param)[0];
+                baseDir = (string)((object[])param)[1];
+                WzMapleVersion version = (WzMapleVersion)((object[])param)[2];
+                DataFolderExportProgress progress = (DataFolderExportProgress)((object[])param)[3];
+                int maxDegreeOfParallelism = (int)((object[])param)[4];
+
+                UpdateProgressBar(MainPanel.mainProgressBar, 0, false, true);
+                UpdateProgressBar(MainPanel.mainProgressBar, shards.Count, true, true);
+                progress.Reset(shards.Count);
+
                 int completed = 0;
 
                 // Each category task builds its own serializer inside the exporter; UpdateProgressBar
@@ -2054,15 +2105,9 @@ namespace HaRepacker.GUI
                     ErrorLogger.Log(ErrorLevel.IncorrectStructure, error);
                 }
                 ErrorLogger.SaveToFile(WZ_EXTRACT_ERROR_FILE);
-            }
-            finally
-            {
-                // Reset progress bar to 0
-                UpdateProgressBar(MainPanel.mainProgressBar, 0, false, true);
-                UpdateProgressBar(MainPanel.mainProgressBar, 0, true, true);
+            });
 
-                threadDone = true;
-            }
+            FinishExportWorker(failure, "Data 資料夾批次匯出", baseDir);
         }
 
         /// <summary>
@@ -2074,26 +2119,27 @@ namespace HaRepacker.GUI
             cancellationTokenSource = new CancellationTokenSource();
             ChangeApplicationState(false);
 
-            List<WzDirectory> dirsToDump = (List<WzDirectory>)((object[])param)[0];
-            List<WzImage> imgsToDump = (List<WzImage>)((object[])param)[1];
-            string baseDir = (string)((object[])param)[2];
-            IWzImageSerializer serializer = (IWzImageSerializer)((object[])param)[3];
+            // Same boundary as the other export workers - see RunWzFilesExtraction.
+            string baseDir = null;
+            string failure = ExportWorkerBoundary.Run(() =>
+            {
+                List<WzDirectory> dirsToDump = (List<WzDirectory>)((object[])param)[0];
+                List<WzImage> imgsToDump = (List<WzImage>)((object[])param)[1];
+                baseDir = (string)((object[])param)[2];
+                IWzImageSerializer serializer = (IWzImageSerializer)((object[])param)[3];
 
-            UpdateProgressBar(MainPanel.mainProgressBar, 0, false, true);
-            UpdateProgressBar(MainPanel.mainProgressBar, dirsToDump.Count + imgsToDump.Count, true, true);
+                UpdateProgressBar(MainPanel.mainProgressBar, 0, false, true);
+                UpdateProgressBar(MainPanel.mainProgressBar, dirsToDump.Count + imgsToDump.Count, true, true);
 
-            // Export 
-            WzFileExporter.RunWzImgDirsExtraction(dirsToDump, imgsToDump, baseDir, serializer,
-                progressCallback: (x) => {
-                    UpdateProgressBar(MainPanel.mainProgressBar, 1, false, false);
-                },
-                cancellationToken: cancellationTokenSource.Token);
+                // Export
+                WzFileExporter.RunWzImgDirsExtraction(dirsToDump, imgsToDump, baseDir, serializer,
+                    progressCallback: (x) => {
+                        UpdateProgressBar(MainPanel.mainProgressBar, 1, false, false);
+                    },
+                    cancellationToken: cancellationTokenSource.Token);
+            });
 
-            // Reset progress bar to 0
-            UpdateProgressBar(MainPanel.mainProgressBar, 0, false, true);
-            UpdateProgressBar(MainPanel.mainProgressBar, 0, true, true);
-
-            threadDone = true;
+            FinishExportWorker(failure, "匯出 IMG", baseDir);
         }
 
         /// <summary>
@@ -2109,27 +2155,27 @@ namespace HaRepacker.GUI
             var watch = new Stopwatch();
             watch.Start();
 #endif
-            List<WzObject> objsToDump = (List<WzObject>)((object[])param)[0];
-            string path = (string)((object[])param)[1];
-            ProgressingWzSerializer serializers = (ProgressingWzSerializer)((object[])param)[2];
+            // Same boundary as the other export workers - see RunWzFilesExtraction.
+            string path = null;
+            string failure = ExportWorkerBoundary.Run(() =>
+            {
+                List<WzObject> objsToDump = (List<WzObject>)((object[])param)[0];
+                path = (string)((object[])param)[1];
+                ProgressingWzSerializer serializers = (ProgressingWzSerializer)((object[])param)[2];
 
-            UpdateProgressBar(MainPanel.mainProgressBar, 0, false, true);
+                UpdateProgressBar(MainPanel.mainProgressBar, 0, false, true);
 
-            WzFileExporter.RunWzXmlExtraction(objsToDump, path, serializers,
-                progressCallback: (isSetMax, value) => {
-                    if (isSetMax)
-                        UpdateProgressBar(MainPanel.mainProgressBar, value, true, true);
-                    else
-                        UpdateProgressBar(MainPanel.mainProgressBar, 1, false, false);
-                },
-                cancellationToken: cancellationTokenSource.Token);
+                WzFileExporter.RunWzXmlExtraction(objsToDump, path, serializers,
+                    progressCallback: (isSetMax, value) => {
+                        if (isSetMax)
+                            UpdateProgressBar(MainPanel.mainProgressBar, value, true, true);
+                        else
+                            UpdateProgressBar(MainPanel.mainProgressBar, 1, false, false);
+                    },
+                    cancellationToken: cancellationTokenSource.Token);
+            });
 
-
-            // Reset progress bar to 0
-            UpdateProgressBar(MainPanel.mainProgressBar, 0, false, true);
-            UpdateProgressBar(MainPanel.mainProgressBar, 0, true, true);
-
-            threadDone = true;
+            FinishExportWorker(failure, "匯出 XML", path);
         }
 
 
@@ -2196,42 +2242,70 @@ namespace HaRepacker.GUI
         /// </summary>
         private void dataFolderServerXmlToolStripMenuItem_Click(object sender, EventArgs e)
         {
-            FolderBrowserDialog dataFolderDialog = new FolderBrowserDialog()
+            // The whole handler is guarded: an exception here used to reach the global handler,
+            // which shows the crash dialog and exits the app. One denied subfolder inside the
+            // picked Data folder was enough (reproduced in the audit).
+            try
             {
-                Description = "選擇Data資料夾"
-            };
-            if (dataFolderDialog.ShowDialog() != Forms.DialogResult.OK)
-                return;
-
-            FolderBrowserDialog folderDialog = new FolderBrowserDialog()
-            {
-                Description = HaRepacker.Properties.Resources.SelectOutDir
-            };
-            if (folderDialog.ShowDialog() != Forms.DialogResult.OK)
-                return;
-
-            List<DataFolderWzShard> shards = DataFolderWzScanner.Scan(dataFolderDialog.SelectedPath);
-            if (shards.Count == 0)
-            {
-                MessageBox.Show("在所選資料夾中找不到任何 WZ 分片檔案（例如 Character_000.wz）。",
-                    Properties.Resources.Warning, MessageBoxButtons.OK, MessageBoxIcon.Warning);
-                return;
-            }
-
-            // No serializer is built here: every category task makes its own inside the exporter,
-            // because WzClassicXmlSerializer carries mutable progress state.
-            DataFolderExportProgress progress = new DataFolderExportProgress();
-            int maxDegreeOfParallelism = DataFolderWzServerXmlExporter.ResolveParallelism(
-                Program.ConfigurationManager.UserSettings.DataFolderExportParallelism);
-
-            threadDone = false;
-            runningThread = new Thread(new ParameterizedThreadStart(RunDataFolderServerXmlExtraction));
-            runningThread.Start(
-                (object)new object[]
+                FolderBrowserDialog dataFolderDialog = new FolderBrowserDialog()
                 {
-                    shards, folderDialog.SelectedPath, GetSelectedEncryptionVersion(), progress, maxDegreeOfParallelism
-                });
-            new Thread(new ParameterizedThreadStart(ProgressBarThread)).Start(progress);
+                    Description = "選擇Data資料夾"
+                };
+                if (dataFolderDialog.ShowDialog() != Forms.DialogResult.OK)
+                    return;
+
+                FolderBrowserDialog folderDialog = new FolderBrowserDialog()
+                {
+                    Description = HaRepacker.Properties.Resources.SelectOutDir
+                };
+                if (folderDialog.ShowDialog() != Forms.DialogResult.OK)
+                    return;
+
+                DataFolderWzScanResult scan = DataFolderWzScanner.ScanWithReport(dataFolderDialog.SelectedPath);
+                if (scan.RootError != null)
+                {
+                    MessageBox.Show("無法讀取資料夾：\n" + dataFolderDialog.SelectedPath
+                            + "\n\n原因：\n" + scan.RootError,
+                        Properties.Resources.Error, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+                if (scan.SkippedDirectories.Count > 0)
+                {
+                    // Once, before the export - never one box per directory.
+                    MessageBox.Show("掃描完成，但有 " + scan.SkippedDirectories.Count
+                            + " 個資料夾無法讀取而略過（例如權限不足）。\n\n第一個："
+                            + scan.SkippedDirectories[0] + "\n" + scan.FirstSkipReason,
+                        Properties.Resources.Warning, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+
+                List<DataFolderWzShard> shards = new List<DataFolderWzShard>(scan.Shards);
+                if (shards.Count == 0)
+                {
+                    MessageBox.Show("在所選資料夾中找不到任何 WZ 分片檔案（例如 Character_000.wz）。",
+                        Properties.Resources.Warning, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    return;
+                }
+
+                // No serializer is built here: every category task makes its own inside the exporter,
+                // because WzClassicXmlSerializer carries mutable progress state.
+                DataFolderExportProgress progress = new DataFolderExportProgress();
+                int maxDegreeOfParallelism = DataFolderWzServerXmlExporter.ResolveParallelism(
+                    Program.ConfigurationManager.UserSettings.DataFolderExportParallelism);
+
+                threadDone = false;
+                runningThread = new Thread(new ParameterizedThreadStart(RunDataFolderServerXmlExtraction));
+                runningThread.Start(
+                    (object)new object[]
+                    {
+                        shards, folderDialog.SelectedPath, GetSelectedEncryptionVersion(), progress, maxDegreeOfParallelism
+                    });
+                new Thread(new ParameterizedThreadStart(ProgressBarThread)).Start(progress);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("無法掃描 Data 資料夾。\n\n原因：\n" + ex.Message,
+                    Properties.Resources.Error, MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
         }
 
         /// <summary>

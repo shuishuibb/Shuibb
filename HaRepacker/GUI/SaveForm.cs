@@ -172,32 +172,51 @@ namespace HaRepacker.GUI
                         wzf.Version = (short)version;
                         wzf.MapleVersion = wzMapleVersionSelected;
 
-                        if (string.Equals(wzf.FilePath, dialog.FileName, StringComparison.OrdinalIgnoreCase))
+                        // Always written beside the target first, then committed - the original
+                        // is never deleted before the new bytes are known to be complete.
+                        string wzTempPath = dialog.FileName + "$tmp";
+                        try
                         {
-                            wzf.SaveToDisk(dialog.FileName + "$tmp", bSaveAs64BitWzFile, wzMapleVersionSelected);
-                            _mainPanel.MainForm.UnloadWzFile(wzf);
-                            try
-                            {
-                                File.Delete(dialog.FileName); // delete existing file
-                                File.Move(dialog.FileName + "$tmp", dialog.FileName);
-                            }
-                            catch (IOException ex)
-                            {
-                                MessageBox.Show(string.Format(UiLocalization.Translate("Error overwriting WZ file: {0}"), ex.Message), Properties.Resources.Error);
-                            }
+                            wzf.SaveToDisk(wzTempPath, bSaveAs64BitWzFile, wzMapleVersionSelected);
                         }
-                        else
+                        catch (Exception ex)
                         {
-                            wzf.SaveToDisk(dialog.FileName, bSaveAs64BitWzFile, wzMapleVersionSelected);
-                            _mainPanel.MainForm.UnloadWzFile(wzf);
+                            // Nothing was unloaded and the original was not touched: report and
+                            // leave the dialog open so another location can be tried at once.
+                            // Without this catch the exception (no write permission, disk full)
+                            // used to escape to the global handler and close the whole app.
+                            try { if (File.Exists(wzTempPath)) File.Delete(wzTempPath); } catch { }
+                            ShowSaveError(dialog.FileName, ex.Message, null, null);
+                            return;
                         }
 
-                        // Reload the new file
-                        WzFile loadedWzFile = wzFileManager.LoadWzFile(dialog.FileName, wzMapleVersionSelected);
-                        if (loadedWzFile != null)
+                        // The original must be released before it can be moved aside.
+                        string originalPath = wzf.FilePath;
+                        _mainPanel.MainForm.UnloadWzFile(wzf);
+
+                        SaveCommitResult commit = SaveFileCommit.Replace(wzTempPath, dialog.FileName);
+                        if (!commit.Success)
                         {
-                            _mainPanel.MainForm.AddLoadedWzObjectToMainPanel(loadedWzFile);
+                            ShowSaveError(dialog.FileName, commit.Error, commit.TempPathKept, commit.OriginalMovedTo);
                         }
+
+                        // Reload whatever survived: the new file on success, the restored original
+                        // after a failed overwrite - and when saving to a different path failed
+                        // before anything was created there, the untouched original itself, so the
+                        // unload above never silently costs the tree its file.
+                        string reloadPath = File.Exists(dialog.FileName) ? dialog.FileName
+                            : File.Exists(originalPath) ? originalPath
+                            : null;
+                        if (reloadPath != null)
+                        {
+                            WzFile loadedWzFile = wzFileManager.LoadWzFile(reloadPath, wzMapleVersionSelected);
+                            if (loadedWzFile != null)
+                            {
+                                _mainPanel.MainForm.AddLoadedWzObjectToMainPanel(loadedWzFile);
+                            }
+                        }
+                        if (!commit.Success)
+                            return;
                     }
                     else
                     {
@@ -207,35 +226,44 @@ namespace HaRepacker.GUI
                         string tmpFilePath = dialog.FileName + ".tmp";
                         string targetFilePath = dialog.FileName;
 
-                        bool error_noAdminPriviledge = false;
                         try
                         {
-                            using (FileStream oldfs = File.Open(tmpFilePath, FileMode.OpenOrCreate))
+                            // FileMode.Create, not OpenOrCreate: a stale, longer .tmp from an
+                            // earlier attempt would otherwise keep its tail beyond what this
+                            // write produces.
+                            using (FileStream oldfs = File.Open(tmpFilePath, FileMode.Create))
                             {
                                 using (WzBinaryWriter wzWriter = new WzBinaryWriter(oldfs, WzIv))
                                 {
                                     wzImg.SaveImage(wzWriter, true); // Write to temp folder
                                 }
                             }
-                            try
-                            {
-                                File.Copy(tmpFilePath, targetFilePath, true);
-                                File.Delete(tmpFilePath);
-                            }
-                            catch (Exception exp)
-                            {
-                                Debug.WriteLine(exp); // nvm, dont show to user
-                            }
-                            wzNode.DeleteWzNode(); // this is a WzImage, and cannot be unloaded by _mainPanel.MainForm.UnloadWzFile
                         }
-                        catch (UnauthorizedAccessException)
+                        catch (Exception ex)
                         {
-                            error_noAdminPriviledge = true;
+                            // The image is untouched and its node stays in the tree - report and
+                            // let the user pick another location. This used to be swallowed (or,
+                            // for UnauthorizedAccessException, mis-reported as an open failure)
+                            // while the node was deleted anyway, so a failed save looked done and
+                            // the edits were gone.
+                            try { if (File.Exists(tmpFilePath)) File.Delete(tmpFilePath); } catch { }
+                            ShowSaveError(targetFilePath, ex.Message, null, null);
+                            return;
                         }
+
+                        SaveCommitResult imgCommit = SaveFileCommit.Replace(tmpFilePath, targetFilePath);
+                        if (!imgCommit.Success)
+                        {
+                            ShowSaveError(targetFilePath, imgCommit.Error, imgCommit.TempPathKept, imgCommit.OriginalMovedTo);
+                            return;
+                        }
+
+                        // Only after the bytes are confirmed at the target may the old node go.
+                        wzNode.DeleteWzNode(); // this is a WzImage, and cannot be unloaded by _mainPanel.MainForm.UnloadWzFile
 
                         // Reload the new file
                         WzImage img = wzFileManager.LoadDataWzHotfixFile(dialog.FileName, wzMapleVersionSelected);
-                        if (img == null || error_noAdminPriviledge)
+                        if (img == null)
                         {
                             MessageBox.Show(Properties.Resources.MainFileOpenFail, HaRepacker.Properties.Resources.Error);
                             return;
@@ -257,17 +285,36 @@ namespace HaRepacker.GUI
                     if (dialog.ShowDialog() != System.Windows.Forms.DialogResult.OK)
                         return;
 
-                    using (var memoryStream = new MemoryStream())
+                    // Same shape as the .wz path: build beside the target, then commit, so a
+                    // failure never leaves the target half-written. FileMode.Create also stops a
+                    // longer pre-existing file from keeping its tail past the new data, which the
+                    // old direct OpenOrCreate write could produce.
+                    string msTempPath = dialog.FileName + "$tmp";
+                    try
                     {
-                        var msFile = new WzMsFile(memoryStream, Path.GetFileName(dialog.FileName), dialog.FileName, true, isSavingFile: true);
-                        var savedStream = msFile.Save(wzf);
-
-                        // Now savedStream (which is the same as memoryStream) contains the saved .ms data
-                        // You can write it to a file or use it as needed
-                        using (var fileStream = new FileStream(dialog.FileName, FileMode.OpenOrCreate))
+                        using (var memoryStream = new MemoryStream())
                         {
-                            savedStream.CopyTo(fileStream);
+                            var msFile = new WzMsFile(memoryStream, Path.GetFileName(dialog.FileName), dialog.FileName, true, isSavingFile: true);
+                            var savedStream = msFile.Save(wzf);
+
+                            using (var fileStream = new FileStream(msTempPath, FileMode.Create))
+                            {
+                                savedStream.CopyTo(fileStream);
+                            }
                         }
+                    }
+                    catch (Exception ex)
+                    {
+                        try { if (File.Exists(msTempPath)) File.Delete(msTempPath); } catch { }
+                        ShowSaveError(dialog.FileName, ex.Message, null, null);
+                        return;
+                    }
+
+                    SaveCommitResult msCommit = SaveFileCommit.Replace(msTempPath, dialog.FileName);
+                    if (!msCommit.Success)
+                    {
+                        ShowSaveError(dialog.FileName, msCommit.Error, msCommit.TempPathKept, msCommit.OriginalMovedTo);
+                        return;
                     }
                 }
             }
@@ -275,6 +322,23 @@ namespace HaRepacker.GUI
             Close();
         }
 
+
+        /// <summary>
+        /// One shape for every save failure: what could not be written, why, and where any
+        /// recoverable copies are. Never rethrows - a failed save must end in a message, not in
+        /// the global handler closing the app.
+        /// </summary>
+        private static void ShowSaveError(string targetPath, string reason, string tempPathKept, string originalMovedTo)
+        {
+            string message = UiLocalization.Translate("存檔失敗")
+                + "\n\n" + UiLocalization.Translate("目標檔案：") + "\n" + targetPath
+                + "\n\n" + UiLocalization.Translate("原因：") + "\n" + reason;
+            if (!string.IsNullOrEmpty(tempPathKept))
+                message += "\n\n" + UiLocalization.Translate("已寫好的暫存檔保留在：") + "\n" + tempPathKept;
+            if (!string.IsNullOrEmpty(originalMovedTo))
+                message += "\n\n" + UiLocalization.Translate("原始檔案已移至：") + "\n" + originalMovedTo;
+            MessageBox.Show(message, Properties.Resources.Error, MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
 
         private void PrepareAllImgs(WzDirectory dir)
         {

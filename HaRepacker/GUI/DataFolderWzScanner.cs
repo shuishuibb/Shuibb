@@ -50,6 +50,33 @@ namespace HaRepacker.GUI
     }
 
     /// <summary>
+    /// What a resilient scan found and what it had to skip. Shards is never null; RootError is
+    /// non-null only when the chosen folder itself could not be read at all.
+    /// </summary>
+    public class DataFolderWzScanResult
+    {
+        private readonly List<string> skippedDirectories = new List<string>();
+
+        public IReadOnlyList<DataFolderWzShard> Shards { get; internal set; } = new List<DataFolderWzShard>();
+
+        /// <summary>Directories that could not be read and were left out of the scan.</summary>
+        public IReadOnlyList<string> SkippedDirectories { get { return skippedDirectories; } }
+
+        /// <summary>Why the first skipped directory could not be read - enough for one message.</summary>
+        public string FirstSkipReason { get; private set; }
+
+        /// <summary>Set when the scan root itself is unreadable; nothing was scanned.</summary>
+        public string RootError { get; internal set; }
+
+        internal void AddSkipped(string directory, string reason)
+        {
+            skippedDirectories.Add(directory);
+            if (FirstSkipReason == null)
+                FirstSkipReason = reason;
+        }
+    }
+
+    /// <summary>
     /// Every split file of one category, in the order they have to be written.
     /// This is the unit of parallelism: two batches may run side by side, the shards inside
     /// a batch may not, because they share an output directory.
@@ -176,26 +203,70 @@ namespace HaRepacker.GUI
         /// </summary>
         public static List<DataFolderWzShard> Scan(string dataRootPath)
         {
-            List<DataFolderWzShard> shards = new List<DataFolderWzShard>();
+            return new List<DataFolderWzShard>(ScanWithReport(dataRootPath).Shards);
+        }
+
+        /// <summary>
+        /// Like <see cref="Scan"/>, but says what could not be read instead of throwing.
+        /// One unreadable subdirectory used to abort the whole scan with an
+        /// UnauthorizedAccessException that escaped the menu handler and closed the app; now that
+        /// directory is skipped, everything else is still scanned, and the caller can tell the
+        /// user once how much was skipped. Only a root that cannot be read at all is a hard
+        /// failure, reported through <see cref="DataFolderWzScanResult.RootError"/>.
+        /// </summary>
+        public static DataFolderWzScanResult ScanWithReport(string dataRootPath)
+        {
+            var result = new DataFolderWzScanResult();
             if (string.IsNullOrEmpty(dataRootPath) || !Directory.Exists(dataRootPath))
-                return shards;
+            {
+                result.RootError = "找不到資料夾。";
+                return result;
+            }
 
             List<DataFolderWzShard> candidates = new List<DataFolderWzShard>();
-            foreach (string filePath in Directory.EnumerateFiles(dataRootPath, "*.wz", SearchOption.AllDirectories))
+
+            // Own traversal instead of SearchOption.AllDirectories: the framework's recursive
+            // enumeration throws away the entire walk on the first denied directory.
+            var pending = new Stack<string>();
+            pending.Push(dataRootPath);
+            bool rootVisited = false;
+
+            while (pending.Count > 0)
             {
-                if (!IsShardFileName(Path.GetFileName(filePath)))
-                    continue;
+                string directory = pending.Pop();
+                try
+                {
+                    foreach (string filePath in Directory.EnumerateFiles(directory, "*.wz"))
+                    {
+                        if (!IsShardFileName(Path.GetFileName(filePath)))
+                            continue;
 
-                string relativePath = Path.GetRelativePath(dataRootPath, filePath);
-                string category = GetCategoryNameFromRelativePath(relativePath);
-                if (string.IsNullOrEmpty(category))
-                    continue;
+                        string relativePath = Path.GetRelativePath(dataRootPath, filePath);
+                        string category = GetCategoryNameFromRelativePath(relativePath);
+                        if (string.IsNullOrEmpty(category))
+                            continue;
 
-                candidates.Add(new DataFolderWzShard(filePath, category,
-                    GetOutputRelativePath(relativePath), GetLangLocale(relativePath)));
+                        candidates.Add(new DataFolderWzShard(filePath, category,
+                            GetOutputRelativePath(relativePath), GetLangLocale(relativePath)));
+                    }
+                    foreach (string subDirectory in Directory.EnumerateDirectories(directory))
+                        pending.Push(subDirectory);
+                }
+                catch (Exception ex) when (ex is UnauthorizedAccessException || ex is IOException)
+                {
+                    if (!rootVisited)
+                    {
+                        // The chosen folder itself is unreadable - that is not a partial success.
+                        result.RootError = ex.Message;
+                        return result;
+                    }
+                    result.AddSkipped(directory, ex.Message);
+                }
+                rootVisited = true;
             }
 
             bool hasPreferredLocale = candidates.Any(candidate => IsPreferredLangLocale(candidate.LangLocale));
+            var shards = new List<DataFolderWzShard>();
             foreach (DataFolderWzShard candidate in candidates)
             {
                 // Files outside Lang belong to every locale, so they are always kept.
@@ -203,11 +274,12 @@ namespace HaRepacker.GUI
                     shards.Add(candidate);
             }
 
-            return shards
+            result.Shards = shards
                 .OrderBy(shard => shard.OutputRelativePath, StringComparer.OrdinalIgnoreCase)
                 .ThenBy(shard => shard.IsLangOverlay ? 1 : 0)
                 .ThenBy(shard => Path.GetFileName(shard.FilePath), StringComparer.OrdinalIgnoreCase)
                 .ToList();
+            return result;
         }
 
         /// <summary>
