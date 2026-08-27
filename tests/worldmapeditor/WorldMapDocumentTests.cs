@@ -861,6 +861,234 @@ public sealed class WorldMapDocumentTests
         Assert.Equal(new[] { 240010300, 0 }, reloaded.MapNo.Select(m => m.Value).ToArray());
     }
 
+    // ---- pending positions (preview / 確認修改) --------------------------------------------------
+
+    /// <summary>
+    /// Mirrors what 確認修改 does for spot vectors: write each preview, keep the ones that were
+    /// written, then forget the previews so the WZ values become the new baseline.
+    /// </summary>
+    private static List<WzVectorProperty> ConfirmSpots(
+        WorldMapPendingPositions<IWorldMapMovable> pending)
+    {
+        var written = new List<WzVectorProperty>();
+        foreach (KeyValuePair<IWorldMapMovable, (int X, int Y)> entry in pending.Entries.ToList())
+        {
+            if (WorldMapPositionCommit.Apply(entry.Key.Position, entry.Value.X, entry.Value.Y))
+                written.Add(entry.Key.Position);
+        }
+        pending.Clear();
+        return written;
+    }
+
+    [Fact]
+    public void PreviewingASpot_LeavesTheWzUntouchedUntilConfirmed()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap000.img", null, new PointF(0f, 0f), ("0", 10, 20, 0, null));
+        WorldMapSpot spot = Assert.Single(WorldMapDocument.Load(image).Spots);
+        var pending = new WorldMapPendingPositions<IWorldMapMovable>();
+
+        pending.Stage(spot, 30, 40);
+
+        Assert.Equal(10, spot.SpotX);
+        Assert.Equal(20, spot.SpotY);
+        Assert.False(image.Changed); // staging must not dirty the file
+        // ...but the map draws it at the preview.
+        Assert.Equal((30, 40), pending.Effective(spot, spot.SpotX, spot.SpotY));
+    }
+
+    [Fact]
+    public void ConfirmingASpot_WritesItAndDirtiesTheImage()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap000.img", null, new PointF(0f, 0f), ("0", 10, 20, 0, null));
+        WorldMapSpot spot = Assert.Single(WorldMapDocument.Load(image).Spots);
+        var pending = new WorldMapPendingPositions<IWorldMapMovable>();
+        pending.Stage(spot, 30, 40);
+
+        List<WzVectorProperty> written = ConfirmSpots(pending);
+
+        Assert.Same(spot.Spot, Assert.Single(written));
+        Assert.Equal(30, spot.SpotX);
+        Assert.Equal(40, spot.SpotY);
+        Assert.True(image.Changed);
+        Assert.Equal(0, pending.Count);
+    }
+
+    [Fact]
+    public void DiscardingAPreview_RestoresTheCommittedPositionWithoutWriting()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap000.img", null, new PointF(0f, 0f), ("0", 10, 20, 0, null));
+        WorldMapSpot spot = Assert.Single(WorldMapDocument.Load(image).Spots);
+        var pending = new WorldMapPendingPositions<IWorldMapMovable>();
+        pending.Stage(spot, 250, 120);
+
+        pending.Clear(); // 重設視圖
+
+        Assert.Equal(10, spot.SpotX);
+        Assert.Equal(20, spot.SpotY);
+        Assert.Equal((10, 20), pending.Effective(spot, spot.SpotX, spot.SpotY));
+        Assert.False(image.Changed);
+        Assert.Equal(0, pending.Count);
+    }
+
+    [Fact]
+    public void AfterConfirming_ResetGoesBackToTheConfirmedPosition_NotTheOriginalOne()
+    {
+        // The baseline is "whatever was last written", which is exactly the WZ value - so this
+        // works without storing a separate baseline anywhere.
+        WzImage image = MakeWorldMapImage("WorldMap000.img", null, new PointF(0f, 0f), ("0", 100, 50, 0, null));
+        WorldMapSpot spot = Assert.Single(WorldMapDocument.Load(image).Spots);
+        var pending = new WorldMapPendingPositions<IWorldMapMovable>();
+
+        pending.Stage(spot, 200, 100);
+        ConfirmSpots(pending);
+        Assert.Equal(200, spot.SpotX);
+
+        pending.Stage(spot, 300, 150);
+        pending.Clear(); // 重設視圖
+
+        Assert.Equal((200, 100), pending.Effective(spot, spot.SpotX, spot.SpotY));
+        Assert.Equal(200, spot.SpotX);
+        Assert.Equal(100, spot.SpotY);
+    }
+
+    [Fact]
+    public void GroupPreview_LeavesEveryWzValueAloneUntilOneConfirmWritesThemAll()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap000.img", null, new PointF(0f, 0f),
+            ("0", 10, 20, 0, null), ("1", 30, 40, 0, null));
+        IReadOnlyList<WorldMapSpot> spots = WorldMapDocument.Load(image).Spots;
+        var pending = new WorldMapPendingPositions<IWorldMapMovable>();
+
+        // A +5,+5 group drag.
+        var start = new Dictionary<IWorldMapMovable, (int X, int Y)> { [spots[0]] = (10, 20), [spots[1]] = (30, 40) };
+        foreach (KeyValuePair<IWorldMapMovable, (int X, int Y)> moved in WorldMapGroupMove.Offset(start, 5, 5))
+            pending.Stage(moved.Key, moved.Value.X, moved.Value.Y);
+
+        Assert.Equal(10, spots[0].SpotX);
+        Assert.Equal(30, spots[1].SpotX);
+        Assert.False(image.Changed);
+
+        List<WzVectorProperty> written = ConfirmSpots(pending);
+
+        Assert.Equal(2, written.Count); // one batch, both vectors
+        Assert.Equal((15, 25), (spots[0].SpotX, spots[0].SpotY));
+        Assert.Equal((35, 45), (spots[1].SpotX, spots[1].SpotY));
+        Assert.True(image.Changed);
+    }
+
+    [Fact]
+    public void DraggingTwiceBeforeConfirming_KeepsOnlyTheLatestPreview()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap000.img", null, new PointF(0f, 0f), ("0", 10, 20, 0, null));
+        WorldMapSpot spot = Assert.Single(WorldMapDocument.Load(image).Spots);
+        var pending = new WorldMapPendingPositions<IWorldMapMovable>();
+
+        pending.Stage(spot, 20, 20);
+        // The second drag starts from the preview, not from the WZ value.
+        Assert.Equal((20, 20), pending.Effective(spot, spot.SpotX, spot.SpotY));
+        pending.Stage(spot, 30, 20);
+
+        Assert.Equal(1, pending.Count);
+        ConfirmSpots(pending);
+
+        Assert.Equal(30, spot.SpotX); // 30, never the intermediate 20
+    }
+
+    [Fact]
+    public void PreviewingALinkImageOrigin_LeavesTheWzOriginUntouchedUntilConfirmed()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(0f, 0f), ("0", 1, 2, 0, null));
+        AddMapLink(image, "0", 100, 50, null, null);
+        AddLinkImage(image, "0", 20, 10);
+        WorldMapLink link = Assert.Single(WorldMapDocument.Load(image).Links);
+        var pending = new WorldMapPendingPositions<WorldMapLink>();
+
+        pending.Stage(link, 5, -10);
+
+        Assert.Equal(20, link.LinkImageOrigin.X.Value);
+        Assert.Equal(10, link.LinkImageOrigin.Y.Value);
+        Assert.False(image.Changed);
+        Assert.Equal((5, -10), pending.Effective(link, link.LinkImageOrigin.X.Value, link.LinkImageOrigin.Y.Value));
+
+        Assert.True(WorldMapPositionCommit.Apply(link.LinkImageOrigin, 5, -10));
+        pending.Clear();
+
+        Assert.Equal(5, link.LinkImageOrigin.X.Value);
+        Assert.Equal(-10, link.LinkImageOrigin.Y.Value);
+        Assert.True(image.Changed);
+    }
+
+    [Fact]
+    public void DiscardingALinkImagePreview_RestoresTheLastConfirmedOrigin()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(0f, 0f), ("0", 1, 2, 0, null));
+        AddMapLink(image, "0", 100, 50, null, null);
+        AddLinkImage(image, "0", 20, 10);
+        WorldMapLink link = Assert.Single(WorldMapDocument.Load(image).Links);
+        var pending = new WorldMapPendingPositions<WorldMapLink>();
+
+        pending.Stage(link, -50, 30);
+        pending.Clear();
+
+        Assert.Equal((20, 10), pending.Effective(link, link.LinkImageOrigin.X.Value, link.LinkImageOrigin.Y.Value));
+        Assert.False(image.Changed);
+    }
+
+    [Fact]
+    public void PreviewingASpot_DoesNotDisturbTheLinkImageOrigin_AndViceVersa()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(0f, 0f), ("0", 1, 2, 0, null));
+        AddMapLink(image, "0", 100, 50, null, null);
+        AddLinkImage(image, "0", 20, 10);
+        WorldMapLink link = Assert.Single(WorldMapDocument.Load(image).Links);
+        var positions = new WorldMapPendingPositions<IWorldMapMovable>();
+        var origins = new WorldMapPendingPositions<WorldMapLink>();
+
+        positions.Stage(link, 140, 50);
+        Assert.Equal(0, origins.Count);
+        Assert.Equal(20, link.LinkImageOrigin.X.Value);
+
+        origins.Stage(link, 0, 0);
+        Assert.Equal(1, positions.Count); // the spot preview is unaffected
+        Assert.Equal(100, link.SpotX);    // and neither WZ value has moved
+        Assert.Equal(20, link.LinkImageOrigin.X.Value);
+        Assert.False(image.Changed);
+    }
+
+    [Fact]
+    public void ConfirmingAPreviewThatEndedUpWhereItStarted_WritesNothing()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap000.img", null, new PointF(0f, 0f), ("0", 10, 20, 0, null));
+        WorldMapSpot spot = Assert.Single(WorldMapDocument.Load(image).Spots);
+        var pending = new WorldMapPendingPositions<IWorldMapMovable>();
+
+        pending.Stage(spot, 10, 20); // dragged away and back
+
+        Assert.Empty(ConfirmSpots(pending));
+        Assert.False(image.Changed); // no needless dirty flag
+    }
+
+    [Fact]
+    public void LookingAtAMapStagesNothing()
+    {
+        // Loading, panning, zooming and selecting all leave the staging store empty - there is
+        // nothing to confirm and nothing to discard.
+        WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(0f, 0f), ("0", 10, 20, 0, null));
+        AddMapLink(image, "0", 100, 50, null, null);
+        AddLinkImage(image, "0", 20, 10);
+
+        WorldMapDocument document = WorldMapDocument.Load(image);
+        var positions = new WorldMapPendingPositions<IWorldMapMovable>();
+        var origins = new WorldMapPendingPositions<WorldMapLink>();
+
+        var selection = new HashSet<IWorldMapMovable> { document.Spots[0], document.Links[0] };
+
+        Assert.Equal(2, selection.Count);
+        Assert.False(positions.HasAny);
+        Assert.False(origins.HasAny);
+        Assert.False(image.Changed);
+    }
+
     // ---- bounds --------------------------------------------------------------------------------
 
     [Fact]

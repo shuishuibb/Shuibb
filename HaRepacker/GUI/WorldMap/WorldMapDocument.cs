@@ -340,6 +340,62 @@ namespace HaRepacker.GUI.WorldMap
     }
 
     /// <summary>
+    /// Positions the user has moved but not yet confirmed. Dragging and typing only ever write in
+    /// here, so the WZ keeps its committed values until 確認修改 - which also means saving the WZ
+    /// while a preview is on screen cannot leak the preview into the file.
+    ///
+    /// There is deliberately no stored "baseline": the committed value *is* whatever the WZ
+    /// property currently holds, so discarding a preview is just forgetting it, and confirming one
+    /// makes it the new baseline for free.
+    /// </summary>
+    public sealed class WorldMapPendingPositions<TKey>
+    {
+        private readonly Dictionary<TKey, (int X, int Y)> pending = new Dictionary<TKey, (int X, int Y)>();
+
+        public int Count => pending.Count;
+        public bool HasAny => pending.Count > 0;
+
+        public IEnumerable<KeyValuePair<TKey, (int X, int Y)>> Entries => pending;
+
+        public void Stage(TKey key, int x, int y) => pending[key] = (x, y);
+
+        public bool TryGet(TKey key, out (int X, int Y) value) => pending.TryGetValue(key, out value);
+
+        /// <summary>The previewed position when one exists, otherwise the committed one.</summary>
+        public (int X, int Y) Effective(TKey key, int committedX, int committedY)
+            => pending.TryGetValue(key, out (int X, int Y) preview) ? preview : (committedX, committedY);
+
+        public void Remove(TKey key) => pending.Remove(key);
+
+        public void Clear() => pending.Clear();
+    }
+
+    /// <summary>
+    /// The one place a previewed position becomes a real WZ value.
+    /// </summary>
+    public static class WorldMapPositionCommit
+    {
+        /// <summary>
+        /// Writes x/y into the vector and dirties its image. Returns false - writing nothing -
+        /// when the vector is missing or already holds that position, so confirming a preview
+        /// that ended up back where it started leaves the file clean.
+        /// </summary>
+        public static bool Apply(WzVectorProperty target, int x, int y)
+        {
+            if (target == null)
+                return false;
+            if (target.X.Value == x && target.Y.Value == y)
+                return false;
+
+            target.X.Value = x;
+            target.Y.Value = y;
+            if (target.ParentImage != null)
+                target.ParentImage.Changed = true;
+            return true;
+        }
+    }
+
+    /// <summary>
     /// Moving a group of selected items together. Every item keeps its own position and shifts by
     /// the same delta, so a multi-selection holds its shape instead of collapsing onto one point.
     /// </summary>

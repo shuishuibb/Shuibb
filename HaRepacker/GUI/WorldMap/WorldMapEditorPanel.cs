@@ -108,6 +108,17 @@ namespace HaRepacker.GUI.WorldMap
             LinkImage
         }
 
+        /// <summary>
+        /// Previewed spot positions (MapList spots and MapLink spots alike) and previewed linkImg
+        /// origins. Dragging and typing write only here; the WZ is untouched until 確認修改.
+        /// </summary>
+        private readonly WorldMapPendingPositions<IWorldMapMovable> pendingPositions =
+            new WorldMapPendingPositions<IWorldMapMovable>();
+        private readonly WorldMapPendingPositions<WorldMapLink> pendingOrigins =
+            new WorldMapPendingPositions<WorldMapLink>();
+
+        private Button confirmButton;
+
         private WorldMapDragKind dragKind = WorldMapDragKind.None;
         private WorldMapLink draggingLinkImage;
         private double dragStartImageLeft;
@@ -190,6 +201,13 @@ namespace HaRepacker.GUI.WorldMap
                 return true; // still a world map; showing the failure beats falling back to another editor
             }
 
+            // Previews belong to the map that was on screen. The user never confirmed them, so
+            // they are dropped rather than carried over - and they must never follow the user to
+            // another image and get written there.
+            pendingPositions.Clear();
+            pendingOrigins.Clear();
+            RefreshPendingState();
+
             document = WorldMapDocument.Load(image);
             selectedItems.Clear();
             primarySelected = null;
@@ -218,6 +236,9 @@ namespace HaRepacker.GUI.WorldMap
         public void Clear()
         {
             document = null;
+            pendingPositions.Clear();
+            pendingOrigins.Clear();
+            RefreshPendingState();
             selectedItems.Clear();
             primarySelected = null;
             markers.Clear();
@@ -394,7 +415,8 @@ namespace HaRepacker.GUI.WorldMap
             if (!linkImages.TryGetValue(link, out Image image))
                 return;
 
-            (double Left, double Top) position = ComputeLinkImagePosition(link, link.SpotX, link.SpotY);
+            (int X, int Y) spot = EffectivePosition(link);
+            (double Left, double Top) position = ComputeLinkImagePosition(link, spot.X, spot.Y);
             Canvas.SetLeft(image, position.Left);
             Canvas.SetTop(image, position.Top);
 
@@ -405,13 +427,15 @@ namespace HaRepacker.GUI.WorldMap
             }
         }
 
+        /// <summary>
+        /// Where the artwork is drawn for a given anchor. Uses the *previewed* origin, so a
+        /// dragged picture stays where it was dropped even though the WZ still holds the old one.
+        /// </summary>
         private (double Left, double Top) ComputeLinkImagePosition(WorldMapLink link, int spotX, int spotY)
         {
             (double x, double y) anchor = WorldMapCoordinateConverter.WorldToCanvas(document.BaseOrigin, spotX, spotY);
-            WzVectorProperty origin = link.LinkImageOrigin;
-            int originX = origin?.X.Value ?? 0;
-            int originY = origin?.Y.Value ?? 0;
-            return WorldMapLinkImagePlacement.ToCanvasPosition(anchor, originX, originY);
+            (int X, int Y) origin = EffectiveOrigin(link);
+            return WorldMapLinkImagePlacement.ToCanvasPosition(anchor, origin.X, origin.Y);
         }
 
         private void AddMarker(IWorldMapMovable item, Shape marker)
@@ -420,7 +444,8 @@ namespace HaRepacker.GUI.WorldMap
             marker.MouseLeftButtonDown += Marker_MouseLeftButtonDown;
             markers[item] = marker;
             worldCanvas.Children.Add(marker);
-            PositionMarker(item, item.Position.X.Value, item.Position.Y.Value);
+            (int X, int Y) position = EffectivePosition(item);
+            PositionMarker(item, position.X, position.Y);
         }
 
         private Shape CreateSpotMarker(WorldMapSpot spot)
@@ -496,6 +521,55 @@ namespace HaRepacker.GUI.WorldMap
             }
         }
 
+        // ---- previewed vs committed values --------------------------------------------------------
+
+        /// <summary>Where this item is shown - its preview when it has one, else its WZ value.</summary>
+        private (int X, int Y) EffectivePosition(IWorldMapMovable item)
+            => pendingPositions.Effective(item, item.Position.X.Value, item.Position.Y.Value);
+
+        /// <summary>
+        /// The origin the artwork is drawn with - previewed when it has one, else the committed
+        /// origin, else (0,0) for a linkImg that has none yet.
+        /// </summary>
+        private (int X, int Y) EffectiveOrigin(WorldMapLink link)
+        {
+            WzVectorProperty origin = link.LinkImageOrigin;
+            return pendingOrigins.Effective(link, origin?.X.Value ?? 0, origin?.Y.Value ?? 0);
+        }
+
+        private bool HasPendingChanges => pendingPositions.HasAny || pendingOrigins.HasAny;
+
+        private int PendingChangeCount => pendingPositions.Count + pendingOrigins.Count;
+
+        private void RefreshPendingState()
+        {
+            if (confirmButton != null)
+                confirmButton.IsEnabled = HasPendingChanges;
+        }
+
+        /// <summary>
+        /// Forgets every preview and puts the markers and artwork back on their committed values.
+        /// Writes nothing - the WZ never held the previews in the first place - and deliberately
+        /// keeps the current selection so the user does not lose their place.
+        /// </summary>
+        private void DiscardPendingPositions()
+        {
+            pendingPositions.Clear();
+            pendingOrigins.Clear();
+            RefreshPendingState();
+
+            if (document == null)
+                return;
+
+            foreach (IWorldMapMovable item in markers.Keys)
+                PositionMarker(item, item.Position.X.Value, item.Position.Y.Value);
+            foreach (WorldMapLink link in linkImages.Keys)
+                PositionLinkImage(link);
+
+            UpdateCanvasBounds();
+            PopulateInspector();
+        }
+
         private void PositionMarker(IWorldMapMovable item, int spotX, int spotY)
         {
             if (!markers.TryGetValue(item, out Shape marker))
@@ -518,8 +592,9 @@ namespace HaRepacker.GUI.WorldMap
 
             foreach (IWorldMapMovable item in markers.Keys)
             {
+                (int X, int Y) spot = EffectivePosition(item);
                 (double x, double y) = WorldMapCoordinateConverter.WorldToCanvas(
-                    document.BaseOrigin, item.Position.X.Value, item.Position.Y.Value);
+                    document.BaseOrigin, spot.X, spot.Y);
                 width = Math.Max(width, x + CanvasPadding);
                 height = Math.Max(height, y + CanvasPadding);
             }
@@ -529,8 +604,9 @@ namespace HaRepacker.GUI.WorldMap
             // (worldCanvas does not clip) and its origin is never adjusted to make it fit.
             foreach (KeyValuePair<WorldMapLink, Image> entry in linkImages)
             {
+                (int X, int Y) linkSpot = EffectivePosition(entry.Key);
                 (double Left, double Top) position = ComputeLinkImagePosition(
-                    entry.Key, entry.Key.SpotX, entry.Key.SpotY);
+                    entry.Key, linkSpot.X, linkSpot.Y);
                 width = Math.Max(width, position.Left + entry.Value.Width + CanvasPadding);
                 height = Math.Max(height, position.Top + entry.Value.Height + CanvasPadding);
             }
@@ -541,6 +617,12 @@ namespace HaRepacker.GUI.WorldMap
 
         // ---- view ------------------------------------------------------------------------------
 
+        /// <summary>
+        /// Resets the camera *and* throws away every unconfirmed position - the way back out of a
+        /// preview. Nothing is written: the WZ never held the previews, so this is pure forgetting.
+        /// No re-parse and no re-decode either; the cached bitmaps and the loaded document stay as
+        /// they are and only the placements are recomputed.
+        /// </summary>
         private void ResetView()
         {
             zoomTransform.ScaleX = 1.0;
@@ -548,6 +630,11 @@ namespace HaRepacker.GUI.WorldMap
             panTransform.X = 0.0;
             panTransform.Y = 0.0;
             UpdateZoomText();
+
+            bool discarded = HasPendingChanges;
+            DiscardPendingPositions();
+            if (discarded)
+                statusText.Text = "已取消尚未確認的位置修改並重設視圖。";
         }
 
         private void UpdateZoomText()
@@ -717,8 +804,10 @@ namespace HaRepacker.GUI.WorldMap
         private void BeginPendingDrag(Point pointerOnCanvas)
         {
             dragStartPositions.Clear();
+            // Start from what is on screen, not from the WZ - dragging something a second time
+            // must continue from where the last preview left it.
             foreach (IWorldMapMovable item in selectedItems)
-                dragStartPositions[item] = (item.Position.X.Value, item.Position.Y.Value);
+                dragStartPositions[item] = EffectivePosition(item);
 
             dragKind = WorldMapDragKind.ItemPosition;
             dragStartPointerOnCanvas = pointerOnCanvas;
@@ -806,35 +895,20 @@ namespace HaRepacker.GUI.WorldMap
 
             (int x, int y) = OriginForPosition(link, Canvas.GetLeft(image), Canvas.GetTop(image));
 
+            // Preview only. A linkImg with no origin yet keeps its previewed one here too - the
+            // property is not created until 確認修改, so browsing still cannot alter the WZ.
             WzVectorProperty origin = link.LinkImageOrigin;
-            if (origin == null)
-            {
-                // Dragging is an explicit edit, so creating the missing origin here is fair - but
-                // only through the tree, never as a model-only property the tree cannot see.
-                origin = TryCreateLinkImageOrigin(link);
-                if (origin == null)
-                {
-                    PositionLinkImage(link); // snap back; nothing was changed
-                    return;
-                }
-            }
-
-            if (origin.X.Value == x && origin.Y.Value == y)
-            {
-                PositionLinkImage(link);
-                return;
-            }
-
-            origin.X.Value = x;
-            origin.Y.Value = y;
-            if (origin.ParentImage != null)
-                origin.ParentImage.Changed = true;
+            if (origin != null && origin.X.Value == x && origin.Y.Value == y)
+                pendingOrigins.Remove(link);
+            else
+                pendingOrigins.Stage(link, x, y);
 
             PositionLinkImage(link);
             UpdateCanvasBounds();
-            PropertiesChanged?.Invoke(this, new WzImageProperty[] { origin });
+            RefreshPendingState();
             PopulateInspector();
-            statusText.Text = "MapLink " + link.EntryName + " 的 linkImg origin 已更新為 " + x + ", " + y + "。";
+            statusText.Text = "已預覽 MapLink " + link.EntryName + " 的 linkImg origin（" + x + ", " + y
+                + "），共 " + PendingChangeCount + " 項尚未確認，請按「確認修改」套用。";
         }
 
         /// <summary>
@@ -942,7 +1016,7 @@ namespace HaRepacker.GUI.WorldMap
         /// </summary>
         private void CommitDrag()
         {
-            var written = new List<WzImageProperty>();
+            int staged = 0;
 
             foreach (KeyValuePair<IWorldMapMovable, (int X, int Y)> start in dragStartPositions)
             {
@@ -956,25 +1030,28 @@ namespace HaRepacker.GUI.WorldMap
                 (int x, int y) = WorldMapCoordinateConverter.CanvasToWorld(document.BaseOrigin, centreX, centreY);
 
                 if (item.Position.X.Value == x && item.Position.Y.Value == y)
-                    continue;
-
-                item.Position.X.Value = x;
-                item.Position.Y.Value = y;
-                if (item.Position.ParentImage != null)
-                    item.Position.ParentImage.Changed = true;
-                written.Add(item.Position);
+                {
+                    // Back where it started: drop any preview instead of keeping a no-op one.
+                    pendingPositions.Remove(item);
+                }
+                else
+                {
+                    pendingPositions.Stage(item, x, y);
+                    staged++;
+                }
 
                 if (item is WorldMapLink link)
                     PositionLinkImage(link);
             }
 
-            if (written.Count > 0)
+            if (staged > 0)
             {
                 UpdateCanvasBounds();
-                PropertiesChanged?.Invoke(this, written);
-                statusText.Text = "已移動 " + written.Count + " 個項目。";
+                // Preview only: nothing written, nothing dirtied, nothing reddened until 確認修改.
+                statusText.Text = "已預覽 " + staged + " 個位置修改，共 " + PendingChangeCount + " 項尚未確認，請按「確認修改」套用。";
             }
 
+            RefreshPendingState();
             PopulateInspector();
         }
 
@@ -1093,8 +1170,10 @@ namespace HaRepacker.GUI.WorldMap
 
             spotXBox.IsEnabled = true;
             spotYBox.IsEnabled = true;
-            spotXBox.Text = spot.SpotX.ToString(CultureInfo.InvariantCulture);
-            spotYBox.Text = spot.SpotY.ToString(CultureInfo.InvariantCulture);
+            // Shows the preview when there is one, so the boxes agree with what is on the map.
+            (int X, int Y) shownSpot = EffectivePosition(spot);
+            spotXBox.Text = shownSpot.X.ToString(CultureInfo.InvariantCulture);
+            spotYBox.Text = shownSpot.Y.ToString(CultureInfo.InvariantCulture);
 
             mapNoSection.Visibility = Visibility.Visible;
             foreach (WzIntProperty mapNo in spot.MapNo)
@@ -1112,23 +1191,27 @@ namespace HaRepacker.GUI.WorldMap
 
             spotXBox.IsEnabled = true;
             spotYBox.IsEnabled = true;
-            spotXBox.Text = link.SpotX.ToString(CultureInfo.InvariantCulture);
-            spotYBox.Text = link.SpotY.ToString(CultureInfo.InvariantCulture);
+            (int X, int Y) shownSpot = EffectivePosition(link);
+            spotXBox.Text = shownSpot.X.ToString(CultureInfo.InvariantCulture);
+            spotYBox.Text = shownSpot.Y.ToString(CultureInfo.InvariantCulture);
 
             // linkImg's own placement, separate from the spot above.
             if (link.LinkImage != null)
             {
                 linkOriginSection.Visibility = Visibility.Visible;
-                WzVectorProperty origin = link.LinkImageOrigin;
-                bool hasOrigin = origin != null;
+                bool hasOrigin = link.LinkImageOrigin != null;
+                bool hasPreview = pendingOrigins.TryGet(link, out (int X, int Y) _);
 
-                // No origin yet: shown as blank and read-only. Merely looking at a MapLink must
-                // never create one - only an explicit drag does.
+                // No origin yet: read-only until an explicit drag previews one. Merely looking at
+                // a MapLink must never create one.
                 originXBox.IsEnabled = hasOrigin;
                 originYBox.IsEnabled = hasOrigin;
-                originMissingText.Visibility = hasOrigin ? Visibility.Collapsed : Visibility.Visible;
-                if (hasOrigin)
-                    ShowOrigin(origin.X.Value, origin.Y.Value);
+                originMissingText.Visibility = hasOrigin || hasPreview ? Visibility.Collapsed : Visibility.Visible;
+                if (hasOrigin || hasPreview)
+                {
+                    (int X, int Y) shownOrigin = EffectiveOrigin(link);
+                    ShowOrigin(shownOrigin.X, shownOrigin.Y);
+                }
             }
 
             // Only what the entry actually carries.
@@ -1412,27 +1495,32 @@ namespace HaRepacker.GUI.WorldMap
             if (isPopulatingInspector || primarySelected == null || selectedItems.Count != 1 || isDraggingItems)
                 return;
 
+            IWorldMapMovable item = primarySelected;
+
             if (!int.TryParse(spotXBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out int x)
                 || !int.TryParse(spotYBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out int y))
             {
-                // Put the real values back rather than nagging with a dialog.
-                ShowCoordinates(primarySelected.Position.X.Value, primarySelected.Position.Y.Value);
+                // Put the shown values back rather than nagging with a dialog.
+                (int X, int Y) shown = EffectivePosition(item);
+                ShowCoordinates(shown.X, shown.Y);
                 statusText.Text = "座標必須是整數";
                 return;
             }
 
-            IWorldMapMovable item = primarySelected;
+            // Typed coordinates are a preview too, exactly like a drag.
             if (item.Position.X.Value == x && item.Position.Y.Value == y)
-                return;
-
-            item.Position.X.Value = x;
-            item.Position.Y.Value = y;
-            if (item.Position.ParentImage != null)
-                item.Position.ParentImage.Changed = true;
+                pendingPositions.Remove(item);
+            else
+                pendingPositions.Stage(item, x, y);
 
             PositionMarker(item, x, y);
-            PropertiesChanged?.Invoke(this, new WzImageProperty[] { item.Position });
-            statusText.Text = item.DisplayName + " 座標已更新為 " + x + ", " + y + "。";
+            if (item is WorldMapLink link)
+                PositionLinkImage(link);
+            UpdateCanvasBounds();
+            RefreshPendingState();
+            statusText.Text = HasPendingChanges
+                ? "已預覽 " + item.DisplayName + " 座標 " + x + ", " + y + "，共 " + PendingChangeCount + " 項尚未確認。"
+                : item.DisplayName + " 座標維持 " + x + ", " + y + "。";
         }
 
         private void OriginBox_KeyDown(object sender, KeyEventArgs e)
@@ -1463,22 +1551,91 @@ namespace HaRepacker.GUI.WorldMap
             if (!int.TryParse(originXBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out int x)
                 || !int.TryParse(originYBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out int y))
             {
-                ShowOrigin(origin.X.Value, origin.Y.Value);
+                (int X, int Y) shown = EffectiveOrigin(link);
+                ShowOrigin(shown.X, shown.Y);
                 statusText.Text = "Origin 必須是整數";
                 return;
             }
-            if (origin.X.Value == x && origin.Y.Value == y)
-                return;
 
-            origin.X.Value = x;
-            origin.Y.Value = y;
-            if (origin.ParentImage != null)
-                origin.ParentImage.Changed = true;
+            // Preview, same as dragging the picture.
+            if (origin.X.Value == x && origin.Y.Value == y)
+                pendingOrigins.Remove(link);
+            else
+                pendingOrigins.Stage(link, x, y);
 
             PositionLinkImage(link);
             UpdateCanvasBounds();
-            PropertiesChanged?.Invoke(this, new WzImageProperty[] { origin });
-            statusText.Text = "MapLink " + link.EntryName + " 的 linkImg origin 已更新為 " + x + ", " + y + "。";
+            RefreshPendingState();
+            statusText.Text = HasPendingChanges
+                ? "已預覽 MapLink " + link.EntryName + " 的 linkImg origin（" + x + ", " + y + "），共 "
+                  + PendingChangeCount + " 項尚未確認。"
+                : "MapLink " + link.EntryName + " 的 linkImg origin 維持 " + x + ", " + y + "。";
+        }
+
+        // ---- confirm ------------------------------------------------------------------------------
+
+        /// <summary>
+        /// The only place a previewed position reaches the WZ. Writes every pending spot and
+        /// linkImg origin, dirties their images, and reports all of them in a single
+        /// PropertiesChanged so the tree reddens exactly the leaves that were written.
+        ///
+        /// A pending item that cannot be written - a linkImg whose origin cannot be created,
+        /// because there is no tree node to attach it to - keeps its preview and leaves the button
+        /// enabled; the ones that succeeded are still committed rather than rolled back.
+        /// </summary>
+        private void ConfirmPendingChanges()
+        {
+            if (document == null || !HasPendingChanges)
+                return;
+
+            var written = new List<WzImageProperty>();
+            var committedItems = new List<IWorldMapMovable>();
+            var committedLinks = new List<WorldMapLink>();
+            int failed = 0;
+
+            foreach (KeyValuePair<IWorldMapMovable, (int X, int Y)> entry in pendingPositions.Entries.ToList())
+            {
+                if (WorldMapPositionCommit.Apply(entry.Key.Position, entry.Value.X, entry.Value.Y))
+                    written.Add(entry.Key.Position);
+                committedItems.Add(entry.Key);
+            }
+
+            foreach (KeyValuePair<WorldMapLink, (int X, int Y)> entry in pendingOrigins.Entries.ToList())
+            {
+                WorldMapLink link = entry.Key;
+                WzVectorProperty origin = link.LinkImageOrigin;
+                if (origin == null)
+                {
+                    // Creating it is fair now - this is the explicit confirm, not a browse.
+                    origin = TryCreateLinkImageOrigin(link);
+                    if (origin == null)
+                    {
+                        failed++;
+                        continue;
+                    }
+                }
+
+                if (WorldMapPositionCommit.Apply(origin, entry.Value.X, entry.Value.Y))
+                    written.Add(origin);
+                committedLinks.Add(link);
+            }
+
+            // The committed values are now the WZ values, so simply forgetting these previews
+            // makes them the new baseline.
+            foreach (IWorldMapMovable item in committedItems)
+                pendingPositions.Remove(item);
+            foreach (WorldMapLink link in committedLinks)
+                pendingOrigins.Remove(link);
+
+            if (written.Count > 0)
+                PropertiesChanged?.Invoke(this, written);
+
+            RefreshPendingState();
+            PopulateInspector();
+
+            statusText.Text = failed > 0
+                ? "已套用 " + written.Count + " 個位置修改，" + failed + " 個 LinkImg 無法建立 origin，未套用。"
+                : "已套用 " + written.Count + " 個位置修改。";
         }
 
         private void ShowOrigin(int x, int y)
@@ -1518,6 +1675,8 @@ namespace HaRepacker.GUI.WorldMap
                 statusText.Text = "這張世界地圖沒有 info/parentMap，無法回上一層。";
                 return;
             }
+
+            DiscardPendingPositions(); // unconfirmed previews do not travel with the user
             NavigationRequested?.Invoke(this, parent);
         }
 
@@ -1525,6 +1684,10 @@ namespace HaRepacker.GUI.WorldMap
         {
             if (document == null)
                 return;
+
+            // Leaving this map without confirming means the previews are abandoned - navigating
+            // must never quietly write them.
+            DiscardPendingPositions();
 
             // A MapLink states its destination outright, so no guessing is needed.
             if (item is WorldMapLink link)
@@ -1631,7 +1794,14 @@ namespace HaRepacker.GUI.WorldMap
             DockPanel.SetDock(previousImageButton, Dock.Left);
             bar.Children.Add(previousImageButton);
 
+            confirmButton = PanelButton("確認修改");
+            confirmButton.IsEnabled = false;
+            confirmButton.Click += delegate { ConfirmPendingChanges(); };
+            DockPanel.SetDock(confirmButton, Dock.Right);
+            bar.Children.Add(confirmButton);
+
             Button resetButton = PanelButton("重設視圖");
+            resetButton.Margin = new Thickness(0.0, 0.0, 8.0, 0.0);
             resetButton.Click += delegate { ResetView(); };
             DockPanel.SetDock(resetButton, Dock.Right);
             bar.Children.Add(resetButton);
