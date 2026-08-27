@@ -170,7 +170,144 @@ namespace HaRepacker.GUI.Panels
             UpdateNativeSelectionVisuals();
 
             if (activeNode != null && nativeTreeItems.TryGetValue(activeNode, out TreeViewItem activeItem))
-                Dispatcher.BeginInvoke(new Action(activeItem.BringIntoView), DispatcherPriority.Loaded);
+            {
+                // Tagged with the reveal generation: a tab switch bumps it, so a reveal queued by
+                // a refresh just before the switch cannot land afterwards and drag the restored
+                // viewport back to the selected node.
+                int revealGen = treeRevealGeneration;
+                Dispatcher.BeginInvoke(new Action(() =>
+                {
+                    if (revealGen == treeRevealGeneration && !suppressTreeAutoReveal)
+                        activeItem.BringIntoView();
+                }), DispatcherPriority.Loaded);
+            }
+        }
+
+        /// <summary>
+        /// Invalidates this tab's in-flight background work (a running progressive search, the
+        /// search session). Called before "close all" empties the tree, so late results land in
+        /// a world that no longer accepts them.
+        /// </summary>
+        public void CancelBackgroundTreeWork()
+        {
+            searchRunGeneration++;
+            EndSearchSession();
+        }
+
+        /// <summary>
+        /// After "close all files": nothing may keep pointing at the objects that were just
+        /// disposed - not the editors, not the queued render, not the status type.
+        /// </summary>
+        public void ResetViewAfterCloseAll()
+        {
+            nativeSelectedNodes.Clear();
+            nativeSelectionPainted.Clear();
+            pendingObjectValue = null;
+            coloredNode = null;
+
+            _bindingPropertyItem.WzFileName = string.Empty;
+            _bindingPropertyItem.WzFileValue = string.Empty;
+            SetSelectedWzTypeName(string.Empty);
+
+            canvasPropBox.Visibility = Visibility.Collapsed;
+            mp3Player.Visibility = Visibility.Collapsed;
+            textEditor.Visibility = Visibility.Collapsed;
+            if (nodeEditorPanel != null)
+                nodeEditorPanel.Visibility = Visibility.Collapsed;
+            if (skillPreviewPanel != null)
+            {
+                skillPreviewPanel.Visibility = Visibility.Collapsed;
+                skillPreviewPanel.StopPlayback();
+            }
+            if (worldMapEditorPanel != null)
+            {
+                worldMapEditorPanel.Clear();
+                worldMapEditorPanel.Visibility = Visibility.Collapsed;
+            }
+
+            RefreshNativeDataTree();
+        }
+
+        // ---- per-tab tree viewport -------------------------------------------------------------
+
+        private double savedTreeVerticalOffset;
+        private double savedTreeHorizontalOffset;
+        private bool hasSavedTreeViewport;
+
+        /// <summary>
+        /// True while a tab switch is putting the viewport back. WPF re-focuses the last focused
+        /// TreeViewItem when the tab's content reattaches, and a focused element raises
+        /// RequestBringIntoView - which would yank the tree back to the selected node even though
+        /// the user had scrolled elsewhere. Explicit navigation (search, type-ahead, WorldMap
+        /// jumps) runs under isNavigatingSearchResult and is never suppressed.
+        /// </summary>
+        private bool suppressTreeAutoReveal;
+
+        /// <summary>Bumped when the viewport is restored; stale queued reveals check it and bail.</summary>
+        private int treeRevealGeneration;
+
+        /// <summary>Remembers where this tab's tree is scrolled, called when the tab is left.</summary>
+        public void CaptureTreeViewport()
+        {
+            if (FindNativeTreeScrollViewer() is ScrollViewer viewer)
+            {
+                savedTreeVerticalOffset = viewer.VerticalOffset;
+                savedTreeHorizontalOffset = viewer.HorizontalOffset;
+                hasSavedTreeViewport = true;
+            }
+        }
+
+        /// <summary>
+        /// Puts this tab's tree back where the user left it. Selection is untouched - selection
+        /// and viewport are deliberately independent: the selected node stays selected (and the
+        /// editor keeps showing it) but the picture does not jump to it.
+        /// </summary>
+        public void RestoreTreeViewport()
+        {
+            treeRevealGeneration++;
+            if (!hasSavedTreeViewport)
+                return;
+
+            suppressTreeAutoReveal = true;
+            double vertical = savedTreeVerticalOffset;
+            double horizontal = savedTreeHorizontalOffset;
+            // ContextIdle: after layout has settled and after any focus-restore reveal has fired,
+            // so this write is the one that wins.
+            Dispatcher.BeginInvoke(new Action(() =>
+            {
+                try
+                {
+                    if (FindNativeTreeScrollViewer() is ScrollViewer viewer)
+                    {
+                        viewer.ScrollToVerticalOffset(vertical);
+                        viewer.ScrollToHorizontalOffset(horizontal);
+                    }
+                }
+                finally
+                {
+                    suppressTreeAutoReveal = false;
+                }
+            }), DispatcherPriority.ContextIdle);
+        }
+
+        private ScrollViewer FindNativeTreeScrollViewer()
+        {
+            return FindDescendantScrollViewer(dataTreeView);
+        }
+
+        private static ScrollViewer FindDescendantScrollViewer(DependencyObject root)
+        {
+            if (root == null)
+                return null;
+            if (root is ScrollViewer viewer)
+                return viewer;
+            int count = System.Windows.Media.VisualTreeHelper.GetChildrenCount(root);
+            for (int i = 0; i < count; i++)
+            {
+                if (FindDescendantScrollViewer(System.Windows.Media.VisualTreeHelper.GetChild(root, i)) is ScrollViewer found)
+                    return found;
+            }
+            return null;
         }
 
         /// <summary>
@@ -188,6 +325,16 @@ namespace HaRepacker.GUI.Panels
                 return;
 
             nativeTreeVirtualizationApplied = true;
+
+            // Swallows the automatic scroll-to-focused-item WPF performs when a tab's content
+            // reattaches; explicit navigation runs under isNavigatingSearchResult and passes.
+            dataTreeView.AddHandler(FrameworkElement.RequestBringIntoViewEvent,
+                new RequestBringIntoViewEventHandler((s, e) =>
+                {
+                    if (suppressTreeAutoReveal && !isNavigatingSearchResult)
+                        e.Handled = true;
+                }));
+
             VirtualizingStackPanel.SetIsVirtualizing(dataTreeView, true);
             VirtualizingStackPanel.SetVirtualizationMode(dataTreeView, VirtualizationMode.Recycling);
             // The ScrollViewer has to scroll by item for the panel to virtualise at all; ScrollUnit
@@ -674,7 +821,15 @@ namespace HaRepacker.GUI.Panels
 
                     PopulateNativeTreeItem(parentItem, path[index - 1]);
                     if (!nativeTreeItems.TryGetValue(pathNode, out item))
-                        return;
+                    {
+                        // PopulateNativeTreeItem builds only the first chunk synchronously; a
+                        // target past it (child #836 of a 2,171-image file, say) has no
+                        // container yet, and the reveal used to silently stop here - the hit
+                        // was found but never selected. Finish the fill, then look again.
+                        FlushPendingNativeTreeItems();
+                        if (!nativeTreeItems.TryGetValue(pathNode, out item))
+                            return;
+                    }
                 }
 
                 if (index < path.Count - 1 && !item.IsExpanded)
@@ -1714,7 +1869,16 @@ namespace HaRepacker.GUI.Panels
             WzNode wzNode = node;
             if (RenameInputBox.Show(Properties.Resources.MainConfirmRename, wzNode.Text, out newName))
             {
+                // Cancel never reaches here; a same-name confirm is a no-op and records nothing.
+                string oldName = wzNode.Text;
+                if (string.IsNullOrEmpty(newName) || string.Equals(newName, oldName, StringComparison.Ordinal))
+                    return;
+
                 wzNode.ChangeName(newName);
+                // TreeViewItem.Header is a one-time copy of node.Text; push the rename across.
+                UpdateNativeNodeHeader(wzNode);
+                UndoRedoMan.AddUndoBatch(new System.Collections.Generic.List<UndoRedoAction>
+                    { UndoRedoManager.ObjectRenamed(wzNode, oldName, newName) });
             }
         }
         #endregion
@@ -5339,11 +5503,14 @@ namespace HaRepacker.GUI.Panels
                             RevertNodeNameBox(node);
                         }
                         else if (WzNode.CanNodeBeInserted((WzNode)node.Parent, setText)) {
+                            string oldName = node.Text;
                             node.ChangeName(setText);
                             // TreeViewItem.Header is a one-time copy of node.Text taken in
                             // CreateNativeTreeItem, so the rename has to be pushed across or the
                             // visible tree keeps the old name until it is rebuilt.
                             UpdateNativeNodeHeader(node);
+                            UndoRedoMan.AddUndoBatch(new System.Collections.Generic.List<UndoRedoAction>
+                                { UndoRedoManager.ObjectRenamed(node, oldName, setText) });
                         }
                         else {
                             Warning.Error(Properties.Resources.MainNodeExists);
@@ -5584,6 +5751,125 @@ namespace HaRepacker.GUI.Panels
             }
         }
 
+        // ---- progressive Find next --------------------------------------------------------------
+
+        /// <summary>
+        /// Cancels whichever progressive search is still running: bumped by a new press, a query
+        /// change, a user re-selection ending the session, and close-all. A run compares its own
+        /// copy after every await and quietly stops when it lost.
+        /// </summary>
+        private int searchRunGeneration;
+
+        /// <summary>
+        /// The async walk behind Find next. Same traversal order and same match counter as
+        /// <see cref="SearchTV"/>, plus: an unparsed image is parsed when the walk reaches it -
+        /// big ones on a worker thread through the same in-flight state the double-click parse
+        /// uses - and the walk yields the dispatcher regularly, so scanning thousands of images
+        /// never freezes the window. Search stays display-clean: parsing marks nothing changed,
+        /// expands nothing, and only the branch of an actual hit is materialized (by the hit
+        /// handler, exactly as before).
+        /// </summary>
+        private async Task<bool> SearchTVAsync(WzNode node, int generation, System.Diagnostics.Stopwatch yieldClock, int[] imagesScanned)
+        {
+            // Snapshot: parsing/reveal work may add nodes while we walk.
+            var children = new List<WzNode>();
+            foreach (System.Windows.Forms.TreeNode child in node.Nodes)
+                if (child is WzNode wz)
+                    children.Add(wz);
+
+            foreach (WzNode subnode in children)
+            {
+                if (generation != searchRunGeneration)
+                    return false;
+
+                if (0 <= subnode.Text.IndexOf(searchText, StringComparison.InvariantCultureIgnoreCase))
+                {
+                    if (currentidx == searchidx)
+                    {
+                        subnode.BackColor = System.Drawing.Color.Yellow;
+                        coloredNode = subnode;
+                        SelectAndRevealNativeNode(subnode);
+                        finished = true;
+                        searchidx++;
+                        return true;
+                    }
+                    currentidx++;
+                }
+
+                if (subnode.Tag is WzImage img)
+                {
+                    if (!img.Parsed)
+                    {
+                        await EnsureImageParsedForSearchAsync(img, generation);
+                        if (generation != searchRunGeneration)
+                            return false;
+                        if (!img.Parsed)
+                            continue; // broken image: skip it, keep searching the rest
+                    }
+                    SearchWzProperties(img);
+                    if (finished)
+                        return true;
+
+                    imagesScanned[0]++;
+                    if (yieldClock.ElapsedMilliseconds > 40)
+                    {
+                        // Let paint/input through and show progress before continuing.
+                        toolStripStatusLabel_additionalInfo.Text = "搜尋中… 已掃 " + imagesScanned[0] + " 張 IMG";
+                        await Dispatcher.Yield(DispatcherPriority.Background);
+                        yieldClock.Restart();
+                        if (generation != searchRunGeneration)
+                            return false;
+                    }
+                }
+                else
+                {
+                    if (await SearchTVAsync(subnode, generation, yieldClock, imagesScanned))
+                        return true;
+                    if (generation != searchRunGeneration)
+                        return false;
+                }
+            }
+            return finished;
+        }
+
+        /// <summary>
+        /// Parses one image for the search walk, sharing <see cref="imagesBeingParsed"/> with the
+        /// double-click parse so the same image is never parsed twice concurrently: if the other
+        /// path started it, this one just waits for it. Big images go to a worker thread (the
+        /// same size threshold as double-click); small ones parse inline, with the caller's
+        /// yield cadence keeping the pump alive. Parsing here never touches Changed and never
+        /// expands anything.
+        /// </summary>
+        private async Task EnsureImageParsedForSearchAsync(WzImage img, int generation)
+        {
+            while (imagesBeingParsed.Contains(img) && generation == searchRunGeneration)
+                await Task.Delay(25);
+            if (img.Parsed || generation != searchRunGeneration)
+                return;
+
+            if (img.BlockSize >= AsyncParseMinBlockSize)
+            {
+                imagesBeingParsed.Add(img);
+                try
+                {
+                    await System.Threading.Tasks.Task.Run(() => img.ParseImage());
+                }
+                catch
+                {
+                    // A broken image just doesn't get searched.
+                }
+                finally
+                {
+                    imagesBeingParsed.Remove(img);
+                }
+            }
+            else
+            {
+                try { img.ParseImage(); }
+                catch { }
+            }
+        }
+
         /// <summary>
         /// Find all
         /// </summary>
@@ -5724,7 +6010,7 @@ namespace HaRepacker.GUI.Panels
             searchidx = 0;
         }
 
-        private void button_nextSearch_Click(object sender, RoutedEventArgs e)
+        private async void button_nextSearch_Click(object sender, RoutedEventArgs e)
         {
             if (coloredNode != null)
             {
@@ -5733,29 +6019,59 @@ namespace HaRepacker.GUI.Panels
             }
             if (findBox.Text == "" || DataTree.Nodes.Count == 0) return;
             if (DataTree.SelectedNode == null) DataTree.SelectedNode = DataTree.Nodes[0];
+
+            // A press while the previous search is still walking supersedes it.
+            int generation = ++searchRunGeneration;
+
             finished = false;
             listSearchResults = false;
             searchResultsList.Clear();
             searchValues = Program.ConfigurationManager.UserSettings.SearchStringValues;
             currentidx = 0;
             searchText = findBox.Text;
-            extractImages = Program.ConfigurationManager.UserSettings.ParseImagesInSearch;
+            string query = searchText;
 
             // Walk the session's roots, not the live selection - the live selection is now
             // whichever hit the previous press jumped to.
             EnsureSearchSession(searchText);
-            foreach (WzNode node in searchRootNodes)
+
+            var yieldClock = System.Diagnostics.Stopwatch.StartNew();
+            int[] imagesScanned = { 0 };
+            try
             {
-                if (node.Tag is IPropertyContainer)
-                    SearchWzProperties((IPropertyContainer)node.Tag);
-                else if (node.Tag is WzImageProperty) continue;
-                else SearchTV(node);
-                if (finished) break;
+                foreach (WzNode node in searchRootNodes.ToList())
+                {
+                    if (node.Tag is IPropertyContainer container)
+                        SearchWzProperties(container);
+                    else if (node.Tag is WzImageProperty) continue;
+                    else await SearchTVAsync(node, generation, yieldClock, imagesScanned);
+                    if (finished || generation != searchRunGeneration) break;
+                }
             }
+            catch (Exception ex)
+            {
+                if (generation == searchRunGeneration)
+                    toolStripStatusLabel_additionalInfo.Text = "搜尋失敗：" + ex.Message;
+                return;
+            }
+
+            // Superseded by a newer press / query change / close-all: this run says nothing.
+            if (generation != searchRunGeneration)
+                return;
+
             // Past the last match: rewind so the next press starts over from the first one. The
             // session's roots stay put, so "start over" means the original scope, not the hit the
-            // selection happens to be sitting on.
-            if (!finished) { MessageBox.Show(Properties.Resources.MainTreeEnd); searchidx = 0; WzNode.EnsureVisibleIfDisplayed(DataTree.SelectedNode); }
+            // selection happens to be sitting on. Reported in the status line, not a MessageBox.
+            if (!finished)
+            {
+                toolStripStatusLabel_additionalInfo.Text = "搜尋完成，找不到「" + query + "」。";
+                searchidx = 0;
+                WzNode.EnsureVisibleIfDisplayed(DataTree.SelectedNode);
+            }
+            else
+            {
+                toolStripStatusLabel_additionalInfo.Text = "-";
+            }
             findBox.Focus();
         }
 
@@ -5771,6 +6087,9 @@ namespace HaRepacker.GUI.Panels
         private void findBox_TextChanged(object sender, TextChangedEventArgs e)
         {
             searchidx = 0;
+            // A running progressive search for the old text must not finish later and jump the
+            // selection to a result the user no longer wants.
+            searchRunGeneration++;
             // Different text means the next Find next is a new search, so the roots get
             // re-snapshotted from whatever the user has selected at that point.
             EndSearchSession();

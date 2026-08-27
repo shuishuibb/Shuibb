@@ -18,7 +18,7 @@ namespace NodeEditorCopyPasteTests;
 /// the other source's String.wz" (audit P0-1).
 ///
 /// Two layers:
-///   * pure path-rule tests against NodeEditorStringSourceScope,
+///   * pure path-rule tests against StringSourceScope,
 ///   * an end-to-end test that builds two complete miniature Data sources as real .wz files under
 ///     %TEMP%\ShuibbFixValidation, opens both through one real WzFileManager (the app has exactly
 ///     one), and asserts which file the panel links each item to, both load orders, and that an
@@ -28,7 +28,7 @@ namespace NodeEditorCopyPasteTests;
 /// multi-tab UI. Tabs share the single WzFileManager, and the resolution depends only on the
 /// selected node and that manager, so per-tab behaviour follows from these tests by construction.
 /// </summary>
-public sealed class NodeEditorStringSourceScopeTests
+public sealed class StringSourceScopeTests
 {
     // ---- pure path rules ----------------------------------------------------------------------
 
@@ -42,23 +42,23 @@ public sealed class NodeEditorStringSourceScopeTests
     {
         var candidates = new List<string> { AString, BString };
 
-        Assert.Equal(new[] { AString }, NodeEditorStringSourceScope.PickSameSource(AItem, candidates));
-        Assert.Equal(new[] { BString }, NodeEditorStringSourceScope.PickSameSource(BItem, candidates));
+        Assert.Equal(new[] { AString }, StringSourceScope.PickSameSource(AItem, candidates));
+        Assert.Equal(new[] { BString }, StringSourceScope.PickSameSource(BItem, candidates));
     }
 
     [Fact]
     public void OnlyTheWrongSourceOpen_LinksNothing()
     {
         // B item selected, only A's String open: sharing just the drive root is not a source.
-        Assert.Empty(NodeEditorStringSourceScope.PickSameSource(BItem, new List<string> { AString }));
-        Assert.Empty(NodeEditorStringSourceScope.PickSameSource(AItem, new List<string> { BString }));
+        Assert.Empty(StringSourceScope.PickSameSource(BItem, new List<string> { AString }));
+        Assert.Empty(StringSourceScope.PickSameSource(AItem, new List<string> { BString }));
     }
 
     [Fact]
     public void TwoLocalesOfOneSource_BothSurviveForTheLocalePreference()
     {
         string zhCn = @"D:\3.私服檔案\技術谷4.0\Data\Lang\zh_CN\String\String_000.wz";
-        var picked = NodeEditorStringSourceScope.PickSameSource(AItem, new List<string> { zhCn, AString });
+        var picked = StringSourceScope.PickSameSource(AItem, new List<string> { zhCn, AString });
 
         // Both are the same Data root; the caller's existing zh_TW ordering chooses between them.
         Assert.Equal(2, picked.Count);
@@ -67,7 +67,7 @@ public sealed class NodeEditorStringSourceScopeTests
     [Fact]
     public void UnknownSelectedPath_OneFamilyOpen_StillLinks()
     {
-        var picked = NodeEditorStringSourceScope.PickSameSource(null,
+        var picked = StringSourceScope.PickSameSource(null,
             new List<string> { AString, @"D:\3.私服檔案\技術谷4.0\Data\Lang\zh_CN\String\String_000.wz" });
         Assert.Equal(2, picked.Count);
     }
@@ -75,13 +75,13 @@ public sealed class NodeEditorStringSourceScopeTests
     [Fact]
     public void UnknownSelectedPath_TwoFamiliesOpen_RefusesToGuess()
     {
-        Assert.Empty(NodeEditorStringSourceScope.PickSameSource(null, new List<string> { AString, BString }));
+        Assert.Empty(StringSourceScope.PickSameSource(null, new List<string> { AString, BString }));
     }
 
     [Fact]
     public void ForwardSlashesAndCaseDifferencesStillMatch()
     {
-        var picked = NodeEditorStringSourceScope.PickSameSource(
+        var picked = StringSourceScope.PickSameSource(
             BItem.Replace('\\', '/').ToUpperInvariant(),
             new List<string> { BString });
         Assert.Single(picked);
@@ -94,7 +94,7 @@ public sealed class NodeEditorStringSourceScopeTests
         // selected file - past the deepest real layout. Linking would risk the wrong file.
         string item = @"C:\stuff\deep\a\b\c\d\Item_000.wz";
         string str = @"C:\stuff\other\String_000.wz";
-        Assert.Empty(NodeEditorStringSourceScope.PickSameSource(item, new List<string> { str }));
+        Assert.Empty(StringSourceScope.PickSameSource(item, new List<string> { str }));
     }
 
     // ---- end-to-end: two real miniature sources, one real manager --------------------------------

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
@@ -263,7 +263,7 @@ namespace SkillPreview
             // that other source's file. A node whose source can't be established links to nothing
             // rather than to a file that might be the wrong one.
             var samesource = new HashSet<string>(
-                NodeEditorStringSourceScope.PickSameSource(
+                StringSourceScope.PickSameSource(
                     sourceFilePath, files.Select(f => f.FilePath).ToList()),
                 StringComparer.OrdinalIgnoreCase);
             files.RemoveAll(f => !samesource.Contains(f.FilePath));

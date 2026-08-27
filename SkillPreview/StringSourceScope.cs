@@ -14,7 +14,7 @@ namespace SkillPreview
     /// so nothing here assumes any directory name; the only signal used is how much of the two
     /// files' directory paths is shared.
     /// </summary>
-    public static class NodeEditorStringSourceScope
+    public static class StringSourceScope
     {
         /// <summary>
         /// How far above the selected file's own directory the common ancestor may sit for the

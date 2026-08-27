@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
@@ -34,7 +34,9 @@ namespace typeahead
         [STAThread]
         static void Main(string[] args)
         {
-            logPath = args.Length > 0 ? args[0] : "typeahead.txt";
+            // Default beside the exe, never the current directory - a run from the repo root used
+            // to drop its log there, and one such stale log ended up committed.
+            logPath = args.Length > 0 ? args[0] : System.IO.Path.Combine(AppContext.BaseDirectory, "typeahead.txt");
             wzPath = args.Length > 1 ? args[1] : "";
             imgName = args.Length > 2 ? args[2] : "Skill.img";
             digits = args.Length > 3 ? args[3] : "1121008";

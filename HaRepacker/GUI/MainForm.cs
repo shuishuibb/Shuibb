@@ -925,7 +925,15 @@ namespace HaRepacker.GUI
         /// <param name="e"></param>
         private void tabControl_MainPanels_TabIndexChanged(object sender, EventArgs e)
         {
+            // Each tab keeps its own tree viewport: note where the leaving tab was scrolled, and
+            // put the entering tab back where it was - without revealing its selected node.
+            MainPanel previousPanel = MainPanel;
+            previousPanel?.CaptureTreeViewport();
+
             UpdateSelectedMainPanelTab();
+
+            if (!ReferenceEquals(previousPanel, MainPanel))
+                MainPanel?.RestoreTreeViewport();
         }
 
         /// <summary>
@@ -1117,6 +1125,7 @@ namespace HaRepacker.GUI
 
             List<string> wzfilePathsToLoad = new List<string>();
             List<string> msFilePathsToLoad = new List<string>();
+            List<string> loadFailures = new List<string>();
 
             foreach (string filePath in fileNames) {
                 string filePathLowerCase = filePath.ToLower();
@@ -1242,6 +1251,16 @@ namespace HaRepacker.GUI
                     // Other WZs
                     else
                     {
+                        // A truly empty file cannot be a WZ; telling the user beats handing the
+                        // parser zero bytes and reporting whatever exception falls out.
+                        long fileLength = -1;
+                        try { fileLength = new FileInfo(filePath).Length; } catch { }
+                        if (fileLength == 0)
+                        {
+                            loadFailures.Add(Path.GetFileName(filePath) + " - 檔案為空，無法開啟。");
+                            continue;
+                        }
+
                         if (MapleVersionEncryptionSelected == WzMapleVersion.GENERATE)
                         {
                             WzKeyBruteforceForm bfForm = new WzKeyBruteforceForm();
@@ -1292,8 +1311,6 @@ namespace HaRepacker.GUI
             MainPanel.OnSetPanelLoading();
 
             // Try opening one, to see if the user is having the right priviledge
-
-            List<string> loadFailures = new List<string>();
 
             // .ms packs first (before this they were decrypted inline on the UI thread, one after
             // another). Same per-file failure isolation as the .wz batch: failures join the one
@@ -1346,6 +1363,35 @@ namespace HaRepacker.GUI
                 foreach (WzFile wzFile in loadedWzFiles) // add later, once everything is loaded to memory
                 {
                     AddLoadedWzObjectToMainPanel(wzFile, currentDispatcher);
+
+                    // The new-format client ships tiny category index files (Mob.wz, Skill.wz,
+                    // ...) that parse fine but hold no images at all - just empty directory
+                    // shells. Opened silently they look like "the program failed to parse my
+                    // data". Say so once, and point at the split files sitting next to them.
+                    try
+                    {
+                        if (wzFile.WzDirectory != null && wzFile.WzDirectory.CountImages() == 0)
+                        {
+                            string dir = Path.GetDirectoryName(wzFile.FilePath);
+                            string baseName = Path.GetFileNameWithoutExtension(wzFile.FilePath);
+                            string[] shards = null;
+                            try { shards = Directory.GetFiles(dir, baseName + "_*.wz"); } catch { }
+                            lock (loadFailures)
+                            {
+                                if (shards != null && shards.Length > 0)
+                                    loadFailures.Add(Path.GetFileName(wzFile.FilePath)
+                                        + " - 這個 WZ 是空的分類索引檔，實際資料在旁邊的分片檔案裡（例如 "
+                                        + Path.GetFileName(shards[0]) + "），請改開分片檔或使用 Data 資料夾批次功能。");
+                                else
+                                    loadFailures.Add(Path.GetFileName(wzFile.FilePath)
+                                        + " - 這個 WZ 沒有任何圖像資料（可能是索引檔或空檔）。");
+                            }
+                        }
+                    }
+                    catch
+                    {
+                        // A notice must never break the open itself.
+                    }
                 }
             }); // load complete
 
@@ -1364,6 +1410,12 @@ namespace HaRepacker.GUI
         /// the work starts, release in the awaited completion), so no locking is needed.
         /// </summary>
         private static readonly HashSet<string> msOpensInFlight = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Bumped by "close all files". An async open captured under an older generation throws
+        /// its finished result away instead of re-attaching a file the user just closed.
+        /// </summary>
+        private static int fileOpenGeneration;
 
         /// <summary>
         /// Opens .ms packs with the heavy part (file read, decrypt, entry parse) on worker
@@ -1398,18 +1450,35 @@ namespace HaRepacker.GUI
                 })));
             }
 
+            int generationAtStart = fileOpenGeneration;
             foreach (var (filePath, fullPath, task) in work)
             {
                 try
                 {
                     WzFile wzFile = await task; // back on the UI thread here
+                    if (generationAtStart != fileOpenGeneration)
+                    {
+                        // "Close all" ran while this pack was decrypting - it must not reappear.
+                        wzFile.Dispose();
+                        continue;
+                    }
                     wzFileManager.LoadWzFile(Path.GetFileName(filePath), wzFile); // throws if already loaded
                     AddLoadedWzObjectToMainPanel(wzFile, currentDispatcher);
                 }
                 catch (Exception ex)
                 {
                     // One broken pack costs that pack, not the batch. Same summary as .wz loads.
-                    string reason = ex is AggregateException agg ? (agg.InnerException?.Message ?? agg.Message) : ex.Message;
+                    Exception root = ex is AggregateException agg ? (agg.InnerException ?? agg) : ex;
+                    string reason = root.Message;
+                    // The .ms header key is derived from the file NAME: a renamed pack fails
+                    // exactly here, with this header error. Only that specific failure gets the
+                    // filename hint - a truncated or corrupt pack keeps its raw message.
+                    if (root is System.IO.InvalidDataException
+                        && reason != null && reason.IndexOf("MS file header", StringComparison.OrdinalIgnoreCase) >= 0)
+                    {
+                        reason = "無法開啟這個 .ms 檔案。.ms 的解密金鑰與原始檔名有關；"
+                            + "如果此檔案曾被重新命名，請改回原始檔名後再試。\n    原始錯誤：" + reason;
+                    }
                     failures.Add(Path.GetFileName(filePath) + " - " + reason);
                 }
                 finally
@@ -1730,43 +1799,95 @@ namespace HaRepacker.GUI
         /// <param name="e"></param>
         private void unloadAllToolStripMenuItem_Click(object sender, EventArgs e)
         {
-            if (Warning.Warn(HaRepacker.Properties.Resources.MainUnloadAll))
+            if (!Warning.Warn(HaRepacker.Properties.Resources.MainUnloadAll))
+                return;
+
+            // In-flight async opens (.ms packs) that complete after this point belong to a world
+            // that was closed - the generation check makes them dispose their result instead of
+            // attaching it to an emptied tree.
+            fileOpenGeneration++;
+
+            // The global manager's lists are NOT the source of truth here: a tab can hold an
+            // independent copy of a file another tab also has (LoadWzFileIndependent), and those
+            // are exactly what the old manager-driven sweep left behind. What the user sees open
+            // is the tabs' trees, so that is what gets closed - every tab, not just the active
+            // one, and without ever switching the selected tab around.
+            var alreadyClosed = new HashSet<object>();
+            foreach (object item in tabControl_MainPanels.Items)
             {
-                Dispatcher currentThread = Dispatcher.CurrentDispatcher;
+                if (item is TabItem tab && tab.Content is MainPanel panel)
+                    UnloadAllFilesFromPanel(panel, alreadyClosed);
+            }
 
-                // Unload WZ files if WzFileManager is initialized
-                if (Program.WzFileManager != null)
+            RefreshSelectedWzTypeLabel();
+        }
+
+        /// <summary>
+        /// Closes every root in one tab's tree: WZ files (manager-registered or independent),
+        /// standalone images, and IMG-filesystem directories. One native-tree refresh at the end,
+        /// not one per file.
+        /// </summary>
+        private void UnloadAllFilesFromPanel(MainPanel panel, HashSet<object> alreadyClosed)
+        {
+            panel.CancelBackgroundTreeWork();
+
+            var roots = new List<WzNode>();
+            foreach (System.Windows.Forms.TreeNode treeNode in panel.DataTree.Nodes)
+            {
+                if (treeNode is WzNode wzNode)
+                    roots.Add(wzNode);
+            }
+
+            foreach (WzNode node in roots)
+            {
+                object tag = node.Tag;
+                try
                 {
-                    foreach (WzFile wzFile in Program.WzFileManager.WzFileList)
-                        UnloadWzFile(wzFile, currentThread, false);
-
-                    foreach (WzImage wzImage in Program.WzFileManager.WzImagesList)
-                        UnloadWzImageFile(wzImage, currentThread, false);
-                }
-
-                // Unload VirtualWzDirectory nodes (IMG filesystem)
-                currentThread.Invoke(() =>
-                {
-                    var nodesToRemove = new System.Collections.Generic.List<WzNode>();
-                    foreach (WzNode node in MainPanel.DataTree.Nodes)
+                    if (tag is WzFile wzFile)
                     {
-                        if (node.Tag is MapleLib.Img.VirtualWzDirectory virtualDir)
+                        // Reference-set guard: the same instance must never be disposed twice
+                        // even if it somehow shows up under two roots.
+                        if (alreadyClosed.Add(wzFile))
                         {
-                            // Stop hot-swap watching for this directory
-                            _hotSwapManager?.UnwatchDirectory(virtualDir.FilesystemPath);
+                            // Registered with the manager: normal unload (which disposes).
+                            if (!wzFile.IsUnloaded && !string.IsNullOrEmpty(wzFile.FilePath))
+                                Program.WzFileManager?.UnloadWzFile(wzFile, wzFile.FilePath);
 
-                            virtualDir.Dispose();
-                            nodesToRemove.Add(node);
+                            // Independent instance the manager never matched: still owns a
+                            // stream, still must be released.
+                            if (!wzFile.IsUnloaded)
+                                wzFile.Dispose();
                         }
                     }
-                    foreach (var node in nodesToRemove)
+                    else if (tag is WzImage wzImage)
                     {
-                        node.Remove();
+                        if (alreadyClosed.Add(wzImage))
+                        {
+                            Program.WzFileManager?.UnloadWzImgFile(wzImage);
+                            // A standalone .img the manager doesn't know silently misses the
+                            // unload above; Dispose is null-guarded and safe either way.
+                            wzImage.Dispose();
+                        }
                     }
-
-                    MainPanel.RefreshNativeDataTree();
-                });
+                    else if (tag is MapleLib.Img.VirtualWzDirectory virtualDir)
+                    {
+                        if (alreadyClosed.Add(virtualDir))
+                        {
+                            _hotSwapManager?.UnwatchDirectory(virtualDir.FilesystemPath);
+                            virtualDir.Dispose();
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // One file refusing to close must not leave the rest open.
+                    MapleLib.Helpers.ErrorLogger.Log(MapleLib.Helpers.ErrorLevel.Info,
+                        "Close all: " + node.Text + " - " + ex.Message);
+                }
+                node.Remove();
             }
+
+            panel.ResetViewAfterCloseAll();
         }
 
         /// <summary>

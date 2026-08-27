@@ -35,14 +35,22 @@ namespace HaRepacker
             return new UndoRedoAction(item, parent, UndoRedoType.ObjectRemoved);
         }
 
-        public static UndoRedoAction ObjectRenamed(WzNode parent, WzNode item)
+        /// <summary>
+        /// A rename that can be walked back and forth. Identity is the WzNode/WzObject reference
+        /// itself, never a path - the rename is exactly what changes the path. (The old factory
+        /// here mislabelled renames as ObjectRemoved and had no callers; undoing one would have
+        /// re-ADDED the node.)
+        /// </summary>
+        public static UndoRedoAction ObjectRenamed(WzNode item, string oldName, string newName)
         {
-            return new UndoRedoAction(item, parent, UndoRedoType.ObjectRemoved);
+            return new UndoRedoAction(item, oldName, newName);
         }
         #endregion
 
         public void Undo()
         {
+            if (UndoList.Count == 0)
+                return; // Ctrl+Z with nothing to undo indexed past the end and crashed the app
             UndoRedoBatch action = UndoList[UndoList.Count - 1];
             action.UndoRedo();
             action.SwitchActions();
@@ -52,6 +60,8 @@ namespace HaRepacker
 
         public void Redo()
         {
+            if (RedoList.Count == 0)
+                return;
             UndoRedoBatch action = RedoList[RedoList.Count - 1];
             action.UndoRedo();
             action.SwitchActions();
@@ -81,11 +91,23 @@ namespace HaRepacker
         private readonly WzNode parent;
         private UndoRedoType type;
 
+        // Rename bookkeeping: applying the action puts undoName on; SwitchAction swaps the two.
+        private string undoName;
+        private string redoName;
+
         public UndoRedoAction(WzNode item, WzNode parent, UndoRedoType type)
         {
             this.item = item;
             this.parent = parent;
             this.type = type;
+        }
+
+        public UndoRedoAction(WzNode item, string oldName, string newName)
+        {
+            this.item = item;
+            this.type = UndoRedoType.ObjectRenamed;
+            this.undoName = oldName;
+            this.redoName = newName;
         }
 
         public void UndoRedo()
@@ -97,6 +119,12 @@ namespace HaRepacker
                     break;
                 case UndoRedoType.ObjectRemoved:
                     parent.AddNode(item, true);
+                    break;
+                case UndoRedoType.ObjectRenamed:
+                    // ChangeName writes both the tree text and the WzObject name, and keeps the
+                    // dirty flag honest - undoing a rename is itself a modification. The callers
+                    // of Undo/Redo refresh the native tree, which repaints the WPF header.
+                    item.ChangeName(undoName);
                     break;
             }
         }
@@ -111,6 +139,9 @@ namespace HaRepacker
                     break;
                 case UndoRedoType.ObjectRemoved:
                     type = UndoRedoType.ObjectAdded;
+                    break;
+                case UndoRedoType.ObjectRenamed:
+                    (undoName, redoName) = (redoName, undoName);
                     break;
 
             }
