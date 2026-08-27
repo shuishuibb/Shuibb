@@ -15,8 +15,19 @@ namespace HaRepacker.GUI.WorldMap
     /// </summary>
     public interface IWorldMapMovable
     {
-        /// <summary>The vector actually written when the item is moved.</summary>
+        /// <summary>
+        /// The vector written when the item is moved, or null when the entry has no spot yet.
+        /// Both MapList entries and MapLink entries may legitimately lack one - this repository's
+        /// own codec tracks OriginalHasSpot for both - so a null here is ordinary data, not an
+        /// error. It is created on the first confirmed move; see <see cref="Owner"/>.
+        /// </summary>
         WzVectorProperty Position { get; }
+
+        /// <summary>False while the entry has no spot vector at all.</summary>
+        bool HasPosition { get; }
+
+        /// <summary>The entry the spot belongs under, used to create one when it is missing.</summary>
+        WzSubProperty Owner { get; }
 
         /// <summary>Shown in the inspector title, e.g. "MapList 4" / "MapLink 5".</summary>
         string DisplayName { get; }
@@ -35,7 +46,7 @@ namespace HaRepacker.GUI.WorldMap
         /// <summary>Its name as it appears in the tree ("4").</summary>
         public string EntryName { get; init; }
 
-        /// <summary>Required - an entry without one is not a spot and is skipped.</summary>
+        /// <summary>Null when the entry has no spot yet - see IWorldMapMovable.Position.</summary>
         public WzVectorProperty Spot { get; init; }
 
         /// <summary>Null when the entry has no type; the inspector shows "-" and writes nothing.</summary>
@@ -44,10 +55,12 @@ namespace HaRepacker.GUI.WorldMap
         /// <summary>mapNo children in declaration order. Empty when absent.</summary>
         public IReadOnlyList<WzIntProperty> MapNo { get; init; }
 
-        public int SpotX => Spot.X.Value;
-        public int SpotY => Spot.Y.Value;
+        public int SpotX => Spot?.X.Value ?? 0;
+        public int SpotY => Spot?.Y.Value ?? 0;
 
         public WzVectorProperty Position => Spot;
+        public bool HasPosition => Spot != null;
+        public WzSubProperty Owner => Entry;
         public string DisplayName => "MapList " + EntryName;
     }
 
@@ -70,7 +83,7 @@ namespace HaRepacker.GUI.WorldMap
         public WzSubProperty Entry { get; init; }
         public string EntryName { get; init; }
 
-        /// <summary>Required - an entry without one has no position and is skipped.</summary>
+        /// <summary>Null when the entry has no spot yet - see IWorldMapMovable.Position.</summary>
         public WzVectorProperty Spot { get; init; }
 
         /// <summary>toolTip text, or null when the entry has none.</summary>
@@ -80,11 +93,26 @@ namespace HaRepacker.GUI.WorldMap
         public string LinkMap { get; init; }
 
         /// <summary>
-        /// link\linkImg - the artwork drawn on the world map for this link, or null when the
-        /// entry has none. The real WZ property, not a copy: moving the picture writes back into
-        /// this canvas's own origin.
+        /// The raw link\linkImg property as it appears in the WZ - a canvas, a UOL, or null.
         /// </summary>
-        public WzCanvasProperty LinkImage { get; init; }
+        public WzImageProperty LinkImageSource { get; init; }
+
+        /// <summary>
+        /// The canvas to draw, after following a UOL. Null when there is no artwork or the link
+        /// could not be resolved.
+        /// </summary>
+        public WzCanvasProperty LinkImageDisplay { get; init; }
+
+        /// <summary>
+        /// The canvas whose origin this link may edit - set only when linkImg *is* a canvas of its
+        /// own. A UOL resolves to a canvas that some other entry probably shares, and writing an
+        /// origin there would move every user of it, so those stay display-only until the schema
+        /// proves otherwise.
+        /// </summary>
+        public WzCanvasProperty LinkImageEditable { get; init; }
+
+        /// <summary>Artwork that can be shown but must not be repositioned - a shared UOL target.</summary>
+        public bool IsLinkImageReadOnly => LinkImageDisplay != null && LinkImageEditable == null;
 
         /// <summary>
         /// linkImg's origin vector, or null when it has none. Distinct from
@@ -92,12 +120,14 @@ namespace HaRepacker.GUI.WorldMap
         /// no origin" - the editor has to tell those apart, because it must never create one just
         /// because someone opened the map.
         /// </summary>
-        public WzVectorProperty LinkImageOrigin => LinkImage?["origin"] as WzVectorProperty;
+        public WzVectorProperty LinkImageOrigin => LinkImageEditable?["origin"] as WzVectorProperty;
 
-        public int SpotX => Spot.X.Value;
-        public int SpotY => Spot.Y.Value;
+        public int SpotX => Spot?.X.Value ?? 0;
+        public int SpotY => Spot?.Y.Value ?? 0;
 
         public WzVectorProperty Position => Spot;
+        public bool HasPosition => Spot != null;
+        public WzSubProperty Owner => Entry;
         public string DisplayName => "MapLink " + EntryName;
     }
 
@@ -125,6 +155,13 @@ namespace HaRepacker.GUI.WorldMap
         /// <summary>MapLink entries that have a usable spot. Empty when the image has no MapLink.</summary>
         public IReadOnlyList<WorldMapLink> Links { get; private init; }
 
+        /// <summary>
+        /// MapLink entries skipped because they carry no spot vector. They have no anchor to draw
+        /// or move from, and one is not invented for them - but they are counted so the editor can
+        /// say so rather than silently showing fewer links than the tree does.
+        /// </summary>
+        public int LinksWithoutSpot { get; private init; }
+
         /// <summary>Raw info\parentMap value, or null. Normalize with WorldMapNavigation.</summary>
         public string ParentMap { get; private init; }
 
@@ -138,6 +175,7 @@ namespace HaRepacker.GUI.WorldMap
 
             WzCanvasProperty baseCanvas = ResolveBaseCanvas(image["BaseImg"]);
             var spots = ReadSpots(image["MapList"]);
+            var links = ReadLinks(image["MapLink"], out int linksWithoutSpot);
 
             return new WorldMapDocument
             {
@@ -146,7 +184,8 @@ namespace HaRepacker.GUI.WorldMap
                 BaseCanvas = baseCanvas,
                 BaseOrigin = baseCanvas == null ? new PointF(0f, 0f) : baseCanvas.GetCanvasOriginPosition(),
                 Spots = spots,
-                Links = ReadLinks(image["MapLink"]),
+                Links = links,
+                LinksWithoutSpot = linksWithoutSpot,
                 ParentMap = (image["info"] as IPropertyContainer)?["parentMap"].ReadString(null),
                 Warning = baseCanvas == null ? "無法取得 BaseImg" : null
             };
@@ -219,8 +258,11 @@ namespace HaRepacker.GUI.WorldMap
             {
                 if (child is not WzSubProperty entry)
                     continue;
-                if (entry["spot"] is not WzVectorProperty spot)
-                    continue;
+
+                // A missing spot is ordinary data, not a reason to hide the entry: it is shown at
+                // a placeholder position and gets a real spot the first time the user confirms a
+                // move. Skipping these is what made most of WorldMap082's entries undraggable.
+                var spot = entry["spot"] as WzVectorProperty;
 
                 var mapNo = new List<WzIntProperty>();
                 if (entry["mapNo"] is IPropertyContainer mapNoContainer)
@@ -251,9 +293,10 @@ namespace HaRepacker.GUI.WorldMap
         /// vector has no position that could be drawn or dragged, so it is skipped - guessing one
         /// would risk writing a coordinate into the wrong property.
         /// </summary>
-        private static List<WorldMapLink> ReadLinks(WzImageProperty mapLink)
+        private static List<WorldMapLink> ReadLinks(WzImageProperty mapLink, out int withoutSpot)
         {
             var links = new List<WorldMapLink>();
+            withoutSpot = 0;
             if (mapLink is not IPropertyContainer container)
                 return links;
 
@@ -261,10 +304,17 @@ namespace HaRepacker.GUI.WorldMap
             {
                 if (child is not WzSubProperty entry)
                     continue;
-                if (entry["spot"] is not WzVectorProperty spot)
-                    continue;
+
+                // As with MapList, a MapLink without a spot is still shown and still movable -
+                // the spot is created on the first confirmed move.
+                var spot = entry["spot"] as WzVectorProperty;
+                if (spot == null)
+                    withoutSpot++;
 
                 var nested = entry["link"] as IPropertyContainer;
+                WzImageProperty linkImageSource = nested?["linkImg"];
+                ResolveLinkImageCanvas(linkImageSource, out WzCanvasProperty display, out WzCanvasProperty editable);
+
                 links.Add(new WorldMapLink
                 {
                     Entry = entry,
@@ -272,12 +322,40 @@ namespace HaRepacker.GUI.WorldMap
                     Spot = spot,
                     ToolTip = entry["toolTip"].ReadString(null),
                     LinkMap = nested?["linkMap"].ReadString(null),
-                    // Only a real canvas counts; anything else leaves the link marker-only.
-                    LinkImage = nested?["linkImg"] as WzCanvasProperty
+                    LinkImageSource = linkImageSource,
+                    LinkImageDisplay = display,
+                    LinkImageEditable = editable
                 });
             }
 
             return links;
+        }
+
+        /// <summary>
+        /// Works out what to draw for a linkImg property, and whether this link owns it.
+        ///
+        /// A plain canvas is both drawable and editable. A UOL is followed so the artwork can
+        /// still be shown, but the canvas it lands on is very likely shared with other entries -
+        /// writing an origin into it would silently move all of them - so it comes back
+        /// display-only. Nothing else is accepted, and the WZ is never searched for a substitute.
+        /// </summary>
+        public static void ResolveLinkImageCanvas(WzImageProperty linkImage,
+            out WzCanvasProperty display, out WzCanvasProperty editable)
+        {
+            display = null;
+            editable = null;
+            if (linkImage == null)
+                return;
+
+            if (linkImage is WzCanvasProperty canvas)
+            {
+                display = canvas;
+                editable = canvas;
+                return;
+            }
+
+            if (linkImage is WzUOLProperty uol)
+                display = ResolveUolToCanvas(uol);
         }
 
         /// <summary>Every mapNo value in this image, for the forward-navigation match.</summary>
@@ -315,11 +393,15 @@ namespace HaRepacker.GUI.WorldMap
     /// Where a MapLink's linkImg artwork sits, and what its origin has to become when the user
     /// drags it somewhere else.
     ///
+    /// linkImg is positioned entirely by its own origin - **not** by the link's spot. The two are
+    /// separate things: spot is the link's point on the map, linkImg/origin places the picture.
+    /// So the anchor here is the world's zero point, which in canvas space is BaseImg's origin;
+    /// moving a link's spot does not move its picture.
+    ///
     /// A WZ canvas origin is the anchor point *inside* the bitmap, so the picture's top-left is
     /// the anchor minus the origin - the same convention this codebase already draws with
     /// (HaRepacker\FHMapper\FHMapper.cs: DrawImage(bmp, x - origin.X, y - origin.Y), and
-    /// AnimationBuilder's Size - origin). The anchor for a link is its own spot, converted into
-    /// canvas space.
+    /// AnimationBuilder's Size - origin).
     ///
     /// The consequence to keep straight: dragging the picture right by 20 lowers origin.X by 20.
     /// Both directions live here so no mouse handler ever open-codes that sign and inverts the
@@ -368,6 +450,151 @@ namespace HaRepacker.GUI.WorldMap
         public void Remove(TKey key) => pending.Remove(key);
 
         public void Clear() => pending.Clear();
+    }
+
+    /// <summary>
+    /// Creating a spot vector for an entry that has none yet.
+    /// </summary>
+    public static class WorldMapSpotFactory
+    {
+        /// <summary>
+        /// Adds a spot holding the given coordinates to the entry and dirties its image. Returns
+        /// the new vector, or null when there is no entry or one already exists.
+        ///
+        /// Only ever called from 確認修改: the position it stores is where the user actually
+        /// dropped the marker, so nothing is being guessed on their behalf. Independent of the
+        /// tree, because whether that branch happens to be expanded has nothing to do with
+        /// whether the WZ can be edited.
+        /// </summary>
+        public static WzVectorProperty Create(WzSubProperty entry, int x, int y)
+        {
+            if (entry == null || entry["spot"] != null)
+                return null;
+
+            var spot = new WzVectorProperty("spot", new WzIntProperty("x", x), new WzIntProperty("y", y));
+            entry.AddProperty(spot);
+            if (spot.ParentImage != null)
+                spot.ParentImage.Changed = true;
+            return spot;
+        }
+    }
+
+    /// <summary>
+    /// Where to park entries that have no spot yet.
+    ///
+    /// Their stored position is effectively (0,0) - that is what this repository's codec reads a
+    /// missing spot as - so they would all pile onto one pixel and be impossible to tell apart.
+    /// Fanning them into a small grid is a display decision only: nothing is written, and whatever
+    /// the user drags one to is what gets stored.
+    /// </summary>
+    public static class WorldMapPlaceholderLayout
+    {
+        public const int Columns = 8;
+        public const int Step = 20;
+
+        public static (int X, int Y) PositionFor(int index)
+        {
+            if (index < 0)
+                index = 0;
+            return ((index % Columns) * Step, (index / Columns) * Step);
+        }
+    }
+
+    /// <summary>
+    /// Creating a linkImg origin that does not exist yet.
+    /// </summary>
+    public static class WorldMapLinkImageOrigin
+    {
+        /// <summary>
+        /// Adds an origin holding the given values to the canvas and dirties its image. Returns
+        /// the new vector, or null when there is no canvas or one already exists.
+        ///
+        /// Created with its final values rather than (0,0)-then-edited, so confirming a preview is
+        /// a single change instead of a create plus an immediate correction.
+        ///
+        /// Deliberately independent of the tree: the canvas is the real data, and whether the user
+        /// happens to have expanded that branch has nothing to do with whether the WZ can be
+        /// edited.
+        /// </summary>
+        public static WzVectorProperty Create(WzCanvasProperty canvas, int x, int y)
+        {
+            if (canvas == null || canvas["origin"] != null)
+                return null;
+
+            var origin = new WzVectorProperty("origin", new WzIntProperty("x", x), new WzIntProperty("y", y));
+            canvas.AddProperty(origin);
+            if (origin.ParentImage != null)
+                origin.ParentImage.Changed = true;
+            return origin;
+        }
+    }
+
+    /// <summary>
+    /// Per-pixel opacity for one piece of artwork, taken once when it is drawn.
+    ///
+    /// A WPF Image hit-tests as a plain rectangle, so a mostly-transparent picture swallows clicks
+    /// meant for whatever sits underneath it - which is why some link images could never be
+    /// grabbed. Testing the actual pixel instead lets a click fall through transparent areas.
+    /// </summary>
+    public sealed class WorldMapAlphaMask
+    {
+        /// <summary>Below this an edge pixel counts as transparent rather than a grab handle.</summary>
+        public const byte OpaqueThreshold = 8;
+
+        private readonly byte[] alpha;
+
+        public int Width { get; }
+        public int Height { get; }
+
+        public WorldMapAlphaMask(int width, int height, byte[] alpha)
+        {
+            Width = width;
+            Height = height;
+            this.alpha = alpha;
+        }
+
+        /// <summary>True when the pixel at this offset inside the artwork can be grabbed.</summary>
+        public bool IsOpaqueAt(double localX, double localY)
+        {
+            if (alpha == null)
+                return false;
+
+            int x = (int)Math.Floor(localX);
+            int y = (int)Math.Floor(localY);
+            if (x < 0 || y < 0 || x >= Width || y >= Height)
+                return false;
+
+            int index = y * Width + x;
+            return index >= 0 && index < alpha.Length && alpha[index] >= OpaqueThreshold;
+        }
+    }
+
+    /// <summary>
+    /// Picks which piece of artwork a click landed on.
+    /// </summary>
+    public static class WorldMapLinkImageHitTester
+    {
+        /// <summary>
+        /// The index of the topmost artwork whose pixel under (x, y) is opaque, or -1.
+        /// Candidates must be ordered topmost first; transparent pixels fall through to whatever
+        /// is beneath, so a big transparent frame never steals a click from the picture below it.
+        /// </summary>
+        public static int PickTopMost(
+            IReadOnlyList<(double Left, double Top, WorldMapAlphaMask Mask)> candidatesTopFirst, double x, double y)
+        {
+            if (candidatesTopFirst == null)
+                return -1;
+
+            for (int index = 0; index < candidatesTopFirst.Count; index++)
+            {
+                (double left, double top, WorldMapAlphaMask mask) = candidatesTopFirst[index];
+                if (mask == null)
+                    continue;
+                if (mask.IsOpaqueAt(x - left, y - top))
+                    return index;
+            }
+            return -1;
+        }
     }
 
     /// <summary>

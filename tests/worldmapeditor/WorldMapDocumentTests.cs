@@ -112,19 +112,85 @@ public sealed class WorldMapDocumentTests
     }
 
     [Fact]
-    public void Load_EntryWithoutSpot_IsSkippedRatherThanCrashing()
+    public void Load_EntryWithoutSpot_IsStillListedAndMovable()
     {
+        // A MapList entry may legitimately have no spot - this repository's own codec tracks
+        // OriginalHasSpot for exactly that. Dropping them is what made most of WorldMap082's
+        // entries invisible and undraggable, so they are kept, flagged, and given a spot on the
+        // first confirmed move.
         WzImage image = MakeWorldMapImage("WorldMap000.img", "WorldMap", new PointF(0f, 0f),
             ("0", 1, 2, 0, null));
 
-        // A MapList child carrying only a type - nothing to draw.
         var stray = new WzSubProperty("1");
         stray.AddProperty(new WzIntProperty("type", 3));
         ((WzSubProperty)image["MapList"]).AddProperty(stray);
 
         WorldMapDocument document = WorldMapDocument.Load(image);
 
-        Assert.Equal("0", Assert.Single(document.Spots).EntryName);
+        Assert.Equal(new[] { "0", "1" }, document.Spots.Select(s => s.EntryName).ToArray());
+
+        WorldMapSpot placed = document.Spots[0];
+        WorldMapSpot unplaced = document.Spots[1];
+        Assert.True(placed.HasPosition);
+        Assert.False(unplaced.HasPosition);
+        Assert.Null(unplaced.Position);
+        Assert.Same(stray, unplaced.Owner); // where a spot would be created
+        Assert.False(image.Changed);        // and looking at it creates nothing
+    }
+
+    [Fact]
+    public void ConfirmingAMoveOnASpotlessEntry_CreatesTheSpotWhereItWasDropped()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap000.img", null, new PointF(0f, 0f));
+        var entry = new WzSubProperty("0");
+        entry.AddProperty(new WzIntProperty("type", 1));
+        ((WzSubProperty)image["MapList"]).AddProperty(entry);
+        image.Changed = false;
+
+        WorldMapSpot spot = Assert.Single(WorldMapDocument.Load(image).Spots);
+        var pending = new WorldMapPendingPositions<IWorldMapMovable>();
+
+        // Dragged - preview only, nothing created yet.
+        pending.Stage(spot, 120, -35);
+        Assert.Null(entry["spot"]);
+        Assert.False(image.Changed);
+
+        // 確認修改
+        WzVectorProperty created = WorldMapSpotFactory.Create(spot.Owner, 120, -35);
+        pending.Clear();
+
+        Assert.NotNull(created);
+        Assert.Equal((120, -35), (created.X.Value, created.Y.Value));
+        Assert.Same(created, entry["spot"]);
+        Assert.True(image.Changed);
+
+        // Re-reading now sees a normal, positioned entry.
+        WorldMapSpot reloaded = Assert.Single(WorldMapDocument.Load(image).Spots);
+        Assert.True(reloaded.HasPosition);
+        Assert.Equal(120, reloaded.SpotX);
+    }
+
+    [Fact]
+    public void SpotFactory_RefusesWhenOneAlreadyExistsOrThereIsNoEntry()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap000.img", null, new PointF(0f, 0f), ("0", 10, 20, 0, null));
+        WorldMapSpot spot = Assert.Single(WorldMapDocument.Load(image).Spots);
+
+        Assert.Null(WorldMapSpotFactory.Create(spot.Owner, 1, 2)); // already has one
+        Assert.Null(WorldMapSpotFactory.Create(null, 1, 2));
+        Assert.Equal(10, spot.SpotX); // existing one untouched
+    }
+
+    [Fact]
+    public void PlaceholderLayout_FansSpotlessEntriesOutInsteadOfStackingThem()
+    {
+        // Their stored position reads as (0,0), so without this they would all sit on one pixel
+        // and be impossible to pick apart. Display only - nothing is written.
+        Assert.Equal((0, 0), WorldMapPlaceholderLayout.PositionFor(0));
+        Assert.NotEqual(WorldMapPlaceholderLayout.PositionFor(0), WorldMapPlaceholderLayout.PositionFor(1));
+        Assert.Equal((0, WorldMapPlaceholderLayout.Step),
+            WorldMapPlaceholderLayout.PositionFor(WorldMapPlaceholderLayout.Columns));
+        Assert.Equal((0, 0), WorldMapPlaceholderLayout.PositionFor(-5)); // defensive
     }
 
     [Fact]
@@ -500,12 +566,17 @@ public sealed class WorldMapDocumentTests
     }
 
     [Fact]
-    public void Load_MapLinkWithoutSpot_IsSkippedRatherThanGivenAGuessedPosition()
+    public void Load_MapLinkWithoutSpot_IsStillListedAndMovable()
     {
         WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(0f, 0f), ("0", 1, 2, 0, null));
         AddMapLink(image, "5", x: null, y: null, toolTip: "no position", linkMap: "WorldMap020");
 
-        Assert.Empty(WorldMapDocument.Load(image).Links);
+        WorldMapLink link = Assert.Single(WorldMapDocument.Load(image).Links);
+
+        Assert.False(link.HasPosition);
+        Assert.Null(link.Position);
+        Assert.Equal("WorldMap020", link.LinkMap); // the rest of the entry is still readable
+        Assert.False(image.Changed);               // and nothing is created by looking
     }
 
     [Fact]
@@ -599,7 +670,10 @@ public sealed class WorldMapDocumentTests
         WorldMapLink link = Assert.Single(WorldMapDocument.Load(image).Links);
 
         // The real property, not a copy - editing the origin has to write back into this canvas.
-        Assert.Same(canvas, link.LinkImage);
+        // A plain canvas is both drawable and editable.
+        Assert.Same(canvas, link.LinkImageDisplay);
+        Assert.Same(canvas, link.LinkImageEditable);
+        Assert.False(link.IsLinkImageReadOnly);
         Assert.Equal(20, link.LinkImageOrigin.X.Value);
         Assert.Equal(10, link.LinkImageOrigin.Y.Value);
     }
@@ -612,9 +686,11 @@ public sealed class WorldMapDocumentTests
 
         WorldMapLink link = Assert.Single(WorldMapDocument.Load(image).Links);
 
-        Assert.Null(link.LinkImage);
+        Assert.Null(link.LinkImageSource);
+        Assert.Null(link.LinkImageDisplay);
         Assert.Null(link.LinkImageOrigin);
-        Assert.Equal(100, link.SpotX); // the marker still works
+        Assert.False(link.IsLinkImageReadOnly); // nothing to show is not the same as read-only
+        Assert.Equal(100, link.SpotX);          // the marker still works
     }
 
     [Fact]
@@ -722,17 +798,43 @@ public sealed class WorldMapDocumentTests
         Assert.True(image.Changed);
     }
 
+    /// <summary>
+    /// Where the panel draws a link's artwork: anchored at the world's zero point (BaseImg's
+    /// origin) and offset by linkImg's own origin. The link's spot is deliberately not involved.
+    /// </summary>
+    private static (double Left, double Top) ArtworkPosition(PointF baseOrigin, WorldMapLink link)
+        => WorldMapLinkImagePlacement.ToCanvasPosition(
+            WorldMapCoordinateConverter.WorldToCanvas(baseOrigin, 0, 0),
+            link.LinkImageOrigin.X.Value, link.LinkImageOrigin.Y.Value);
+
     [Fact]
-    public void MovingTheLinkSpot_LeavesTheArtworkOriginAlone_ButItsAnchorMoves()
+    public void ArtworkIsPlacedByItsOwnOrigin_NotByTheLinkSpot()
+    {
+        // Two links with the same linkImg origin but very different spots must draw their
+        // artwork in the same place - the spot plays no part in placement.
+        WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(320f, 235f), ("0", 1, 2, 0, null));
+        AddMapLink(image, "0", 100, 50, null, null);
+        AddLinkImage(image, "0", 20, 10);
+        AddMapLink(image, "1", -400, 900, null, null);
+        AddLinkImage(image, "1", 20, 10);
+
+        IReadOnlyList<WorldMapLink> links = WorldMapDocument.Load(image).Links;
+
+        Assert.Equal(ArtworkPosition(new PointF(320f, 235f), links[0]),
+                     ArtworkPosition(new PointF(320f, 235f), links[1]));
+        // ...and that place is the base origin offset by linkImg's origin.
+        Assert.Equal((300.0, 225.0), ArtworkPosition(new PointF(320f, 235f), links[0]));
+    }
+
+    [Fact]
+    public void MovingTheLinkSpot_LeavesBothTheArtworkOriginAndItsPositionAlone()
     {
         WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(0f, 0f), ("0", 1, 2, 0, null));
         AddMapLink(image, "0", 100, 50, null, null);
         AddLinkImage(image, "0", 20, 10);
         WorldMapLink link = Assert.Single(WorldMapDocument.Load(image).Links);
 
-        (double beforeLeft, double beforeTop) = WorldMapLinkImagePlacement.ToCanvasPosition(
-            WorldMapCoordinateConverter.WorldToCanvas(new PointF(0f, 0f), link.SpotX, link.SpotY),
-            link.LinkImageOrigin.X.Value, link.LinkImageOrigin.Y.Value);
+        (double Left, double Top) before = ArtworkPosition(new PointF(0f, 0f), link);
 
         // What CommitDrag performs for a MapLink marker.
         link.Position.X.Value = 140;
@@ -741,14 +843,8 @@ public sealed class WorldMapDocumentTests
 
         Assert.Equal(20, link.LinkImageOrigin.X.Value); // origin value unchanged
         Assert.Equal(10, link.LinkImageOrigin.Y.Value);
-
-        (double afterLeft, double afterTop) = WorldMapLinkImagePlacement.ToCanvasPosition(
-            WorldMapCoordinateConverter.WorldToCanvas(new PointF(0f, 0f), link.SpotX, link.SpotY),
-            link.LinkImageOrigin.X.Value, link.LinkImageOrigin.Y.Value);
-
-        // ...but the artwork follows the anchor by the same 40px the spot moved.
-        Assert.Equal(beforeLeft + 40.0, afterLeft);
-        Assert.Equal(beforeTop, afterTop);
+        // ...and the artwork does not move either: dragging the spot moves only the marker.
+        Assert.Equal(before, ArtworkPosition(new PointF(0f, 0f), link));
     }
 
     [Fact]
@@ -763,7 +859,7 @@ public sealed class WorldMapDocumentTests
         WorldMapDocument document = WorldMapDocument.Load(image);
         WorldMapLink link = Assert.Single(document.Links);
 
-        Assert.NotNull(link.LinkImage);
+        Assert.NotNull(link.LinkImageDisplay);
         Assert.Equal(100, link.SpotX);
         Assert.Equal("WorldMap050", link.LinkMap);
         Assert.False(image.Changed);
@@ -859,6 +955,276 @@ public sealed class WorldMapDocumentTests
         Assert.Equal("1", name);
         WorldMapSpot reloaded = Assert.Single(WorldMapDocument.Load(image).Spots);
         Assert.Equal(new[] { 240010300, 0 }, reloaded.MapNo.Select(m => m.Value).ToArray());
+    }
+
+    // ---- linkImg resolver: direct canvas vs shared UOL --------------------------------------------
+
+    [Fact]
+    public void ResolveLinkImageCanvas_ADirectCanvasIsBothDrawableAndEditable()
+    {
+        var canvas = new WzCanvasProperty("linkImg");
+
+        WorldMapDocument.ResolveLinkImageCanvas(canvas, out WzCanvasProperty display, out WzCanvasProperty editable);
+
+        Assert.Same(canvas, display);
+        Assert.Same(canvas, editable);
+    }
+
+    [Fact]
+    public void ResolveLinkImageCanvas_AUolResolvesForDisplayButStaysReadOnly()
+    {
+        // The UOL target is very likely shared with other entries, so writing an origin into it
+        // would move all of them - it comes back display-only.
+        var image = new WzImage("WorldMap010.img");
+        var shared = new WzCanvasProperty("shared");
+        image.AddProperty(shared);
+        var uol = new WzUOLProperty("linkImg", "shared");
+        image.AddProperty(uol);
+
+        WorldMapDocument.ResolveLinkImageCanvas(uol, out WzCanvasProperty display, out WzCanvasProperty editable);
+
+        Assert.Same(shared, display);
+        Assert.Null(editable);
+    }
+
+    [Fact]
+    public void AUolLinkImage_IsReportedReadOnlyAndExposesNoEditableOrigin()
+    {
+        var image = new WzImage("WorldMap010.img");
+        var shared = new WzCanvasProperty("shared");
+        shared.AddProperty(new WzVectorProperty("origin", new WzIntProperty("x", 7), new WzIntProperty("y", 9)));
+        image.AddProperty(shared);
+
+        var mapList = new WzSubProperty("MapList");
+        image.AddProperty(mapList);
+        var links = new WzSubProperty("MapLink");
+        var entry = new WzSubProperty("0");
+        entry.AddProperty(new WzVectorProperty("spot", new WzIntProperty("x", 10), new WzIntProperty("y", 20)));
+        var nested = new WzSubProperty("link");
+        nested.AddProperty(new WzUOLProperty("linkImg", "../../../shared"));
+        entry.AddProperty(nested);
+        links.AddProperty(entry);
+        image.AddProperty(links);
+        image.Changed = false;
+
+        WorldMapLink link = Assert.Single(WorldMapDocument.Load(image).Links);
+
+        Assert.True(link.IsLinkImageReadOnly);
+        // The shared canvas's own origin must not be presented as this link's editable one.
+        Assert.Null(link.LinkImageOrigin);
+        Assert.Equal(7, ((WzVectorProperty)shared["origin"]).X.Value); // untouched
+        Assert.False(image.Changed);
+    }
+
+    [Fact]
+    public void MapLinkWithoutSpot_IsCountedAndStillShown()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(0f, 0f), ("0", 1, 2, 0, null));
+        AddMapLink(image, "0", 100, 50, null, null);
+        AddMapLink(image, "1", x: null, y: null, toolTip: "no spot", linkMap: null);
+
+        WorldMapDocument document = WorldMapDocument.Load(image);
+
+        Assert.Equal(2, document.Links.Count);       // both listed, neither hidden
+        Assert.Equal(1, document.LinksWithoutSpot);  // and the unplaced one is reported
+        Assert.True(document.Links[0].HasPosition);
+        Assert.False(document.Links[1].HasPosition);
+        Assert.False(image.Changed);                 // no spot invented for it
+    }
+
+    [Fact]
+    public void ConfirmingAMoveOnASpotlessMapLink_CreatesTheSpotWhereItWasDropped()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(0f, 0f), ("0", 1, 2, 0, null));
+        AddMapLink(image, "5", x: null, y: null, toolTip: null, linkMap: "WorldMap020");
+        WorldMapLink link = Assert.Single(WorldMapDocument.Load(image).Links);
+        var pending = new WorldMapPendingPositions<IWorldMapMovable>();
+
+        pending.Stage(link, 88, -12);
+        Assert.Null(link.Owner["spot"]);
+        Assert.False(image.Changed);
+
+        WzVectorProperty created = WorldMapSpotFactory.Create(link.Owner, 88, -12);
+        pending.Clear();
+
+        Assert.Equal((88, -12), (created.X.Value, created.Y.Value));
+        Assert.True(image.Changed);
+        Assert.True(Assert.Single(WorldMapDocument.Load(image).Links).HasPosition);
+    }
+
+    // ---- creating a missing linkImg origin --------------------------------------------------------
+
+    [Fact]
+    public void CreatingAnOrigin_DoesNotNeedAMaterialisedTreeNode()
+    {
+        // The bug: origin creation used to demand linkImg.HRTag, so a MapLink the user had never
+        // expanded in the tree could not be moved at all.
+        WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(0f, 0f), ("0", 1, 2, 0, null));
+        AddMapLink(image, "0", 100, 50, null, null);
+        WzCanvasProperty canvas = AddLinkImage(image, "0", originX: null, originY: null);
+        WorldMapLink link = Assert.Single(WorldMapDocument.Load(image).Links);
+
+        Assert.Null(canvas.HRTag); // never expanded - which must not matter
+        Assert.Null(link.LinkImageOrigin);
+
+        WzVectorProperty created = WorldMapLinkImageOrigin.Create(link.LinkImageEditable, -20, 50);
+
+        Assert.NotNull(created);
+        Assert.Equal(-20, created.X.Value);
+        Assert.Equal(50, created.Y.Value);
+        Assert.Same(created, link.LinkImageOrigin);
+        Assert.True(image.Changed);
+    }
+
+    [Fact]
+    public void CreatingAnOrigin_UsesTheConfirmedValuesDirectly_NotZeroThenCorrected()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(0f, 0f), ("0", 1, 2, 0, null));
+        AddMapLink(image, "0", 100, 50, null, null);
+        AddLinkImage(image, "0", originX: null, originY: null);
+        WorldMapLink link = Assert.Single(WorldMapDocument.Load(image).Links);
+
+        WzVectorProperty created = WorldMapLinkImageOrigin.Create(link.LinkImageEditable, 33, -44);
+
+        // Born correct, so a following Apply has nothing left to do.
+        Assert.Equal((33, -44), (created.X.Value, created.Y.Value));
+        Assert.False(WorldMapPositionCommit.Apply(created, 33, -44));
+    }
+
+    [Fact]
+    public void CreatingAnOrigin_RefusesWhenOneAlreadyExistsOrThereIsNoCanvas()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(0f, 0f), ("0", 1, 2, 0, null));
+        AddMapLink(image, "0", 100, 50, null, null);
+        AddLinkImage(image, "0", 20, 10);
+        WorldMapLink link = Assert.Single(WorldMapDocument.Load(image).Links);
+
+        Assert.Null(WorldMapLinkImageOrigin.Create(link.LinkImageEditable, 1, 2)); // already has one
+        Assert.Null(WorldMapLinkImageOrigin.Create(null, 1, 2));
+        Assert.Equal(20, link.LinkImageOrigin.X.Value); // existing one left alone
+    }
+
+    [Fact]
+    public void MissingOrigin_PreviewAloneCreatesNothing()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(0f, 0f), ("0", 1, 2, 0, null));
+        AddMapLink(image, "0", 100, 50, null, null);
+        WzCanvasProperty canvas = AddLinkImage(image, "0", originX: null, originY: null);
+        WorldMapLink link = Assert.Single(WorldMapDocument.Load(image).Links);
+        var pending = new WorldMapPendingPositions<WorldMapLink>();
+
+        pending.Stage(link, -20, 50); // dragged, not confirmed
+
+        Assert.Null(canvas["origin"]);
+        Assert.False(image.Changed);
+        // ...but the picture is drawn at the previewed origin.
+        Assert.Equal((-20, 50), pending.Effective(link, 0, 0));
+    }
+
+    [Fact]
+    public void MissingOrigin_DiscardingThePreviewStillCreatesNothing()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(0f, 0f), ("0", 1, 2, 0, null));
+        AddMapLink(image, "0", 100, 50, null, null);
+        WzCanvasProperty canvas = AddLinkImage(image, "0", originX: null, originY: null);
+        WorldMapLink link = Assert.Single(WorldMapDocument.Load(image).Links);
+        var pending = new WorldMapPendingPositions<WorldMapLink>();
+
+        pending.Stage(link, -20, 50);
+        pending.Clear(); // 重設視圖 / navigating away
+
+        Assert.Null(canvas["origin"]);
+        Assert.False(image.Changed);
+        Assert.Equal(0, pending.Count);
+    }
+
+    // ---- alpha hit test ---------------------------------------------------------------------------
+
+    /// <summary>A mask whose left half is transparent and right half opaque.</summary>
+    private static WorldMapAlphaMask HalfTransparentMask(int width, int height)
+    {
+        var alpha = new byte[width * height];
+        for (int y = 0; y < height; y++)
+        {
+            for (int x = 0; x < width; x++)
+                alpha[y * width + x] = x < width / 2 ? (byte)0 : (byte)255;
+        }
+        return new WorldMapAlphaMask(width, height, alpha);
+    }
+
+    [Fact]
+    public void AlphaMask_TransparentPixelIsNotAGrabHandle()
+    {
+        WorldMapAlphaMask mask = HalfTransparentMask(10, 10);
+
+        Assert.False(mask.IsOpaqueAt(2.0, 5.0)); // transparent half
+        Assert.True(mask.IsOpaqueAt(7.0, 5.0));  // opaque half
+    }
+
+    [Fact]
+    public void AlphaMask_OutsideTheBitmapIsNeverAHit()
+    {
+        WorldMapAlphaMask mask = HalfTransparentMask(10, 10);
+
+        Assert.False(mask.IsOpaqueAt(-1.0, 5.0));
+        Assert.False(mask.IsOpaqueAt(10.0, 5.0));
+        Assert.False(mask.IsOpaqueAt(5.0, -1.0));
+        Assert.False(mask.IsOpaqueAt(5.0, 10.0));
+    }
+
+    [Fact]
+    public void HitTest_ATransparentTopImageFallsThroughToTheOneBelow()
+    {
+        // The reported symptom: a big mostly-transparent linkImg made the picture underneath
+        // impossible to grab, because a WPF Image hit-tests as a plain rectangle.
+        var top = HalfTransparentMask(10, 10);
+        var bottom = HalfTransparentMask(10, 10);
+        var candidates = new List<(double Left, double Top, WorldMapAlphaMask Mask)>
+        {
+            (0.0, 0.0, top),    // topmost first
+            (-5.0, 0.0, bottom) // shifted so its opaque half sits under top's transparent half
+        };
+
+        // (2,5) is transparent on top, but opaque on bottom (local x = 7).
+        Assert.Equal(1, WorldMapLinkImageHitTester.PickTopMost(candidates, 2.0, 5.0));
+    }
+
+    [Fact]
+    public void HitTest_WhenBothAreOpaqueTheTopMostWins()
+    {
+        var top = HalfTransparentMask(10, 10);
+        var bottom = HalfTransparentMask(10, 10);
+        var candidates = new List<(double Left, double Top, WorldMapAlphaMask Mask)>
+        {
+            (0.0, 0.0, top),
+            (0.0, 0.0, bottom)
+        };
+
+        Assert.Equal(0, WorldMapLinkImageHitTester.PickTopMost(candidates, 7.0, 5.0));
+    }
+
+    [Fact]
+    public void HitTest_NothingOpaqueUnderThePointerMeansNoHit_SoTheClickPans()
+    {
+        var candidates = new List<(double Left, double Top, WorldMapAlphaMask Mask)>
+        {
+            (0.0, 0.0, HalfTransparentMask(10, 10))
+        };
+
+        Assert.Equal(-1, WorldMapLinkImageHitTester.PickTopMost(candidates, 2.0, 5.0));  // transparent
+        Assert.Equal(-1, WorldMapLinkImageHitTester.PickTopMost(candidates, 50.0, 50.0)); // outside
+    }
+
+    [Fact]
+    public void HitTest_ImagesWithoutAMaskAreSkippedNotCrashedOn()
+    {
+        var candidates = new List<(double Left, double Top, WorldMapAlphaMask Mask)>
+        {
+            (0.0, 0.0, null), // undecodable artwork
+            (0.0, 0.0, HalfTransparentMask(10, 10))
+        };
+
+        Assert.Equal(1, WorldMapLinkImageHitTester.PickTopMost(candidates, 7.0, 5.0));
     }
 
     // ---- pending positions (preview / 確認修改) --------------------------------------------------
