@@ -101,6 +101,16 @@ namespace MapleLib {
         private readonly Dictionary<string, WzMainDirectory> _wzDirs = new(StringComparer.OrdinalIgnoreCase);
         private readonly object _canvasSectionLoadLock = new();
 
+        /// <summary>
+        /// How many _canvas_NNN.wz shards LoadCanvasSection may parse concurrently. Default 1
+        /// (sequential): the DoP sweep on real data (B client, Mob = 95 shards) measured a cold
+        /// section load at ~28 ms sequential - the shards are only directory tables until their
+        /// images are actually touched - so parallel parsing buys nothing measurable there and
+        /// the sequential path stays the simplest correct one. The knob exists for the
+        /// benchmark harness and for genuinely slow disks.
+        /// </summary>
+        public static int CanvasSectionLoadParallelism = 1;
+
         private readonly Dictionary<string, WzImage> _wzImages = new(StringComparer.OrdinalIgnoreCase); // The raw wz images loaded in memory.. Hotfix Data.wz or raw .img
         private readonly Dictionary<WzImage, bool> _wzImagesUpdated = [];
 
@@ -917,12 +927,66 @@ namespace MapleLib {
                 // would become "_canvas_0100" and silently fail to load, leaving every canvas
                 // stored in files 100 and above unreachable.
                 string canvasFileBase = string.Format(@"{0}/{1}/{2}_", canvasFolder, CANVAS_DIRECTORY_NAME.ToLower(), CANVAS_DIRECTORY_NAME.ToLower()); // "map/_canvas/_canvas_"
+                List<string> shardsToLoad = new List<string>();
                 for (int canvasNumber = 0; canvasNumber <= wzFileIndex; canvasNumber++)
                 {
                     string canvasFileBase_ = string.Format("{0}{1:D3}", canvasFileBase, canvasNumber); // "map/_canvas/_canvas_001.wz"
                     if (!IsWzFileLoaded(canvasFileBase_))
+                        shardsToLoad.Add(canvasFileBase_);
+                }
+
+                // One corrupt shard costs that shard's canvases (their outlinks stay unresolved),
+                // not the whole section - and not an exception out of whatever resolve triggered
+                // this load. The section is still flagged loaded below either way, so a broken
+                // shard is not re-parsed on every single resolve.
+                int parallelism = Math.Max(1, CanvasSectionLoadParallelism);
+                if (parallelism <= 1 || shardsToLoad.Count <= 1)
+                {
+                    foreach (string shardName in shardsToLoad)
                     {
-                        WzFile loadedWzFile = LoadWzFile(canvasFileBase_, encVersion);
+                        try
+                        {
+                            LoadWzFile(shardName, encVersion);
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"[LoadCanvasSection] shard '{shardName}' failed to load: {ex.Message}");
+                        }
+                    }
+                }
+                else
+                {
+                    // Parse in parallel - each shard is its own physical file with its own
+                    // reader/stream/key, the same isolation MainForm's batch open already relies
+                    // on - then register sequentially in filename order so the manager's visible
+                    // order stays exactly what the sequential loop produced.
+                    WzFile[] parsedShards = new WzFile[shardsToLoad.Count];
+                    System.Threading.Tasks.Parallel.For(0, shardsToLoad.Count,
+                        new System.Threading.Tasks.ParallelOptions { MaxDegreeOfParallelism = parallelism },
+                        i =>
+                        {
+                            try
+                            {
+                                parsedShards[i] = LoadWzFileIndependent(shardsToLoad[i], encVersion);
+                            }
+                            catch (Exception ex)
+                            {
+                                Debug.WriteLine($"[LoadCanvasSection] shard '{shardsToLoad[i]}' failed to parse: {ex.Message}");
+                            }
+                        });
+                    for (int i = 0; i < parsedShards.Length; i++)
+                    {
+                        if (parsedShards[i] == null)
+                            continue;
+                        try
+                        {
+                            LoadWzFile(shardsToLoad[i], parsedShards[i]);
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"[LoadCanvasSection] shard '{shardsToLoad[i]}' failed to register: {ex.Message}");
+                            parsedShards[i].Dispose();
+                        }
                     }
                 }
 

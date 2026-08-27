@@ -1,4 +1,4 @@
-<Solution>
+﻿<Solution>
   <Folder Name="/HaRepacker/">
     <Project Path="HaRepacker/Harepacker-resurrected.csproj" />
   </Folder>
@@ -26,6 +26,7 @@
     <Project Path="tests/renameundo/renameundo.csproj" />
     <Project Path="tests/loadfreeze/loadfreeze.csproj" />
     <Project Path="tests/linkrepair/linkrepair.csproj" />
+    <Project Path="tests/linkrepairperf/linkrepairperf.csproj" />
     <Project Path="tests/exportsafety/exportsafety.csproj" />
     <Project Path="tests/savecommit/savecommit.csproj" />
     <Project Path="tests/searchsession/searchsession.csproj" />

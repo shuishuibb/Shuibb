@@ -67,24 +67,42 @@ namespace MapleLib.WzLib
         /// Resolves a single canvas property's _inlink/_outlink reference.
         /// Modifies the canvas in-place by embedding the linked image data and removing the link property.
         /// Uses direct compressed byte copy for efficiency (avoids bitmap decompression/recompression).
+        ///
+        /// Implemented as PrepareSingleCanvas + ApplyPreparedCanvas so the batch repair can run
+        /// the read-only half on a background thread and the mutation half on the UI thread;
+        /// this method is the original one-shot form and keeps its exact semantics.
         /// </summary>
         /// <param name="canvas">The canvas property to resolve</param>
         /// <param name="inlinkOnly">If true, only resolve _inlink (faster, doesn't load external files)</param>
         /// <returns>True if a link was resolved, false if no link or resolution failed</returns>
         public static bool ResolveSingleCanvas(WzCanvasProperty canvas, bool inlinkOnly = false)
         {
+            PreparedCanvasLink prepared = PrepareSingleCanvas(canvas, inlinkOnly);
+            return prepared != null && ApplyPreparedCanvas(canvas, prepared);
+        }
+
+        /// <summary>
+        /// The read-only half of ResolveSingleCanvas: resolves the _inlink/_outlink target and
+        /// extracts its compressed pixel payload, without mutating the canvas. Returns null when
+        /// there is no link, resolution fails, or the source has no pixel data - exactly the
+        /// cases where ResolveSingleCanvas returns false. Safe to call off the UI thread (it only
+        /// reads the WZ model; the file reader has its own lock), as long as no other thread is
+        /// concurrently mutating the same objects.
+        /// </summary>
+        public static PreparedCanvasLink PrepareSingleCanvas(WzCanvasProperty canvas, bool inlinkOnly = false)
+        {
             if (canvas == null)
-                return false;
+                return null;
 
             bool hasInlink = canvas.ContainsInlinkProperty();
             bool hasOutlink = canvas.ContainsOutlinkProperty();
 
             if (!hasInlink && !hasOutlink)
-                return false;
+                return null;
 
             // Skip _outlink if inlinkOnly is set (outlink requires loading external WZ files)
             if (inlinkOnly && !hasInlink)
-                return false;
+                return null;
 
             try
             {
@@ -94,7 +112,25 @@ namespace MapleLib.WzLib
                 // If resolution succeeded (returns different object than self)
                 if (linkedTarget != null && linkedTarget != canvas && linkedTarget is WzCanvasProperty linkedCanvas)
                 {
-                    return CopyCanvasData(canvas, linkedCanvas, hasInlink, hasOutlink);
+                    WzPngProperty sourcePng = linkedCanvas.PngProperty;
+                    if (sourcePng == null || canvas.PngProperty == null)
+                        return null;
+
+                    // Convert listWz format to standard zlib while the source still has its
+                    // reader/WzKey - same reasoning as CopyCanvasData.
+                    byte[] compressedBytes = sourcePng.GetCompressedBytesForExtraction(false);
+                    if (compressedBytes == null || compressedBytes.Length == 0)
+                        return null;
+
+                    return new PreparedCanvasLink
+                    {
+                        CompressedBytes = compressedBytes,
+                        Width = sourcePng.Width,
+                        Height = sourcePng.Height,
+                        Format = sourcePng.Format,
+                        HadInlink = hasInlink,
+                        HadOutlink = hasOutlink,
+                    };
                 }
             }
             catch (Exception ex)
@@ -102,7 +138,30 @@ namespace MapleLib.WzLib
                 Debug.WriteLine($"[WzLinkResolver] Exception resolving canvas link: {ex.Message}");
             }
 
-            return false;
+            return null;
+        }
+
+        /// <summary>
+        /// The mutation half of ResolveSingleCanvas: embeds a prepared payload into the canvas
+        /// and removes the link properties. Must run where model mutations are allowed (the UI
+        /// thread, for canvases shown in a tree).
+        /// </summary>
+        public static bool ApplyPreparedCanvas(WzCanvasProperty canvas, PreparedCanvasLink prepared)
+        {
+            if (canvas == null || prepared == null)
+                return false;
+
+            WzPngProperty destPng = canvas.PngProperty;
+            if (destPng == null)
+                return false;
+
+            destPng.SetCompressedBytes(prepared.CompressedBytes, prepared.Width, prepared.Height, prepared.Format);
+
+            if (prepared.HadInlink)
+                canvas.RemoveProperty(WzCanvasProperty.InlinkPropertyName);
+            if (prepared.HadOutlink)
+                canvas.RemoveProperty(WzCanvasProperty.OutlinkPropertyName);
+            return true;
         }
 
         /// <summary>
@@ -994,5 +1053,20 @@ namespace MapleLib.WzLib
             }
         }
         #endregion
+    }
+
+    /// <summary>
+    /// The resolved-and-extracted payload for one linked canvas: everything the mutation half
+    /// needs, with no reference back to the source reader. Immutable by convention - prepared on
+    /// a worker, applied on the UI thread.
+    /// </summary>
+    public sealed class PreparedCanvasLink
+    {
+        public byte[] CompressedBytes { get; init; }
+        public int Width { get; init; }
+        public int Height { get; init; }
+        public WzPngFormat Format { get; init; }
+        public bool HadInlink { get; init; }
+        public bool HadOutlink { get; init; }
     }
 }

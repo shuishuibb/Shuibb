@@ -149,9 +149,76 @@ namespace HaRepacker.GUI.Panels
         #endregion
 
         #region Data Tree
+        /// <summary>
+        /// How many times this panel has actually rebuilt the WPF mirror of the tree. Pure
+        /// instrumentation for the tree-batching regressions - a single user action that mutates
+        /// hundreds of nodes must cost about one rebuild, not hundreds.
+        /// </summary>
+        public int NativeTreeRefreshCount { get; private set; }
+
+        // ---- tree mutation batching ------------------------------------------------------------
+
+        /// <summary>Depth of nested BeginNativeTreeUpdate scopes; refreshes coalesce while &gt; 0.</summary>
+        private int nativeTreeUpdateDepth;
+        /// <summary>A refresh was requested inside a batch; the outermost End runs it once.</summary>
+        private bool nativeTreeRefreshPending;
+
+        /// <summary>
+        /// Starts a batch: every RefreshNativeDataTree issued until the matching
+        /// EndNativeTreeUpdate collapses into a single rebuild at the end. Nests; UI thread only,
+        /// like the refresh itself. Prefer the IDisposable form so an exception can never leave
+        /// the depth stuck.
+        /// </summary>
+        public void BeginNativeTreeUpdate()
+        {
+            nativeTreeUpdateDepth++;
+        }
+
+        public void EndNativeTreeUpdate()
+        {
+            if (nativeTreeUpdateDepth == 0)
+                return; // unbalanced End - swallow rather than go negative and eat future refreshes
+            nativeTreeUpdateDepth--;
+            if (nativeTreeUpdateDepth == 0 && nativeTreeRefreshPending)
+            {
+                nativeTreeRefreshPending = false;
+                RefreshNativeDataTree();
+            }
+        }
+
+        /// <summary>try/finally in a box: <c>using (panel.NativeTreeUpdateScope()) { ... }</c></summary>
+        public IDisposable NativeTreeUpdateScope()
+        {
+            BeginNativeTreeUpdate();
+            return new NativeTreeUpdateScopeToken(this);
+        }
+
+        private sealed class NativeTreeUpdateScopeToken : IDisposable
+        {
+            private MainPanel panel;
+            public NativeTreeUpdateScopeToken(MainPanel panel) { this.panel = panel; }
+            public void Dispose()
+            {
+                MainPanel p = System.Threading.Interlocked.Exchange(ref panel, null);
+                p?.EndNativeTreeUpdate();
+            }
+        }
+
         public void RefreshNativeDataTree()
         {
             if (!Dispatcher.CheckAccess()) { Dispatcher.BeginInvoke(RefreshNativeDataTree); return; }
+            if (nativeTreeUpdateDepth > 0) { nativeTreeRefreshPending = true; return; }
+            NativeTreeRefreshCount++;
+
+            // Rebuilding clears the ScrollViewer, which used to snap the picture to the top and
+            // then the reveal below dragged it to the selected node - so any mutation that went
+            // through here yanked the tree away from where the user was actually looking.
+            // Capture where the viewport is now, put it back after the rebuild, and leave
+            // revealing to explicit navigation (search, type-ahead, WorldMap jumps), which calls
+            // SelectAndRevealNativeNode itself.
+            treeRevealGeneration++; // stale queued reveals/restores from earlier refreshes die
+            MutationViewportSnapshot viewportSnapshot = CaptureMutationViewport();
+
             var expandedNodes = nativeTreeItems
                 .Where(pair => pair.Value.IsExpanded)
                 .Select(pair => pair.Key)
@@ -169,18 +236,155 @@ namespace HaRepacker.GUI.Panels
             foreach (WzNode node in DataTree.Nodes) RestoreNativeExpansion(node, expandedNodes);
             UpdateNativeSelectionVisuals();
 
-            if (activeNode != null && nativeTreeItems.TryGetValue(activeNode, out TreeViewItem activeItem))
+            QueueMutationViewportRestore(viewportSnapshot);
+        }
+
+        // ---- mutation viewport preservation ------------------------------------------------------
+
+        /// <summary>
+        /// Where the tree's picture was just before a rebuild: the raw scroll offsets, plus (best
+        /// effort) the node at the top of the viewport and its pixel distance from the viewport
+        /// edge, so content shifting above the viewport can be corrected for. Short-lived and
+        /// local to one refresh - deliberately separate from the per-tab saved viewport that tab
+        /// switching uses.
+        /// </summary>
+        private readonly struct MutationViewportSnapshot
+        {
+            public MutationViewportSnapshot(bool hasViewer, double vertical, double horizontal, WzNode anchor, double anchorY)
             {
-                // Tagged with the reveal generation: a tab switch bumps it, so a reveal queued by
-                // a refresh just before the switch cannot land afterwards and drag the restored
-                // viewport back to the selected node.
-                int revealGen = treeRevealGeneration;
-                Dispatcher.BeginInvoke(new Action(() =>
-                {
-                    if (revealGen == treeRevealGeneration && !suppressTreeAutoReveal)
-                        activeItem.BringIntoView();
-                }), DispatcherPriority.Loaded);
+                HasViewer = hasViewer; VerticalOffset = vertical; HorizontalOffset = horizontal;
+                AnchorNode = anchor; AnchorViewportY = anchorY;
             }
+            public bool HasViewer { get; }
+            public double VerticalOffset { get; }
+            public double HorizontalOffset { get; }
+            public WzNode AnchorNode { get; }
+            public double AnchorViewportY { get; }
+        }
+
+        private MutationViewportSnapshot CaptureMutationViewport()
+        {
+            if (FindNativeTreeScrollViewer() is not ScrollViewer viewer)
+                return default;
+
+            WzNode anchor = null;
+            double anchorY = 0;
+            try
+            {
+                // The row under the top edge of the viewport is the user's visual anchor. One
+                // probe is not enough: at the left margin the point falls in the transparent
+                // indentation (no hit) or on an expanded ancestor whose subtree spans the whole
+                // viewport (useless as an anchor - its own top is thousands of pixels up). Probe
+                // rightward until a row whose own top is actually near the edge answers.
+                foreach (double probeX in new[] { 8d, 28d, 48d, 72d, 110d, 160d, 220d })
+                {
+                    var hit = System.Windows.Media.VisualTreeHelper.HitTest(viewer, new System.Windows.Point(probeX, 9));
+                    DependencyObject current = hit?.VisualHit;
+                    while (current != null && current is not TreeViewItem)
+                        current = System.Windows.Media.VisualTreeHelper.GetParent(current);
+                    if (current is not TreeViewItem item || item.Tag is not WzNode node)
+                        continue;
+                    double y = item.TransformToAncestor(viewer).Transform(new System.Windows.Point()).Y;
+                    if (y < -24)
+                        continue; // a spanning ancestor, not the top row
+                    anchor = node;
+                    anchorY = y;
+                    break;
+                }
+            }
+            catch
+            {
+                // The anchor is an enhancement; the offsets below are the guarantee.
+            }
+            return new MutationViewportSnapshot(true, viewer.VerticalOffset, viewer.HorizontalOffset, anchor, anchorY);
+        }
+
+        private void QueueMutationViewportRestore(MutationViewportSnapshot snapshot)
+        {
+            if (!snapshot.HasViewer)
+                return;
+
+            int restoreGen = treeRevealGeneration;
+            // Swallow the focus-restore RequestBringIntoView the rebuild can trigger, exactly
+            // like the tab-switch restore does. Whichever restore/refresh owns the newest
+            // generation is responsible for lifting the flag again.
+            suppressTreeAutoReveal = true;
+
+            // One pass is not enough: big expanded nodes refill in queued 200-item chunks, and
+            // each append makes the VirtualizingStackPanel re-estimate positions and shove the
+            // offset around (measured +3200px per chunk when clamped at the bottom, and a one-off
+            // +1197px drift even when not). So the restore re-asserts itself after every pending
+            // fill chunk - at Background priority the passes interleave FIFO with the fills - and
+            // only releases once the tree is fully built and the offset has stuck.
+            Action pass = null;
+            pass = () =>
+            {
+                bool done = false;
+                try
+                {
+                    if (restoreGen != treeRevealGeneration)
+                    {
+                        done = true;
+                        return; // a newer refresh or a tab switch owns the viewport now
+                    }
+                    if (FindNativeTreeScrollViewer() is not ScrollViewer viewer)
+                    {
+                        done = true;
+                        return;
+                    }
+
+                    // Scrolling to an offset beyond the currently-built extent would clamp to
+                    // the bottom; materialize just enough chunks for the target to exist.
+                    int fillGuard = 0;
+                    while (HasPendingNativeTreeFills && fillGuard++ < 512)
+                    {
+                        viewer.UpdateLayout();
+                        if (viewer.ExtentHeight >= snapshot.VerticalOffset + viewer.ViewportHeight)
+                            break;
+                        FillPendingNativeTreeItems();
+                    }
+
+                    viewer.ScrollToVerticalOffset(snapshot.VerticalOffset);
+                    viewer.ScrollToHorizontalOffset(snapshot.HorizontalOffset);
+
+                    // If the old top-visible row still exists, nudge so it sits at the same
+                    // pixel it did before - keeps the picture stable when rows were added or
+                    // removed above the viewport. A deleted anchor leaves the offset restore
+                    // standing, and the extent change clamps naturally.
+                    if (snapshot.AnchorNode != null
+                        && nativeTreeItems.TryGetValue(snapshot.AnchorNode, out TreeViewItem anchorItem))
+                    {
+                        viewer.UpdateLayout(); // commit the offset write so the measure below is real
+                        if (anchorItem.IsVisible)
+                        {
+                            double y = anchorItem.TransformToAncestor(viewer).Transform(new System.Windows.Point()).Y;
+                            double delta = y - snapshot.AnchorViewportY;
+                            if (Math.Abs(delta) > 0.5)
+                                viewer.ScrollToVerticalOffset(Math.Max(0, viewer.VerticalOffset + delta));
+                        }
+                    }
+
+                    if (!HasPendingNativeTreeFills)
+                        done = true; // fully built; this offset is final
+                }
+                catch
+                {
+                    // Best effort; never let a viewport nicety become a crash.
+                    done = true;
+                }
+                finally
+                {
+                    if (!done)
+                    {
+                        Dispatcher.BeginInvoke(pass, DispatcherPriority.Background);
+                    }
+                    else if (restoreGen == treeRevealGeneration)
+                    {
+                        suppressTreeAutoReveal = false;
+                    }
+                }
+            };
+            Dispatcher.BeginInvoke(pass, DispatcherPriority.Loaded);
         }
 
         /// <summary>
@@ -191,6 +395,7 @@ namespace HaRepacker.GUI.Panels
         public void CancelBackgroundTreeWork()
         {
             searchRunGeneration++;
+            linkRepairGeneration++; // a running link repair stops at its next batch boundary
             EndSearchSession();
         }
 
@@ -753,6 +958,8 @@ namespace HaRepacker.GUI.Panels
         /// needs them all - revealing a node, working out a shift-select range - must call this
         /// first, or it will only see the first chunk.
         /// </summary>
+        private bool HasPendingNativeTreeFills => pendingNativeFills != null && pendingNativeFills.Count > 0;
+
         private void FlushPendingNativeTreeItems()
         {
             if (pendingNativeFills == null || pendingNativeFills.Count == 0)
@@ -1848,12 +2055,17 @@ namespace HaRepacker.GUI.Panels
             System.Windows.Forms.TreeNode[] nodeArr = new System.Windows.Forms.TreeNode[DataTree.SelectedNodes.Count];
             DataTree.SelectedNodes.CopyTo(nodeArr, 0);
 
-            foreach (WzNode node in nodeArr)
-                if (!(node.Tag is WzFile) && node.Parent != null)
-                {
-                    actions.Add(UndoRedoManager.ObjectRemoved((WzNode)node.Parent, node));
-                    node.DeleteWzNode();
-                }
+            // Deleting 100 nodes is one user action: whatever refreshes the deletions trigger
+            // collapse into the single one the caller issues afterwards.
+            using (NativeTreeUpdateScope())
+            {
+                foreach (WzNode node in nodeArr)
+                    if (!(node.Tag is WzFile) && node.Parent != null)
+                    {
+                        actions.Add(UndoRedoManager.ObjectRemoved((WzNode)node.Parent, node));
+                        node.DeleteWzNode();
+                    }
+            }
             UndoRedoMan.AddUndoBatch(actions);
         }
 
@@ -2073,23 +2285,495 @@ namespace HaRepacker.GUI.Panels
         /// <summary>
         /// Fix the '_inlink' and '_outlink' image property for compatibility to old MapleStory ver.
         /// </summary>
-        public void FixLinkForOldMapleStory_OnClick()
+        public async void FixLinkForOldMapleStory_OnClick()
         {
-            // handle multiple nodes...
-            int nodeCount = DataTree.SelectedNodes.Count;
-            int repaired = 0, failed = 0;
-            DateTime t0 = DateTime.Now;
-            foreach (WzNode node in DataTree.SelectedNodes)
+            // One repair per panel at a time: a second copy racing the first over the same
+            // canvases would double-apply payloads and double-count the totals.
+            if (linkRepairInProgress)
             {
-                CheckImageNodeRecursively_linkRepair(node, ref repaired, ref failed);
+                BatchInfo("補圖仍在進行中，請等它完成後再執行。");
+                return;
             }
 
-            RefreshSelectedImageToImageRenderviewer(DataTree.SelectedNode.Tag, canvasPropBox);
+            List<WzNode> roots = DataTree.SelectedNodes.Cast<WzNode>().ToList();
+            if (roots.Count == 0 && DataTree.SelectedNode is WzNode activeNode)
+                roots.Add(activeNode);
+            if (roots.Count == 0)
+                return;
+
+            DateTime t0 = DateTime.Now;
+            LinkRepairResult result = await RunLinkRepairAsync(roots, showDialog: true, showProgress: true);
+            if (result == null || result.Aborted)
+                return;
+
+            if (DataTree.SelectedNode?.Tag != null)
+                RefreshSelectedImageToImageRenderviewer(DataTree.SelectedNode.Tag, canvasPropBox);
 
             double ms = (DateTime.Now - t0).TotalMilliseconds;
-            MessageBox.Show(string.Format(UiLocalization.Translate("Completed.\nElapsed time: {0} ms (average: {1})"), ms, ms / nodeCount)
-                + "\n" + repaired + " 個連結已補上圖片。"
-                + (failed > 0 ? "\n" + failed + " 個連結找不到來源圖片，原樣保留（未刪除 _inlink/_outlink）。" : ""));
+            if (result.Total == 0)
+            {
+                MessageBox.Show("沒有需要補圖的節點。");
+                return;
+            }
+            MessageBox.Show(string.Format(UiLocalization.Translate("Completed.\nElapsed time: {0} ms (average: {1})"), ms, ms / roots.Count)
+                + "\n" + result.Repaired + " 個連結已補上圖片。"
+                + (result.Failed > 0 ? "\n" + result.Failed + " 個連結找不到來源圖片，原樣保留（未刪除 _inlink/_outlink）。" : ""));
+        }
+
+        /// <summary>What one link-repair run did, for the caller's summary and the harnesses.</summary>
+        public sealed class LinkRepairResult
+        {
+            public int Total { get; init; }
+            public int Repaired { get; init; }
+            public int Failed { get; init; }
+            public bool Aborted { get; init; }
+            public string PhaseTimings { get; init; }
+        }
+
+        /// <summary>Guards against a second concurrent repair on this panel.</summary>
+        private bool linkRepairInProgress;
+        /// <summary>
+        /// Bumped by CancelBackgroundTreeWork (close all / unload); a running repair checks it at
+        /// every batch boundary and stops cleanly, leaving already-applied items applied.
+        /// </summary>
+        private int linkRepairGeneration;
+
+        /// <summary>Thread-shared progress counters; workers write, the UI timer reads.</summary>
+        private sealed class LinkRepairProgress
+        {
+            public int ImagesScanned;          // worker: Interlocked
+            public volatile int Total = -1;    // -1 while the scan is still running
+            public volatile int Completed;     // UI thread
+            public volatile int Repaired;      // UI thread
+            public volatile int Failed;        // UI thread
+        }
+
+        /// <summary>
+        /// The async "_inlink/_outlink 補圖" pipeline. Phase 0 (UI): walk the selected nodes'
+        /// structure without parsing anything. Phase 1 (background): parse the images and collect
+        /// the linked canvases and _hash properties from the WZ model. Phase 2/3 (alternating):
+        /// resolve + extract payloads for a batch on the background thread, then apply that batch
+        /// - byte swap, link-property removal, dirty flags, node cleanup - on the UI thread, with
+        /// a dispatcher yield between batches so input keeps pumping. One native tree refresh at
+        /// the very end.
+        ///
+        /// Same per-canvas semantics as the old synchronous CheckImageNodeRecursively_linkRepair:
+        /// resolution runs FIRST and a link that cannot be resolved is left exactly as it was.
+        /// The one deliberate difference: images nobody has materialized in the tree are repaired
+        /// in the model only - their WinForms/WPF nodes get built correctly later by the normal
+        /// lazy Reparse, instead of being force-built just to delete two children again (that
+        /// force-build was most of the old path's cost).
+        /// </summary>
+        public async Task<LinkRepairResult> RunLinkRepairAsync(IReadOnlyList<WzNode> rootNodes, bool showDialog, bool showProgress)
+        {
+            if (linkRepairInProgress)
+                return new LinkRepairResult { Aborted = true, PhaseTimings = "already running" };
+            linkRepairInProgress = true;
+            int generation = ++linkRepairGeneration;
+
+            var progress = new LinkRepairProgress();
+            DispatcherTimer progressTimer = null;
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            long discoverMs = 0, prepareMs = 0, applyMs = 0;
+            int repaired = 0, failedCount = 0, total = 0;
+            bool aborted = false;
+            string failureSummary = null;
+            bool treeBatchOpen = false;
+
+            try
+            {
+                if (showProgress)
+                    progressTimer = StartLinkRepairProgressTimer(progress, generation);
+
+                // ---- Phase 0 (UI): structure only - no image is parsed here ----
+                var images = new List<WzImage>();
+                var propertyRoots = new List<WzImageProperty>();
+                var directoryHashNodes = new List<WzNode>();
+                foreach (WzNode root in rootNodes)
+                    CollectLinkRepairRoots(root, images, propertyRoots, directoryHashNodes);
+
+                // ---- Phase 1 (background): parse + discover ----
+                var canvases = new List<WzCanvasProperty>();
+                var hashProps = new List<WzImageProperty>();
+                await Task.Run(() =>
+                {
+                    foreach (WzImage img in images)
+                    {
+                        if (generation != linkRepairGeneration)
+                            return;
+                        try
+                        {
+                            if (!img.Parsed)
+                                img.ParseImage();
+                            foreach (WzImageProperty prop in img.WzProperties.ToArray())
+                            {
+                                if (prop.Name == "_hash")
+                                    hashProps.Add(prop);
+                                DiscoverLinkRepairTargets(prop, canvases, hashProps);
+                            }
+                        }
+                        catch
+                        {
+                            // One unparseable image costs that image, not the batch.
+                        }
+                        System.Threading.Interlocked.Increment(ref progress.ImagesScanned);
+                    }
+                    foreach (WzImageProperty prop in propertyRoots)
+                    {
+                        if (generation != linkRepairGeneration)
+                            return;
+                        try { DiscoverLinkRepairTargets(prop, canvases, hashProps); } catch { }
+                    }
+                });
+                discoverMs = stopwatch.ElapsedMilliseconds;
+                if (generation != linkRepairGeneration)
+                    aborted = true;
+
+                total = canvases.Count;
+                progress.Total = total;
+
+                // ---- Phase 2 + 3, alternating in bounded batches ----
+                BeginNativeTreeUpdate();
+                treeBatchOpen = true;
+
+                const int BatchSize = 128;
+                var payloads = new MapleLib.WzLib.PreparedCanvasLink[BatchSize];
+                // Operation-local duplicate-target cache: 55% of the links in a full Npc repair
+                // point at a target some earlier canvas already extracted (many frames share one
+                // picture). Keyed by the resolution anchor's identity plus the link string -
+                // an _inlink resolves relative to its own image, an _outlink through its own
+                // file - so a hit is by construction the same source pixels. Only the immutable
+                // prepared payload is shared; the flags are re-derived per canvas.
+                var preparedByTarget = new Dictionary<(object anchor, string link), MapleLib.WzLib.PreparedCanvasLink>();
+                for (int start = 0; start < canvases.Count; start += BatchSize)
+                {
+                    if (generation != linkRepairGeneration) { aborted = true; break; }
+                    int count = Math.Min(BatchSize, canvases.Count - start);
+
+                    long prepareStart = stopwatch.ElapsedMilliseconds;
+                    await Task.Run(() =>
+                    {
+                        for (int i = 0; i < count; i++)
+                        {
+                            WzCanvasProperty canvas = canvases[start + i];
+                            (object anchor, string link) key = default;
+                            try
+                            {
+                                string inlink = (canvas[WzCanvasProperty.InlinkPropertyName] as WzStringProperty)?.Value;
+                                if (inlink != null && canvas.ParentImage != null)
+                                    key = (canvas.ParentImage, "I" + inlink);
+                                else
+                                {
+                                    string outlink = (canvas[WzCanvasProperty.OutlinkPropertyName] as WzStringProperty)?.Value;
+                                    if (outlink != null && canvas.WzFileParent != null)
+                                        key = (canvas.WzFileParent, "O" + outlink);
+                                }
+                            }
+                            catch { }
+
+                            if (key.anchor != null && preparedByTarget.TryGetValue(key, out MapleLib.WzLib.PreparedCanvasLink hit))
+                            {
+                                payloads[i] = hit == null ? null : new MapleLib.WzLib.PreparedCanvasLink
+                                {
+                                    CompressedBytes = hit.CompressedBytes,
+                                    Width = hit.Width,
+                                    Height = hit.Height,
+                                    Format = hit.Format,
+                                    HadInlink = canvas.ContainsInlinkProperty(),
+                                    HadOutlink = canvas.ContainsOutlinkProperty(),
+                                };
+                                continue;
+                            }
+
+                            payloads[i] = MapleLib.WzLib.WzLinkResolver.PrepareSingleCanvas(canvas);
+                            if (key.anchor != null)
+                                preparedByTarget[key] = payloads[i]; // failures cached too - same inputs resolve the same way
+                        }
+                    });
+                    prepareMs += stopwatch.ElapsedMilliseconds - prepareStart;
+                    if (generation != linkRepairGeneration) { aborted = true; break; }
+
+                    long applyStart = stopwatch.ElapsedMilliseconds;
+                    for (int i = 0; i < count; i++)
+                    {
+                        WzCanvasProperty canvas = canvases[start + i];
+                        MapleLib.WzLib.PreparedCanvasLink payload = payloads[i];
+                        payloads[i] = null;
+
+                        bool ok = false;
+                        try
+                        {
+                            // A file unloaded mid-run: leave its canvases alone.
+                            if (payload != null && canvas.ParentImage?.WzFileParent?.IsUnloaded != true
+                                && MapleLib.WzLib.WzLinkResolver.ApplyPreparedCanvas(canvas, payload))
+                            {
+                                if (canvas.ParentImage != null)
+                                    canvas.ParentImage.Changed = true;
+                                // Only canvases someone actually materialized in the tree need
+                                // node surgery; everyone else's nodes are built fresh from the
+                                // (already repaired) model on the next lazy Reparse.
+                                if (canvas.HRTag is WzNode canvasNode && canvasNode.TreeView == DataTree)
+                                {
+                                    if (payload.HadInlink)
+                                        WzNode.GetChildNode(canvasNode, WzCanvasProperty.InlinkPropertyName)?.DeleteWzNode();
+                                    if (payload.HadOutlink)
+                                        WzNode.GetChildNode(canvasNode, WzCanvasProperty.OutlinkPropertyName)?.DeleteWzNode();
+                                    canvasNode.ChangedNodeProperty();
+                                }
+                                ok = true;
+                            }
+                        }
+                        catch
+                        {
+                            // This canvas only; the loop goes on.
+                        }
+                        if (ok) { repaired++; progress.Repaired = repaired; }
+                        else { failedCount++; progress.Failed = failedCount; }
+                        progress.Completed = repaired + failedCount;
+                    }
+                    applyMs += stopwatch.ElapsedMilliseconds - applyStart;
+
+                    await Dispatcher.Yield(DispatcherPriority.Background);
+                }
+
+                // ---- _hash cleanup (same rule the old traversal applied at every node) ----
+                if (!aborted)
+                {
+                    int hashSinceYield = 0;
+                    foreach (WzImageProperty hashProp in hashProps)
+                    {
+                        if (generation != linkRepairGeneration) { aborted = true; break; }
+                        try
+                        {
+                            if (hashProp.ParentImage?.WzFileParent?.IsUnloaded == true)
+                                continue;
+                            if (hashProp.HRTag is WzNode hashNode && hashNode.TreeView == DataTree)
+                            {
+                                hashNode.DeleteWzNode();
+                            }
+                            else
+                            {
+                                if (hashProp.ParentImage != null)
+                                    hashProp.ParentImage.Changed = true;
+                                hashProp.Remove();
+                            }
+                        }
+                        catch { }
+                        if (++hashSinceYield >= 512)
+                        {
+                            hashSinceYield = 0;
+                            await Dispatcher.Yield(DispatcherPriority.Background);
+                        }
+                    }
+                    foreach (WzNode dirHashNode in directoryHashNodes)
+                    {
+                        try
+                        {
+                            if (dirHashNode.TreeView == DataTree)
+                                dirHashNode.DeleteWzNode();
+                        }
+                        catch { }
+                    }
+                }
+
+                // The WPF mirror shows the result once - inside the batch this marks pending,
+                // and the End in finally performs the single real rebuild.
+                RefreshNativeDataTree();
+            }
+            catch (Exception ex)
+            {
+                failureSummary = ex.Message;
+                try
+                {
+                    if (showDialog)
+                        MessageBox.Show("補圖失敗。\n\n原因：\n" + ex.Message, Properties.Resources.Error);
+                }
+                catch { }
+            }
+            finally
+            {
+                if (treeBatchOpen)
+                    EndNativeTreeUpdate();
+                linkRepairInProgress = false;
+                stopwatch.Stop();
+                if (showProgress)
+                    FinishLinkRepairProgress(progressTimer, generation, total, repaired, failedCount,
+                        aborted, failureSummary, stopwatch.ElapsedMilliseconds);
+            }
+
+            return new LinkRepairResult
+            {
+                Total = total,
+                Repaired = repaired,
+                Failed = failedCount,
+                Aborted = aborted || failureSummary != null,
+                PhaseTimings = "discover=" + discoverMs + "ms prepare=" + prepareMs + "ms apply=" + applyMs + "ms",
+            };
+        }
+
+        /// <summary>
+        /// Structure walk on the UI thread, parsing nothing: images and directly-selected
+        /// property subtrees go to the background phase; a directory-level child literally named
+        /// "_hash" (the old traversal removed those too) is remembered as a node. Unmaterialized
+        /// virtual directories (.ms packs) still hold their lazy placeholder and are skipped -
+        /// exactly what the old node recursion did.
+        /// </summary>
+        private static void CollectLinkRepairRoots(WzNode node, List<WzImage> images,
+            List<WzImageProperty> propertyRoots, List<WzNode> directoryHashNodes)
+        {
+            if (node.Tag is WzImage img)
+            {
+                images.Add(img);
+                return;
+            }
+            if (node.Tag is WzImageProperty prop)
+            {
+                propertyRoots.Add(prop);
+                return;
+            }
+            foreach (System.Windows.Forms.TreeNode child in node.Nodes)
+                if (child is WzNode wzChild)
+                    CollectLinkRepairRoots(wzChild, images, propertyRoots, directoryHashNodes);
+            if (WzNode.GetChildNode(node, "_hash") is WzNode dirHash)
+                directoryHashNodes.Add(dirHash);
+        }
+
+        /// <summary>
+        /// Model-side mirror of the old node traversal: canvases with a link are collected (their
+        /// children are not descended into, as before), every other property recurses, and a
+        /// direct child named "_hash" at any visited level is collected for removal.
+        /// </summary>
+        private static void DiscoverLinkRepairTargets(WzImageProperty prop,
+            List<WzCanvasProperty> canvases, List<WzImageProperty> hashProps)
+        {
+            if (prop is WzCanvasProperty canvas)
+            {
+                if (canvas.ContainsInlinkProperty() || canvas.ContainsOutlinkProperty())
+                    canvases.Add(canvas);
+                if (canvas["_hash"] is WzImageProperty canvasHash)
+                    hashProps.Add(canvasHash);
+                return;
+            }
+
+            // Containers only - mirroring WzNode.ParseChilds, which is what the old node
+            // traversal saw. In particular a UOL's WzProperties RESOLVES the link and returns
+            // the target's children; descending there would repair canvases outside the
+            // selection (the old path never did).
+            if (prop is not IPropertyContainer)
+                return;
+            var children = prop.WzProperties;
+            if (children == null || children.Count == 0)
+                return;
+            foreach (WzImageProperty child in children.ToArray())
+            {
+                if (child.Name == "_hash")
+                    hashProps.Add(child);
+                DiscoverLinkRepairTargets(child, canvases, hashProps);
+            }
+        }
+
+        // ---- link repair progress UI -------------------------------------------------------------
+
+        /// <summary>
+        /// Coalesced progress rendering: the workers only bump counters; this timer reads them at
+        /// 10 Hz on the UI thread and paints the panel's own status bar. Display is delayed 200ms
+        /// so a repair that finishes immediately never flashes a progress bar at all.
+        /// </summary>
+        private DispatcherTimer StartLinkRepairProgressTimer(LinkRepairProgress progress, int generation)
+        {
+            DateTime startedUtc = DateTime.UtcNow;
+            bool shown = false;
+            var timer = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromMilliseconds(100) };
+            timer.Tick += (_, _) =>
+            {
+                if (generation != linkRepairGeneration)
+                {
+                    timer.Stop();
+                    return;
+                }
+                if (!shown)
+                {
+                    if ((DateTime.UtcNow - startedUtc).TotalMilliseconds < 200)
+                        return;
+                    shown = true;
+                }
+                try
+                {
+                    int totalNow = progress.Total;
+                    if (totalNow < 0)
+                    {
+                        mainProgressBar.IsIndeterminate = true;
+                        toolStripStatusLabel_additionalInfo.Text =
+                            "補圖中：正在掃描需要補圖的節點…（已掃 "
+                            + System.Threading.Volatile.Read(ref progress.ImagesScanned) + " 張 IMG）";
+                    }
+                    else
+                    {
+                        int done = progress.Completed;
+                        mainProgressBar.IsIndeterminate = false;
+                        mainProgressBar.Maximum = Math.Max(1, totalNow);
+                        mainProgressBar.Value = Math.Min(done, totalNow);
+                        int percent = totalNow == 0 ? 100 : (int)(100.0 * done / totalNow);
+                        toolStripStatusLabel_additionalInfo.Text =
+                            "補圖中：" + done + " / " + totalNow
+                            + "（成功 " + progress.Repaired + "，失敗 " + progress.Failed + "）" + percent + "%";
+                    }
+                }
+                catch
+                {
+                    // Progress is an observation layer - it must never take the repair down.
+                }
+            };
+            timer.Start();
+            return timer;
+        }
+
+        private void FinishLinkRepairProgress(DispatcherTimer timer, int generation, int total,
+            int repaired, int failedCount, bool aborted, string failureSummary, long elapsedMs)
+        {
+            try
+            {
+                timer?.Stop();
+                mainProgressBar.IsIndeterminate = false;
+                if (failureSummary != null)
+                {
+                    mainProgressBar.Value = 0;
+                    toolStripStatusLabel_additionalInfo.Text = "補圖失敗：" + failureSummary;
+                }
+                else if (aborted)
+                {
+                    mainProgressBar.Value = 0;
+                    toolStripStatusLabel_additionalInfo.Text = "補圖已中止（檔案已卸載或關閉）。";
+                }
+                else if (total == 0)
+                {
+                    mainProgressBar.Value = 0;
+                    toolStripStatusLabel_additionalInfo.Text = "沒有需要補圖的節點。";
+                }
+                else
+                {
+                    // Land on 100% with the summary, then put the bar back a few seconds later.
+                    mainProgressBar.Maximum = Math.Max(1, total);
+                    mainProgressBar.Value = mainProgressBar.Maximum;
+                    toolStripStatusLabel_additionalInfo.Text =
+                        "補圖完成：成功 " + repaired + "，失敗 " + failedCount
+                        + "，耗時 " + (elapsedMs / 1000.0).ToString("0.0") + " 秒";
+                    int shownGeneration = generation;
+                    var resetTimer = new DispatcherTimer(DispatcherPriority.Background) { Interval = TimeSpan.FromSeconds(4) };
+                    resetTimer.Tick += (s2, _) =>
+                    {
+                        ((DispatcherTimer)s2).Stop();
+                        // Leave newer operations' progress alone.
+                        if (shownGeneration == linkRepairGeneration && !linkRepairInProgress)
+                            mainProgressBar.Value = 0;
+                    };
+                    resetTimer.Start();
+                }
+            }
+            catch
+            {
+                // The panel may be tearing down; nothing to clean then.
+            }
         }
 
         /// <summary>
@@ -4771,6 +5455,7 @@ namespace HaRepacker.GUI.Panels
             }
 
             bPasteTaskActive = true;
+            using var pasteTreeBatch = NativeTreeUpdateScope(); // one rebuild per paste, however many targets
             try
             {
                 // Reset replace option

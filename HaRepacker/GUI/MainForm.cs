@@ -2103,8 +2103,20 @@ namespace HaRepacker.GUI
             RemoveSelectedNodes();
         }
 
-        private void UndoMenu_Click(object sender, EventArgs e) { MainPanel?.UndoRedoMan.Undo(); MainPanel?.RefreshNativeDataTree(); }
-        private void RedoMenu_Click(object sender, EventArgs e) { MainPanel?.UndoRedoMan.Redo(); MainPanel?.RefreshNativeDataTree(); }
+        // Batched: an undo batch can touch hundreds of nodes, and the single refresh after the
+        // scope closes is the only WPF rebuild the whole gesture pays for.
+        private void UndoMenu_Click(object sender, EventArgs e)
+        {
+            if (MainPanel == null) return;
+            using (MainPanel.NativeTreeUpdateScope()) { MainPanel.UndoRedoMan.Undo(); }
+            MainPanel.RefreshNativeDataTree();
+        }
+        private void RedoMenu_Click(object sender, EventArgs e)
+        {
+            if (MainPanel == null) return;
+            using (MainPanel.NativeTreeUpdateScope()) { MainPanel.UndoRedoMan.Redo(); }
+            MainPanel.RefreshNativeDataTree();
+        }
 
         private void RemoveSelectedNodes()
         {
