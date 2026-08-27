@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Globalization;
 using MapleLib;
 using MapleLib.WzLib;
 using MapleLib.WzLib.WzProperties;
@@ -8,11 +9,25 @@ using MapleLib.WzLib.WzProperties;
 namespace HaRepacker.GUI.WorldMap
 {
     /// <summary>
+    /// Something on the map the user can select and drag. Both MapList spots and MapLink entries
+    /// store their position in a "spot" WzVectorProperty, so group dragging, selection and the
+    /// dirty/red bookkeeping are written once against this instead of twice.
+    /// </summary>
+    public interface IWorldMapMovable
+    {
+        /// <summary>The vector actually written when the item is moved.</summary>
+        WzVectorProperty Position { get; }
+
+        /// <summary>Shown in the inspector title, e.g. "MapList 4" / "MapLink 5".</summary>
+        string DisplayName { get; }
+    }
+
+    /// <summary>
     /// One MapList entry that has a usable spot. Holds the real WZ properties rather than paths,
     /// so an edit writes straight back to the object the tree is showing - no re-walking the IMG
     /// and no chance of touching a different node than the one on screen.
     /// </summary>
-    public sealed class WorldMapSpot
+    public sealed class WorldMapSpot : IWorldMapMovable
     {
         /// <summary>The MapList child, e.g. MapList\4.</summary>
         public WzSubProperty Entry { get; init; }
@@ -31,6 +46,44 @@ namespace HaRepacker.GUI.WorldMap
 
         public int SpotX => Spot.X.Value;
         public int SpotY => Spot.Y.Value;
+
+        public WzVectorProperty Position => Spot;
+        public string DisplayName => "MapList " + EntryName;
+    }
+
+    /// <summary>
+    /// One MapLink entry. The schema is the one this repository's own WorldMap codec reads and
+    /// writes (HaCreator\WorldMap\WorldMapCodec.cs - ReadLink / PatchLink):
+    ///
+    ///   MapLink\&lt;key&gt;
+    ///   ├─ toolTip   (string, optional)
+    ///   ├─ spot      (vector - the position)
+    ///   └─ link      (optional)
+    ///      ├─ linkMap (string - the world map this jumps to)
+    ///      └─ linkImg (canvas)
+    ///
+    /// Only properties that are actually present are read; nothing is invented, and an entry
+    /// without a spot vector is skipped rather than given a guessed position.
+    /// </summary>
+    public sealed class WorldMapLink : IWorldMapMovable
+    {
+        public WzSubProperty Entry { get; init; }
+        public string EntryName { get; init; }
+
+        /// <summary>Required - an entry without one has no position and is skipped.</summary>
+        public WzVectorProperty Spot { get; init; }
+
+        /// <summary>toolTip text, or null when the entry has none.</summary>
+        public string ToolTip { get; init; }
+
+        /// <summary>link\linkMap - the world map this link points at, or null.</summary>
+        public string LinkMap { get; init; }
+
+        public int SpotX => Spot.X.Value;
+        public int SpotY => Spot.Y.Value;
+
+        public WzVectorProperty Position => Spot;
+        public string DisplayName => "MapLink " + EntryName;
     }
 
     /// <summary>
@@ -54,6 +107,9 @@ namespace HaRepacker.GUI.WorldMap
 
         public IReadOnlyList<WorldMapSpot> Spots { get; private init; }
 
+        /// <summary>MapLink entries that have a usable spot. Empty when the image has no MapLink.</summary>
+        public IReadOnlyList<WorldMapLink> Links { get; private init; }
+
         /// <summary>Raw info\parentMap value, or null. Normalize with WorldMapNavigation.</summary>
         public string ParentMap { get; private init; }
 
@@ -75,6 +131,7 @@ namespace HaRepacker.GUI.WorldMap
                 BaseCanvas = baseCanvas,
                 BaseOrigin = baseCanvas == null ? new PointF(0f, 0f) : baseCanvas.GetCanvasOriginPosition(),
                 Spots = spots,
+                Links = ReadLinks(image["MapLink"]),
                 ParentMap = (image["info"] as IPropertyContainer)?["parentMap"].ReadString(null),
                 Warning = baseCanvas == null ? "無法取得 BaseImg" : null
             };
@@ -174,6 +231,37 @@ namespace HaRepacker.GUI.WorldMap
             return spots;
         }
 
+        /// <summary>
+        /// Reads MapLink using only properties that are actually present. An entry with no spot
+        /// vector has no position that could be drawn or dragged, so it is skipped - guessing one
+        /// would risk writing a coordinate into the wrong property.
+        /// </summary>
+        private static List<WorldMapLink> ReadLinks(WzImageProperty mapLink)
+        {
+            var links = new List<WorldMapLink>();
+            if (mapLink is not IPropertyContainer container)
+                return links;
+
+            foreach (WzImageProperty child in container.WzProperties)
+            {
+                if (child is not WzSubProperty entry)
+                    continue;
+                if (entry["spot"] is not WzVectorProperty spot)
+                    continue;
+
+                links.Add(new WorldMapLink
+                {
+                    Entry = entry,
+                    EntryName = entry.Name,
+                    Spot = spot,
+                    ToolTip = entry["toolTip"].ReadString(null),
+                    LinkMap = (entry["link"] as IPropertyContainer)?["linkMap"].ReadString(null)
+                });
+            }
+
+            return links;
+        }
+
         /// <summary>Every mapNo value in this image, for the forward-navigation match.</summary>
         public HashSet<int> CollectMapNumbers()
         {
@@ -203,6 +291,76 @@ namespace HaRepacker.GUI.WorldMap
         /// </summary>
         public static (int X, int Y) CanvasToWorld(PointF baseOrigin, double canvasX, double canvasY)
             => ((int)Math.Round(canvasX - baseOrigin.X), (int)Math.Round(canvasY - baseOrigin.Y));
+    }
+
+    /// <summary>
+    /// Moving a group of selected items together. Every item keeps its own position and shifts by
+    /// the same delta, so a multi-selection holds its shape instead of collapsing onto one point.
+    /// </summary>
+    public static class WorldMapGroupMove
+    {
+        /// <summary>
+        /// The position each item should end up at after shifting the whole selection by
+        /// (deltaX, deltaY) from the positions captured when the drag started.
+        /// </summary>
+        public static Dictionary<IWorldMapMovable, (int X, int Y)> Offset(
+            IReadOnlyDictionary<IWorldMapMovable, (int X, int Y)> startPositions, int deltaX, int deltaY)
+        {
+            var moved = new Dictionary<IWorldMapMovable, (int X, int Y)>();
+            if (startPositions == null)
+                return moved;
+
+            foreach (KeyValuePair<IWorldMapMovable, (int X, int Y)> start in startPositions)
+                moved[start.Key] = (start.Value.X + deltaX, start.Value.Y + deltaY);
+
+            return moved;
+        }
+    }
+
+    /// <summary>
+    /// mapNo is a numerically-named list, so adding and removing entries has to keep the names
+    /// contiguous - the client reads 0..n-1 and stops at the first gap. Pure index arithmetic,
+    /// kept here so it can be tested without a tree.
+    /// </summary>
+    public static class WorldMapMapNoIndexer
+    {
+        /// <summary>
+        /// The name a newly appended entry should take: one past the highest numeric name, so it
+        /// lands at the end even if the existing names are not perfectly contiguous.
+        /// </summary>
+        public static string NextIndexName(IEnumerable<string> existingNames)
+        {
+            int next = 0;
+            if (existingNames != null)
+            {
+                foreach (string name in existingNames)
+                {
+                    if (int.TryParse(name, NumberStyles.Integer, CultureInfo.InvariantCulture, out int index) && index >= next)
+                        next = index + 1;
+                }
+            }
+            return next.ToString(CultureInfo.InvariantCulture);
+        }
+
+        /// <summary>
+        /// The names the remaining entries should carry after a removal, in their current order:
+        /// "0", "1", "2"... Returns only the ones that actually need renaming, so an unchanged
+        /// entry is not needlessly marked as edited.
+        /// </summary>
+        public static Dictionary<string, string> Renumber(IReadOnlyList<string> remainingNamesInOrder)
+        {
+            var renames = new Dictionary<string, string>();
+            if (remainingNamesInOrder == null)
+                return renames;
+
+            for (int index = 0; index < remainingNamesInOrder.Count; index++)
+            {
+                string expected = index.ToString(CultureInfo.InvariantCulture);
+                if (!string.Equals(remainingNamesInOrder[index], expected, StringComparison.Ordinal))
+                    renames[remainingNamesInOrder[index]] = expected;
+            }
+            return renames;
+        }
     }
 
     /// <summary>
@@ -298,9 +456,15 @@ namespace HaRepacker.GUI.WorldMap
         public const string WorldMapDirectoryName = "WorldMap";
 
         /// <summary>
-        /// A WorldMap*.img that actually sits under a WorldMap directory. The directory check
-        /// matters: a stray WorldMap123.img elsewhere in the WZ is not a world map and must not
+        /// A WorldMap*.img that actually lives in a world-map container. The container check
+        /// matters: a stray WorldMap123.img somewhere unrelated is not a world map and must not
         /// take over the panel.
+        ///
+        /// Two layouts count, because both occur in the wild:
+        ///   Map.wz\WorldMap\WorldMap050.img   - a WorldMap directory inside a bigger WZ
+        ///   WorldMap_000.wz\WorldMap050.img   - a split WZ that is itself the world map file,
+        ///                                       where the images sit at the root with no
+        ///                                       WorldMap directory above them at all
         /// </summary>
         public static bool IsWorldMapImage(WzObject obj)
         {
@@ -311,19 +475,32 @@ namespace HaRepacker.GUI.WorldMap
             if (!image.Name.EndsWith(".img", StringComparison.OrdinalIgnoreCase))
                 return false;
 
-            return FindWorldMapDirectory(image) != null;
+            return FindWorldMapContainer(image) != null;
         }
 
-        /// <summary>The WorldMap directory this image lives under, or null.</summary>
-        public static WzDirectory FindWorldMapDirectory(WzObject obj)
+        /// <summary>
+        /// The directory holding this image's world-map siblings, or null when it is not in one.
+        /// Matches a container whose name starts with "WorldMap" so it covers both a WorldMap
+        /// directory and the root of a WorldMap_000.wz style file (whose root directory carries
+        /// the file's own name).
+        /// </summary>
+        public static WzDirectory FindWorldMapContainer(WzObject obj)
         {
             for (WzObject parent = obj?.Parent; parent != null; parent = parent.Parent)
             {
-                if (parent is WzDirectory directory
-                    && string.Equals(directory.Name, WorldMapDirectoryName, StringComparison.OrdinalIgnoreCase))
+                if (parent is WzDirectory directory && IsWorldMapContainerName(directory.Name))
                     return directory;
             }
+
+            // The root directory of a split file can be named without the WorldMap prefix even
+            // though the file itself carries it, so fall back to the owning WZ file's name.
+            if (obj is WzImage image && IsWorldMapContainerName(image.WzFileParent?.Name))
+                return image.Parent as WzDirectory;
+
             return null;
         }
+
+        private static bool IsWorldMapContainerName(string name)
+            => name != null && name.StartsWith(WorldMapDirectoryName, StringComparison.OrdinalIgnoreCase);
     }
 }

@@ -4492,6 +4492,9 @@ namespace HaRepacker.GUI.Panels
                 worldMapEditorPanel.PropertiesChanged += WorldMapEditor_PropertiesChanged;
                 worldMapEditorPanel.NavigationRequested += WorldMapEditor_NavigationRequested;
                 worldMapEditorPanel.WorldMapSiblingProvider = GetWorldMapSiblings;
+                // Adding a mapNo goes through WzNode.AddObject, which registers on the app's
+                // existing undo stack rather than a WorldMap-specific one.
+                worldMapEditorPanel.UndoRedoMan = undoRedoMan;
                 grid1.Children.Add(worldMapEditorPanel);
             }
 

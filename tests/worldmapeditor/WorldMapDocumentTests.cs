@@ -382,6 +382,298 @@ public sealed class WorldMapDocumentTests
             WorldMapDocument.Load(image).CollectMapNumbers().OrderBy(n => n).ToArray());
     }
 
+    // ---- group move ----------------------------------------------------------------------------
+
+    [Fact]
+    public void GroupMove_ShiftsEveryItemByTheSameDelta_KeepingTheirRelativeLayout()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap000.img", null, new PointF(0f, 0f),
+            ("0", 10, 20, 0, null), ("1", 30, 40, 0, null));
+        IReadOnlyList<WorldMapSpot> spots = WorldMapDocument.Load(image).Spots;
+
+        var start = new Dictionary<IWorldMapMovable, (int X, int Y)>
+        {
+            [spots[0]] = (10, 20),
+            [spots[1]] = (30, 40)
+        };
+
+        Dictionary<IWorldMapMovable, (int X, int Y)> moved = WorldMapGroupMove.Offset(start, 5, -10);
+
+        Assert.Equal((15, 10), moved[spots[0]]);
+        Assert.Equal((35, 30), moved[spots[1]]);
+    }
+
+    [Fact]
+    public void GroupMove_CommittingWritesOnlyTheItemsThatActuallyMoved()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap000.img", null, new PointF(0f, 0f),
+            ("0", 10, 20, 0, null), ("1", 30, 40, 0, null));
+        IReadOnlyList<WorldMapSpot> spots = WorldMapDocument.Load(image).Spots;
+        Assert.False(image.Changed);
+
+        // What CommitDrag does: skip anything whose position is unchanged.
+        var target = new Dictionary<WorldMapSpot, (int X, int Y)>
+        {
+            [spots[0]] = (15, 10),
+            [spots[1]] = (30, 40) // unchanged
+        };
+        var written = new List<WzVectorProperty>();
+        foreach (KeyValuePair<WorldMapSpot, (int X, int Y)> entry in target)
+        {
+            if (entry.Key.SpotX == entry.Value.X && entry.Key.SpotY == entry.Value.Y)
+                continue;
+            entry.Key.Spot.X.Value = entry.Value.X;
+            entry.Key.Spot.Y.Value = entry.Value.Y;
+            entry.Key.Spot.ParentImage.Changed = true;
+            written.Add(entry.Key.Spot);
+        }
+
+        Assert.Same(spots[0].Spot, Assert.Single(written));
+        Assert.Equal(15, spots[0].SpotX);
+        Assert.Equal(30, spots[1].SpotX); // untouched
+        Assert.True(image.Changed);
+    }
+
+    [Fact]
+    public void SelectionAloneNeverWritesAnything()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap000.img", null, new PointF(0f, 0f),
+            ("0", 10, 20, 0, null), ("1", 30, 40, 0, null));
+        WorldMapDocument document = WorldMapDocument.Load(image);
+
+        // Building a multi-selection touches only the panel's own set.
+        var selection = new HashSet<IWorldMapMovable>();
+        foreach (WorldMapSpot spot in document.Spots)
+            selection.Add(spot);
+
+        Assert.Equal(2, selection.Count);
+        Assert.False(image.Changed);
+        Assert.Equal(10, document.Spots[0].SpotX);
+        Assert.Equal(30, document.Spots[1].SpotX);
+    }
+
+    // ---- MapLink -------------------------------------------------------------------------------
+
+    /// <summary>
+    /// Builds MapLink using the schema this repository's own codec reads
+    /// (HaCreator\WorldMap\WorldMapCodec.cs): toolTip, spot, link\linkMap.
+    /// </summary>
+    private static void AddMapLink(WzImage image, string key, int? x, int? y, string toolTip, string linkMap)
+    {
+        var links = image["MapLink"] as WzSubProperty;
+        if (links == null)
+        {
+            links = new WzSubProperty("MapLink");
+            image.AddProperty(links);
+        }
+
+        var entry = new WzSubProperty(key);
+        if (x.HasValue && y.HasValue)
+            entry.AddProperty(new WzVectorProperty("spot", new WzIntProperty("x", x.Value), new WzIntProperty("y", y.Value)));
+        if (toolTip != null)
+            entry.AddProperty(new WzStringProperty("toolTip", toolTip));
+        if (linkMap != null)
+        {
+            var nested = new WzSubProperty("link");
+            nested.AddProperty(new WzStringProperty("linkMap", linkMap));
+            entry.AddProperty(nested);
+        }
+        links.AddProperty(entry);
+        image.Changed = false;
+    }
+
+    [Fact]
+    public void Load_ReadsMapLinkPositionToolTipAndLinkMap()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap010.img", "WorldMap", new PointF(0f, 0f), ("0", 1, 2, 0, null));
+        AddMapLink(image, "5", 100, -50, "victoria", "WorldMap020");
+
+        WorldMapLink link = Assert.Single(WorldMapDocument.Load(image).Links);
+
+        Assert.Equal("5", link.EntryName);
+        Assert.Equal(100, link.SpotX);
+        Assert.Equal(-50, link.SpotY);
+        Assert.Equal("victoria", link.ToolTip);
+        Assert.Equal("WorldMap020", link.LinkMap);
+        // linkMap normalizes to a navigable image name.
+        Assert.Equal("WorldMap020.img", WorldMapNavigation.NormalizeImageName(link.LinkMap));
+    }
+
+    [Fact]
+    public void Load_MapLinkWithoutSpot_IsSkippedRatherThanGivenAGuessedPosition()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(0f, 0f), ("0", 1, 2, 0, null));
+        AddMapLink(image, "5", x: null, y: null, toolTip: "no position", linkMap: "WorldMap020");
+
+        Assert.Empty(WorldMapDocument.Load(image).Links);
+    }
+
+    [Fact]
+    public void Load_MapLinkWithoutOptionalFields_ReadsNullsNotInventedValues()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(0f, 0f), ("0", 1, 2, 0, null));
+        AddMapLink(image, "0", 10, 20, toolTip: null, linkMap: null);
+
+        WorldMapLink link = Assert.Single(WorldMapDocument.Load(image).Links);
+
+        Assert.Null(link.ToolTip);
+        Assert.Null(link.LinkMap);
+        Assert.Null(link.Entry["toolTip"]);
+        Assert.Null(link.Entry["link"]);
+    }
+
+    [Fact]
+    public void Load_WithoutMapLink_YieldsNoLinks()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap000.img", null, new PointF(0f, 0f), ("0", 1, 2, 0, null));
+        Assert.Empty(WorldMapDocument.Load(image).Links);
+    }
+
+    [Fact]
+    public void MovingAMapLink_WritesItsSpotAndDirtiesTheImage()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(0f, 0f), ("0", 1, 2, 0, null));
+        AddMapLink(image, "5", 100, -50, null, null);
+        WorldMapLink link = Assert.Single(WorldMapDocument.Load(image).Links);
+        Assert.False(image.Changed);
+
+        link.Position.X.Value = 130;
+        link.Position.Y.Value = -20;
+        link.Position.ParentImage.Changed = true;
+
+        Assert.Equal(130, ((WzVectorProperty)link.Entry["spot"]).X.Value);
+        Assert.Equal(-20, ((WzVectorProperty)link.Entry["spot"]).Y.Value);
+        Assert.True(image.Changed);
+    }
+
+    [Fact]
+    public void SpotsAndLinksShareTheMovableContract_SoAMixedSelectionDragsAsOneGroup()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap010.img", null, new PointF(0f, 0f), ("0", 10, 20, 0, null));
+        AddMapLink(image, "5", 100, -50, null, null);
+        WorldMapDocument document = WorldMapDocument.Load(image);
+
+        var start = new Dictionary<IWorldMapMovable, (int X, int Y)>
+        {
+            [document.Spots[0]] = (10, 20),
+            [document.Links[0]] = (100, -50)
+        };
+
+        Dictionary<IWorldMapMovable, (int X, int Y)> moved = WorldMapGroupMove.Offset(start, -5, 5);
+
+        Assert.Equal((5, 25), moved[document.Spots[0]]);
+        Assert.Equal((95, -45), moved[document.Links[0]]);
+    }
+
+    // ---- mapNo structure -------------------------------------------------------------------------
+
+    [Fact]
+    public void NextIndexName_AppendsAfterTheHighestExistingIndex()
+    {
+        Assert.Equal("0", WorldMapMapNoIndexer.NextIndexName(new string[0]));
+        Assert.Equal("1", WorldMapMapNoIndexer.NextIndexName(new[] { "0" }));
+        Assert.Equal("3", WorldMapMapNoIndexer.NextIndexName(new[] { "0", "1", "2" }));
+        // A non-numeric sibling must not derail the count.
+        Assert.Equal("2", WorldMapMapNoIndexer.NextIndexName(new[] { "0", "junk", "1" }));
+    }
+
+    [Fact]
+    public void Renumber_ClosesTheGapLeftByADeletion()
+    {
+        // 0=A, 1=B, 2=C with 1 deleted leaves 0, 2 -> the 2 must become 1.
+        Dictionary<string, string> renames = WorldMapMapNoIndexer.Renumber(new[] { "0", "2" });
+
+        Assert.Equal("1", renames["2"]);
+        Assert.False(renames.ContainsKey("0")); // already correct, so not needlessly renamed
+    }
+
+    [Fact]
+    public void Renumber_AlreadyContiguous_RenamesNothing()
+    {
+        Assert.Empty(WorldMapMapNoIndexer.Renumber(new[] { "0", "1", "2" }));
+    }
+
+    [Fact]
+    public void DeletingAMapNo_ThenRenumbering_LeavesContiguousNamesAndKeepsValueOrder()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap000.img", null, new PointF(0f, 0f),
+            ("0", 1, 2, 0, new[] { 111, 222, 333 }));
+        WorldMapSpot spot = Assert.Single(WorldMapDocument.Load(image).Spots);
+        var container = (WzSubProperty)spot.Entry["mapNo"];
+
+        // Delete index 1 (value 222), the way the × button does.
+        container.RemoveProperty(container["1"]);
+
+        Dictionary<string, string> renames = WorldMapMapNoIndexer.Renumber(
+            container.WzProperties.Select(p => p.Name).ToList());
+        foreach (WzImageProperty property in container.WzProperties.ToList())
+        {
+            if (renames.TryGetValue(property.Name, out string newName))
+                property.Name = newName;
+        }
+
+        Assert.Equal(new[] { "0", "1" }, container.WzProperties.Select(p => p.Name).ToArray());
+        Assert.Equal(111, ((WzIntProperty)container["0"]).Value);
+        Assert.Equal(333, ((WzIntProperty)container["1"]).Value);
+    }
+
+    [Fact]
+    public void ASpotWithNoMapNo_GetsNoContainerUntilOneIsExplicitlyAdded()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap000.img", null, new PointF(0f, 0f), ("0", 1, 2, 0, null));
+        WorldMapSpot spot = Assert.Single(WorldMapDocument.Load(image).Spots);
+
+        // Merely loading and inspecting must not create it.
+        Assert.Null(spot.Entry["mapNo"]);
+        Assert.Empty(spot.MapNo);
+        Assert.False(image.Changed);
+
+        // The explicit add is what creates it, with a first entry defaulting to 0.
+        var container = new WzSubProperty("mapNo");
+        spot.Entry.AddProperty(container);
+        string name = WorldMapMapNoIndexer.NextIndexName(container.WzProperties.Select(p => p.Name));
+        container.AddProperty(new WzIntProperty(name, 0));
+        container.ParentImage.Changed = true;
+
+        Assert.Equal("0", name);
+        WorldMapSpot reloaded = Assert.Single(WorldMapDocument.Load(image).Spots);
+        Assert.Equal(0, Assert.Single(reloaded.MapNo).Value);
+        Assert.True(image.Changed);
+    }
+
+    [Fact]
+    public void AddingASecondMapNo_DefaultsToZeroAtTheNextIndex()
+    {
+        WzImage image = MakeWorldMapImage("WorldMap000.img", null, new PointF(0f, 0f),
+            ("0", 1, 2, 0, new[] { 240010300 }));
+        WorldMapSpot spot = Assert.Single(WorldMapDocument.Load(image).Spots);
+        var container = (WzSubProperty)spot.Entry["mapNo"];
+
+        string name = WorldMapMapNoIndexer.NextIndexName(container.WzProperties.Select(p => p.Name));
+        container.AddProperty(new WzIntProperty(name, 0));
+
+        Assert.Equal("1", name);
+        WorldMapSpot reloaded = Assert.Single(WorldMapDocument.Load(image).Spots);
+        Assert.Equal(new[] { 240010300, 0 }, reloaded.MapNo.Select(m => m.Value).ToArray());
+    }
+
+    // ---- bounds --------------------------------------------------------------------------------
+
+    [Fact]
+    public void MarkersOutsideTheArtwork_KeepTheirCoordinatesUnclamped()
+    {
+        // A spot legitimately sitting far outside BaseImg must not be pulled back into it - the
+        // canvas grows instead, which is a rendering concern only.
+        WzImage image = MakeWorldMapImage("WorldMap000.img", null, new PointF(320f, 235f),
+            ("0", -5000, -5000, 0, null));
+
+        WorldMapSpot spot = Assert.Single(WorldMapDocument.Load(image).Spots);
+
+        Assert.Equal(-5000, spot.SpotX);
+        Assert.Equal(-5000, spot.SpotY);
+        Assert.False(image.Changed);
+    }
+
     // ---- detection -----------------------------------------------------------------------------
 
     [Fact]
@@ -395,7 +687,21 @@ public sealed class WorldMapDocumentTests
         worldMapDirectory.AddImage(image);
 
         Assert.True(WorldMapDetector.IsWorldMapImage(image));
-        Assert.Same(worldMapDirectory, WorldMapDetector.FindWorldMapDirectory(image));
+        Assert.Same(worldMapDirectory, WorldMapDetector.FindWorldMapContainer(image));
+    }
+
+    [Fact]
+    public void Detector_AcceptsASplitWorldMapWzWhereImagesSitAtTheRoot()
+    {
+        // WorldMap_000.wz holds WorldMap*.img directly, with no WorldMap directory in between -
+        // the layout that left the editor blank when only the directory form was accepted.
+        var file = new WzFile(1, WzMapleVersion.BMS) { Name = "WorldMap_000.wz" };
+        var root = new WzDirectory(file.Name, file);
+        var image = new WzImage("WorldMap020.img");
+        root.AddImage(image);
+
+        Assert.True(WorldMapDetector.IsWorldMapImage(image));
+        Assert.Same(root, WorldMapDetector.FindWorldMapContainer(image));
     }
 
     [Fact]

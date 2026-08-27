@@ -15,8 +15,9 @@ using MapleLib.WzLib.WzProperties;
 namespace HaRepacker.GUI.WorldMap
 {
     /// <summary>
-    /// Visual editor for a WorldMap*.img: the BaseImg artwork with every MapList spot drawn on
-    /// top, pan/zoom, and an inspector for the selected spot's type / X / Y / mapNo.
+    /// Visual editor for a WorldMap*.img: the BaseImg artwork with every MapList spot and MapLink
+    /// drawn on top, pan/zoom, multi-selection with group dragging, and an inspector for the
+    /// selection's type / X / Y / mapNo.
     ///
     /// Parked in MainPanel's grid1 next to the skill preview and node editor and shown by
     /// MainPanel.ShowWorldMapEditorIfApplicable, exactly like those two - see there for why it
@@ -25,11 +26,12 @@ namespace HaRepacker.GUI.WorldMap
     /// Built in code rather than XAML to match SkillPreview's panels, which are the closest
     /// precedent for a lazily-created editor dropped into that container.
     ///
-    /// Nothing here writes to the WZ as a side effect of looking: pan, zoom and selecting a spot
-    /// never touch a property or set ParentImage.Changed. Only an actual edit does - a finished
-    /// spot drag, a type change, an X/Y entry, a mapNo entry - and each reports the leaf
-    /// properties it wrote through <see cref="PropertiesChanged"/> so MainPanel can redden
-    /// exactly those tree nodes.
+    /// Nothing here writes to the WZ as a side effect of looking: pan, zoom, selecting and
+    /// Ctrl-clicking never touch a property or set ParentImage.Changed, and a click that does not
+    /// travel past the system drag threshold stays a selection rather than becoming a move. Only
+    /// an actual edit writes - a finished drag, a type change, an X/Y entry, a mapNo edit/add/
+    /// delete - and each reports the leaf properties it wrote through <see cref="PropertiesChanged"/>
+    /// so MainPanel can redden exactly those tree nodes.
     /// </summary>
     public sealed class WorldMapEditorPanel : UserControl
     {
@@ -37,7 +39,9 @@ namespace HaRepacker.GUI.WorldMap
         private const double MaxZoom = 5.0;
         private const double ZoomStep = 1.1;
         private const double SpotRadius = 5.0;
+        private const double LinkRadius = 6.0;
         private const double InspectorWidth = 260.0;
+        private const double CanvasPadding = 64.0;
 
         // ---- chrome ----------------------------------------------------------------------------
 
@@ -57,30 +61,46 @@ namespace HaRepacker.GUI.WorldMap
         private ComboBox typeBox;
         private TextBox spotXBox;
         private TextBox spotYBox;
+        private StackPanel linkDetails;
+        private StackPanel mapNoSection;
         private StackPanel mapNoList;
 
         // ---- state -----------------------------------------------------------------------------
 
         private WorldMapDocument document;
-        private readonly Dictionary<WorldMapSpot, Ellipse> spotMarkers = new Dictionary<WorldMapSpot, Ellipse>();
-        private WorldMapSpot selectedSpot;
+        private readonly Dictionary<IWorldMapMovable, Shape> markers = new Dictionary<IWorldMapMovable, Shape>();
+
+        /// <summary>
+        /// Everything currently selected. Spots and links share one set so a mixed selection drags
+        /// as one group - they both move a "spot" vector, so nothing extra is needed to support it.
+        /// </summary>
+        private readonly HashSet<IWorldMapMovable> selectedItems = new HashSet<IWorldMapMovable>();
+
+        /// <summary>The item the inspector describes when exactly one kind is selected.</summary>
+        private IWorldMapMovable primarySelected;
 
         private bool isPanning;
         private Point panStartPointer;
         private double panStartX;
         private double panStartY;
 
-        private WorldMapSpot draggingSpot;
+        /// <summary>
+        /// Set on mouse-down over a marker, but a move only begins once the pointer travels past
+        /// the system drag threshold - so a plain click selects without ever writing to the WZ.
+        /// </summary>
+        private bool isPendingDrag;
+        private bool isDraggingItems;
         private Point dragStartPointerOnCanvas;
-        private int dragStartSpotX;
-        private int dragStartSpotY;
+        private readonly Dictionary<IWorldMapMovable, (int X, int Y)> dragStartPositions =
+            new Dictionary<IWorldMapMovable, (int X, int Y)>();
 
         /// <summary>Suppresses the inspector's commit handlers while it is being populated.</summary>
         private bool isPopulatingInspector;
 
         /// <summary>
         /// Raised with the leaf properties an edit actually wrote. MainPanel turns each into
-        /// WzNode.ChangedNodeProperty() so only those leaves go red - never their parents.
+        /// WzNode.ChangedNodeProperty() so only those leaves go red - never their parents. A group
+        /// drag raises this once with every moved vector, not once per item.
         /// </summary>
         public event EventHandler<IReadOnlyList<WzImageProperty>> PropertiesChanged;
 
@@ -93,6 +113,12 @@ namespace HaRepacker.GUI.WorldMap
         /// references - only WorldMap siblings, never the whole WZ.
         /// </summary>
         public Func<IReadOnlyList<WzImage>> WorldMapSiblingProvider { get; set; }
+
+        /// <summary>
+        /// The app's undo manager, so adding a mapNo registers on the same stack as every other
+        /// tree insertion. Set by MainPanel; structural edits fall back to plain mutation if absent.
+        /// </summary>
+        public UndoRedoManager UndoRedoMan { get; set; }
 
         /// <summary>
         /// image name -> every mapNo it contains. Built on first use and reused; invalidated for
@@ -109,8 +135,8 @@ namespace HaRepacker.GUI.WorldMap
         // ---- load ------------------------------------------------------------------------------
 
         /// <summary>
-        /// Accepts a WorldMap*.img sitting under a WorldMap directory. Returns false for anything
-        /// else, which is how MainPanel decides whether to show this panel at all.
+        /// Accepts a WorldMap*.img in a world-map container. Returns false for anything else,
+        /// which is how MainPanel decides whether to show this panel at all.
         /// </summary>
         public bool TryLoad(WzObject obj)
         {
@@ -131,26 +157,36 @@ namespace HaRepacker.GUI.WorldMap
             }
 
             document = WorldMapDocument.Load(image);
-            selectedSpot = null;
+            selectedItems.Clear();
+            primarySelected = null;
 
             imageNameText.Text = document.ImageName ?? string.Empty;
             previousImageButton.IsEnabled = WorldMapNavigation.NormalizeImageName(document.ParentMap) != null;
 
             RenderBase();
-            RenderSpots();
+            RenderMarkers();
+            UpdateCanvasBounds();
             ResetView();
             PopulateInspector();
 
-            statusText.Text = document.Warning
-                ?? (document.Spots.Count + " 個 Spot　·　拖曳 Spot 修改座標，雙擊 Spot 跳到系列地圖");
+            statusText.Text = document.Warning ?? DescribeContents();
             return true;
+        }
+
+        private string DescribeContents()
+        {
+            string counts = document.Spots.Count + " 個 Spot";
+            if (document.Links.Count > 0)
+                counts += "、" + document.Links.Count + " 個 MapLink";
+            return counts + "　·　Ctrl+點擊可多選，拖曳可一起移動，雙擊 Spot 跳到系列地圖";
         }
 
         public void Clear()
         {
             document = null;
-            selectedSpot = null;
-            spotMarkers.Clear();
+            selectedItems.Clear();
+            primarySelected = null;
+            markers.Clear();
             worldCanvas.Children.Clear();
             baseImage.Source = null;
             worldCanvas.Children.Add(baseImage);
@@ -163,12 +199,14 @@ namespace HaRepacker.GUI.WorldMap
         private void RenderBase()
         {
             baseImage.Source = null;
+            baseImage.Width = double.NaN;
+            baseImage.Height = double.NaN;
             if (document.BaseCanvas == null)
                 return;
 
             try
             {
-                // Decoding a linked canvas can fail on a broken _inlink/_outlink; the spots are
+                // Decoding a linked canvas can fail on a broken _inlink/_outlink; the markers are
                 // still worth showing without the artwork.
                 System.Drawing.Bitmap bitmap = document.BaseCanvas.GetLinkedWzCanvasBitmap();
                 if (bitmap == null)
@@ -189,24 +227,31 @@ namespace HaRepacker.GUI.WorldMap
             }
         }
 
-        private void RenderSpots()
+        private void RenderMarkers()
         {
-            foreach (Ellipse marker in spotMarkers.Values)
+            foreach (Shape marker in markers.Values)
                 worldCanvas.Children.Remove(marker);
-            spotMarkers.Clear();
+            markers.Clear();
 
             foreach (WorldMapSpot spot in document.Spots)
-            {
-                Ellipse marker = CreateSpotMarker(spot);
-                spotMarkers[spot] = marker;
-                worldCanvas.Children.Add(marker);
-                PositionMarker(spot, spot.SpotX, spot.SpotY);
-            }
+                AddMarker(spot, CreateSpotMarker(spot));
+
+            foreach (WorldMapLink link in document.Links)
+                AddMarker(link, CreateLinkMarker(link));
         }
 
-        private Ellipse CreateSpotMarker(WorldMapSpot spot)
+        private void AddMarker(IWorldMapMovable item, Shape marker)
         {
-            var marker = new Ellipse
+            marker.Tag = item;
+            marker.MouseLeftButtonDown += Marker_MouseLeftButtonDown;
+            markers[item] = marker;
+            worldCanvas.Children.Add(marker);
+            PositionMarker(item, item.Position.X.Value, item.Position.Y.Value);
+        }
+
+        private Shape CreateSpotMarker(WorldMapSpot spot)
+        {
+            return new Ellipse
             {
                 Width = SpotRadius * 2.0,
                 Height = SpotRadius * 2.0,
@@ -214,12 +259,29 @@ namespace HaRepacker.GUI.WorldMap
                 Stroke = Brushes.Black,
                 StrokeThickness = 1.0,
                 Cursor = Cursors.Hand,
-                ToolTip = BuildSpotTooltip(spot),
-                Tag = spot
+                ToolTip = BuildSpotTooltip(spot)
             };
+        }
 
-            marker.MouseLeftButtonDown += SpotMarker_MouseLeftButtonDown;
-            return marker;
+        /// <summary>
+        /// A rotated square - a diamond - so a MapLink is never mistaken for a MapList spot at a
+        /// glance. MapLink has no type property in the schema, so it gets one fixed colour rather
+        /// than an invented per-type palette.
+        /// </summary>
+        private Shape CreateLinkMarker(WorldMapLink link)
+        {
+            return new Rectangle
+            {
+                Width = LinkRadius * 2.0,
+                Height = LinkRadius * 2.0,
+                Fill = Brushes.MediumOrchid,
+                Stroke = Brushes.Black,
+                StrokeThickness = 1.0,
+                Cursor = Cursors.Hand,
+                ToolTip = BuildLinkTooltip(link),
+                RenderTransformOrigin = new Point(0.5, 0.5),
+                RenderTransform = new RotateTransform(45.0)
+            };
         }
 
         private static string BuildSpotTooltip(WorldMapSpot spot)
@@ -229,6 +291,17 @@ namespace HaRepacker.GUI.WorldMap
                 ? spot.MapNo[0].Value.ToString(CultureInfo.InvariantCulture)
                 : "-";
             return "MapList " + spot.EntryName + "\nType " + type + "\n" + firstMapNo;
+        }
+
+        /// <summary>Only fields the entry actually has; nothing is invented for display.</summary>
+        private static string BuildLinkTooltip(WorldMapLink link)
+        {
+            string tooltip = "MapLink " + link.EntryName;
+            if (!string.IsNullOrEmpty(link.ToolTip))
+                tooltip += "\n" + link.ToolTip;
+            if (!string.IsNullOrEmpty(link.LinkMap))
+                tooltip += "\n→ " + link.LinkMap;
+            return tooltip;
         }
 
         /// <summary>
@@ -249,14 +322,36 @@ namespace HaRepacker.GUI.WorldMap
             }
         }
 
-        private void PositionMarker(WorldMapSpot spot, int spotX, int spotY)
+        private void PositionMarker(IWorldMapMovable item, int spotX, int spotY)
         {
-            if (!spotMarkers.TryGetValue(spot, out Ellipse marker))
+            if (!markers.TryGetValue(item, out Shape marker))
                 return;
 
             (double x, double y) = WorldMapCoordinateConverter.WorldToCanvas(document.BaseOrigin, spotX, spotY);
-            Canvas.SetLeft(marker, x - SpotRadius);
-            Canvas.SetTop(marker, y - SpotRadius);
+            Canvas.SetLeft(marker, x - marker.Width / 2.0);
+            Canvas.SetTop(marker, y - marker.Height / 2.0);
+        }
+
+        /// <summary>
+        /// Gives the canvas a real size so hit-testing, dragging and zooming have stable bounds.
+        /// Sized to cover the artwork and every marker - markers legitimately sit outside the
+        /// artwork, and their coordinates must never be clamped to fit.
+        /// </summary>
+        private void UpdateCanvasBounds()
+        {
+            double width = baseImage.Source == null ? 0.0 : baseImage.Width;
+            double height = baseImage.Source == null ? 0.0 : baseImage.Height;
+
+            foreach (IWorldMapMovable item in markers.Keys)
+            {
+                (double x, double y) = WorldMapCoordinateConverter.WorldToCanvas(
+                    document.BaseOrigin, item.Position.X.Value, item.Position.Y.Value);
+                width = Math.Max(width, x + CanvasPadding);
+                height = Math.Max(height, y + CanvasPadding);
+            }
+
+            worldCanvas.Width = Math.Max(width, 1.0);
+            worldCanvas.Height = Math.Max(height, 1.0);
         }
 
         // ---- view ------------------------------------------------------------------------------
@@ -304,8 +399,9 @@ namespace HaRepacker.GUI.WorldMap
             if (document == null)
                 return;
 
-            // A spot handled the click already (it sets Handled), so reaching here means empty
+            // A marker handled the click already (it sets Handled), so reaching here means empty
             // background: start panning rather than moving anything.
+            viewport.Focus();
             isPanning = true;
             panStartPointer = e.GetPosition(viewport);
             panStartX = panTransform.X;
@@ -315,9 +411,23 @@ namespace HaRepacker.GUI.WorldMap
 
         private void Viewport_MouseMove(object sender, MouseEventArgs e)
         {
-            if (draggingSpot != null)
+            if (isPendingDrag || isDraggingItems)
             {
-                DragSpotTo(e.GetPosition(worldCanvas));
+                Point pointer = e.GetPosition(worldCanvas);
+                double deltaX = pointer.X - dragStartPointerOnCanvas.X;
+                double deltaY = pointer.Y - dragStartPointerOnCanvas.Y;
+
+                if (!isDraggingItems)
+                {
+                    // Below the system drag threshold this is still a click, not a move - a shaky
+                    // hand must not silently edit the WZ.
+                    if (Math.Abs(deltaX) * zoomTransform.ScaleX < SystemParameters.MinimumHorizontalDragDistance
+                        && Math.Abs(deltaY) * zoomTransform.ScaleY < SystemParameters.MinimumVerticalDragDistance)
+                        return;
+                    isDraggingItems = true;
+                }
+
+                DragSelectionBy(deltaX, deltaY);
                 return;
             }
 
@@ -331,85 +441,200 @@ namespace HaRepacker.GUI.WorldMap
 
         private void Viewport_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
         {
-            if (draggingSpot != null)
-            {
-                CommitSpotDrag();
-            }
+            if (isDraggingItems)
+                CommitDrag();
+            else if (isPendingDrag)
+                PopulateInspector(); // click without a move: selection only, nothing written
+
+            isPendingDrag = false;
+            isDraggingItems = false;
+            dragStartPositions.Clear();
 
             isPanning = false;
             if (viewport.IsMouseCaptured)
                 viewport.ReleaseMouseCapture();
         }
 
-        // ---- spot interaction -------------------------------------------------------------------
-
-        private void SpotMarker_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        private void Viewport_KeyDown(object sender, KeyEventArgs e)
         {
-            if (sender is not Ellipse marker || marker.Tag is not WorldMapSpot spot)
+            if (document == null || e.Key != Key.Escape)
                 return;
 
-            // Handled so the viewport does not also start a pan - dragging a spot must move the
-            // spot, not the map.
+            ClearSelection();
             e.Handled = true;
+        }
+
+        // ---- selection ---------------------------------------------------------------------------
+
+        private void Marker_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        {
+            if (sender is not Shape marker || marker.Tag is not IWorldMapMovable item)
+                return;
+
+            // Handled so the viewport does not also start a pan - dragging a marker must move the
+            // marker, not the map.
+            e.Handled = true;
+            viewport.Focus();
 
             if (e.ClickCount >= 2)
             {
-                NavigateFromSpot(spot);
+                isPendingDrag = false;
+                isDraggingItems = false;
+                NavigateFrom(item);
                 return;
             }
 
-            SelectSpot(spot);
+            bool additive = (Keyboard.Modifiers & ModifierKeys.Control) != 0;
+            if (additive)
+            {
+                // Ctrl+click is a selection toggle and nothing else - it never starts a move, so
+                // building a multi-selection can never nudge anything.
+                if (!selectedItems.Remove(item))
+                {
+                    selectedItems.Add(item);
+                    primarySelected = item;
+                }
+                else if (ReferenceEquals(primarySelected, item))
+                {
+                    primarySelected = selectedItems.FirstOrDefault();
+                }
+                RefreshSelectionVisuals();
+                PopulateInspector();
+                return;
+            }
 
-            draggingSpot = spot;
-            dragStartPointerOnCanvas = e.GetPosition(worldCanvas);
-            dragStartSpotX = spot.SpotX;
-            dragStartSpotY = spot.SpotY;
+            // Plain click on something outside the selection replaces it; on something already
+            // selected it keeps the group so the whole group can be dragged.
+            if (!selectedItems.Contains(item))
+            {
+                selectedItems.Clear();
+                selectedItems.Add(item);
+            }
+            primarySelected = item;
+            RefreshSelectionVisuals();
+            PopulateInspector();
+
+            BeginPendingDrag(e.GetPosition(worldCanvas));
+        }
+
+        private void BeginPendingDrag(Point pointerOnCanvas)
+        {
+            dragStartPositions.Clear();
+            foreach (IWorldMapMovable item in selectedItems)
+                dragStartPositions[item] = (item.Position.X.Value, item.Position.Y.Value);
+
+            dragStartPointerOnCanvas = pointerOnCanvas;
+            isPendingDrag = true;
+            isDraggingItems = false;
             viewport.CaptureMouse();
         }
 
-        private void SelectSpot(WorldMapSpot spot)
+        private void ClearSelection()
         {
-            // Selecting only changes this panel - the tree's selection is left alone so the user
-            // does not lose their place, and nothing is written to the WZ.
-            if (selectedSpot != null && spotMarkers.TryGetValue(selectedSpot, out Ellipse previous))
+            selectedItems.Clear();
+            primarySelected = null;
+            RefreshSelectionVisuals();
+            PopulateInspector();
+        }
+
+        private void SelectAllSpots()
+        {
+            if (document == null)
+                return;
+
+            selectedItems.Clear();
+            foreach (WorldMapSpot spot in document.Spots)
+                selectedItems.Add(spot);
+            primarySelected = document.Spots.Count > 0 ? document.Spots[0] : null;
+            RefreshSelectionVisuals();
+            PopulateInspector();
+        }
+
+        /// <summary>
+        /// Selected items get a white outline; the primary one is drawn thicker so the inspector's
+        /// subject is identifiable inside a group.
+        /// </summary>
+        private void RefreshSelectionVisuals()
+        {
+            foreach (KeyValuePair<IWorldMapMovable, Shape> entry in markers)
             {
-                previous.Stroke = Brushes.Black;
-                previous.StrokeThickness = 1.0;
+                bool selected = selectedItems.Contains(entry.Key);
+                entry.Value.Stroke = selected ? Brushes.White : Brushes.Black;
+                entry.Value.StrokeThickness = selected
+                    ? (ReferenceEquals(entry.Key, primarySelected) ? 3.0 : 2.0)
+                    : 1.0;
+            }
+        }
+
+        // ---- dragging ----------------------------------------------------------------------------
+
+        /// <summary>
+        /// Live feedback only - the markers and the X/Y boxes follow the pointer, but nothing is
+        /// written until the button comes up. Marking the image dirty on every mouse move would
+        /// flag the WZ as changed for a drag the user then abandons.
+        /// </summary>
+        private void DragSelectionBy(double deltaX, double deltaY)
+        {
+            (int worldDeltaX, int worldDeltaY) = WorldMapCoordinateConverter.CanvasToWorld(
+                new System.Drawing.PointF(0f, 0f), deltaX, deltaY);
+
+            Dictionary<IWorldMapMovable, (int X, int Y)> moved =
+                WorldMapGroupMove.Offset(dragStartPositions, worldDeltaX, worldDeltaY);
+
+            foreach (KeyValuePair<IWorldMapMovable, (int X, int Y)> entry in moved)
+                PositionMarker(entry.Key, entry.Value.X, entry.Value.Y);
+
+            if (primarySelected != null && moved.TryGetValue(primarySelected, out (int X, int Y) primary))
+                ShowCoordinates(primary.X, primary.Y);
+        }
+
+        /// <summary>
+        /// Writes every item that actually moved, in one go, and reports them as a single batch so
+        /// MainPanel reddens all of them from one event.
+        /// </summary>
+        private void CommitDrag()
+        {
+            var written = new List<WzImageProperty>();
+
+            foreach (KeyValuePair<IWorldMapMovable, (int X, int Y)> start in dragStartPositions)
+            {
+                IWorldMapMovable item = start.Key;
+                if (!markers.TryGetValue(item, out Shape marker))
+                    continue;
+
+                // The marker already sits where the drag left it; convert that back to WZ space.
+                double centreX = Canvas.GetLeft(marker) + marker.Width / 2.0;
+                double centreY = Canvas.GetTop(marker) + marker.Height / 2.0;
+                (int x, int y) = WorldMapCoordinateConverter.CanvasToWorld(document.BaseOrigin, centreX, centreY);
+
+                if (item.Position.X.Value == x && item.Position.Y.Value == y)
+                    continue;
+
+                item.Position.X.Value = x;
+                item.Position.Y.Value = y;
+                if (item.Position.ParentImage != null)
+                    item.Position.ParentImage.Changed = true;
+                written.Add(item.Position);
             }
 
-            selectedSpot = spot;
-
-            if (spot != null && spotMarkers.TryGetValue(spot, out Ellipse marker))
+            if (written.Count > 0)
             {
-                marker.Stroke = Brushes.White;
-                marker.StrokeThickness = 3.0;
+                PropertiesChanged?.Invoke(this, written);
+                statusText.Text = "已移動 " + written.Count + " 個項目。";
             }
 
             PopulateInspector();
         }
 
-        /// <summary>
-        /// Live feedback only - the marker and the X/Y boxes follow the pointer, but nothing is
-        /// written until the button comes up. Marking the image dirty on every mouse move would
-        /// flag the WZ as changed for a drag the user then abandons.
-        /// </summary>
-        private void DragSpotTo(Point pointerOnCanvas)
+        // ---- inspector ---------------------------------------------------------------------------
+
+        private void ShowCoordinates(int x, int y)
         {
-            double deltaX = pointerOnCanvas.X - dragStartPointerOnCanvas.X;
-            double deltaY = pointerOnCanvas.Y - dragStartPointerOnCanvas.Y;
-
-            (double canvasX, double canvasY) = WorldMapCoordinateConverter.WorldToCanvas(
-                document.BaseOrigin, dragStartSpotX, dragStartSpotY);
-            (int worldX, int worldY) = WorldMapCoordinateConverter.CanvasToWorld(
-                document.BaseOrigin, canvasX + deltaX, canvasY + deltaY);
-
-            PositionMarker(draggingSpot, worldX, worldY);
-
             isPopulatingInspector = true;
             try
             {
-                spotXBox.Text = worldX.ToString(CultureInfo.InvariantCulture);
-                spotYBox.Text = worldY.ToString(CultureInfo.InvariantCulture);
+                spotXBox.Text = x.ToString(CultureInfo.InvariantCulture);
+                spotYBox.Text = y.ToString(CultureInfo.InvariantCulture);
             }
             finally
             {
@@ -417,58 +642,19 @@ namespace HaRepacker.GUI.WorldMap
             }
         }
 
-        private void CommitSpotDrag()
-        {
-            WorldMapSpot spot = draggingSpot;
-            draggingSpot = null;
-
-            if (!int.TryParse(spotXBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out int newX)
-                || !int.TryParse(spotYBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out int newY))
-            {
-                PositionMarker(spot, spot.SpotX, spot.SpotY);
-                PopulateInspector();
-                return;
-            }
-
-            ApplySpotPosition(spot, newX, newY);
-        }
-
-        /// <summary>
-        /// The single place a spot's coordinates reach the WZ - used by both the drag and the X/Y
-        /// boxes. A no-op move writes nothing, so nudging a spot back to where it started does not
-        /// leave the file dirty.
-        /// </summary>
-        private void ApplySpotPosition(WorldMapSpot spot, int newX, int newY)
-        {
-            if (spot == null)
-                return;
-
-            if (spot.SpotX == newX && spot.SpotY == newY)
-            {
-                PositionMarker(spot, newX, newY);
-                return;
-            }
-
-            spot.Spot.X.Value = newX;
-            spot.Spot.Y.Value = newY;
-            MarkChanged(spot.Spot);
-
-            PositionMarker(spot, newX, newY);
-            statusText.Text = "MapList " + spot.EntryName + " 座標已更新為 " + newX + ", " + newY + "。";
-        }
-
-        // ---- inspector ---------------------------------------------------------------------------
-
         private void PopulateInspector()
         {
             isPopulatingInspector = true;
             try
             {
                 mapNoList.Children.Clear();
+                linkDetails.Children.Clear();
+                linkDetails.Visibility = Visibility.Collapsed;
+                mapNoSection.Visibility = Visibility.Collapsed;
 
-                if (selectedSpot == null)
+                if (selectedItems.Count == 0)
                 {
-                    inspectorTitle.Text = "未選取 Spot";
+                    inspectorTitle.Text = "未選取";
                     typeBox.ItemsSource = null;
                     typeBox.IsEnabled = false;
                     spotXBox.Text = string.Empty;
@@ -478,28 +664,16 @@ namespace HaRepacker.GUI.WorldMap
                     return;
                 }
 
-                inspectorTitle.Text = "MapList " + selectedSpot.EntryName;
+                if (selectedItems.Count > 1)
+                {
+                    PopulateMultiSelection();
+                    return;
+                }
 
-                // Offer the usual values, plus whatever this spot actually has - an unknown type
-                // must stay selectable and must never be silently rewritten to 0.
-                var typeOptions = new List<int> { 0, 1, 2, 3 };
-                if (selectedSpot.Type != null && !typeOptions.Contains(selectedSpot.Type.Value))
-                    typeOptions.Add(selectedSpot.Type.Value);
-                typeOptions.Sort();
-
-                typeBox.ItemsSource = typeOptions;
-                typeBox.IsEnabled = selectedSpot.Type != null;
-                typeBox.SelectedItem = selectedSpot.Type?.Value;
-                if (selectedSpot.Type == null)
-                    typeBox.Text = "-";
-
-                spotXBox.IsEnabled = true;
-                spotYBox.IsEnabled = true;
-                spotXBox.Text = selectedSpot.SpotX.ToString(CultureInfo.InvariantCulture);
-                spotYBox.Text = selectedSpot.SpotY.ToString(CultureInfo.InvariantCulture);
-
-                foreach (WzIntProperty mapNo in selectedSpot.MapNo)
-                    mapNoList.Children.Add(BuildMapNoRow(mapNo));
+                if (primarySelected is WorldMapSpot spot)
+                    PopulateSpot(spot);
+                else if (primarySelected is WorldMapLink link)
+                    PopulateLink(link);
             }
             finally
             {
@@ -507,16 +681,125 @@ namespace HaRepacker.GUI.WorldMap
             }
         }
 
-        private UIElement BuildMapNoRow(WzIntProperty mapNo)
+        private void PopulateMultiSelection()
+        {
+            int spots = selectedItems.OfType<WorldMapSpot>().Count();
+            int links = selectedItems.OfType<WorldMapLink>().Count();
+            inspectorTitle.Text = links == 0
+                ? "已選取 " + spots + " 個 Spot"
+                : (spots == 0 ? "已選取 " + links + " 個 MapLink"
+                              : "已選取 " + spots + " 個 Spot、" + links + " 個 MapLink");
+
+            // A single absolute X/Y would be a lie for a group, so the boxes are shown empty and
+            // disabled - group positioning is done by dragging.
+            spotXBox.Text = string.Empty;
+            spotYBox.Text = string.Empty;
+            spotXBox.IsEnabled = false;
+            spotYBox.IsEnabled = false;
+
+            var types = selectedItems.OfType<WorldMapSpot>()
+                .Select(s => s.Type?.Value)
+                .Distinct()
+                .ToList();
+
+            typeBox.IsEnabled = false;
+            if (types.Count == 1 && types[0].HasValue)
+            {
+                typeBox.ItemsSource = new List<int> { types[0].Value };
+                typeBox.SelectedItem = types[0].Value;
+            }
+            else
+            {
+                typeBox.ItemsSource = null;
+                typeBox.Text = types.Count > 1 ? "多個值" : "-";
+            }
+
+            // mapNo belongs to one spot; hidden for a group.
+        }
+
+        private void PopulateSpot(WorldMapSpot spot)
+        {
+            inspectorTitle.Text = spot.DisplayName;
+
+            // Offer the usual values, plus whatever this spot actually has - an unknown type must
+            // stay selectable and must never be silently rewritten to 0.
+            var typeOptions = new List<int> { 0, 1, 2, 3 };
+            if (spot.Type != null && !typeOptions.Contains(spot.Type.Value))
+                typeOptions.Add(spot.Type.Value);
+            typeOptions.Sort();
+
+            typeBox.ItemsSource = typeOptions;
+            typeBox.IsEnabled = spot.Type != null;
+            typeBox.SelectedItem = spot.Type?.Value;
+            if (spot.Type == null)
+                typeBox.Text = "-";
+
+            spotXBox.IsEnabled = true;
+            spotYBox.IsEnabled = true;
+            spotXBox.Text = spot.SpotX.ToString(CultureInfo.InvariantCulture);
+            spotYBox.Text = spot.SpotY.ToString(CultureInfo.InvariantCulture);
+
+            mapNoSection.Visibility = Visibility.Visible;
+            foreach (WzIntProperty mapNo in spot.MapNo)
+                mapNoList.Children.Add(BuildMapNoRow(spot, mapNo));
+        }
+
+        private void PopulateLink(WorldMapLink link)
+        {
+            inspectorTitle.Text = link.DisplayName;
+
+            // MapLink has no type in the schema, so the type row is inert rather than invented.
+            typeBox.ItemsSource = null;
+            typeBox.IsEnabled = false;
+            typeBox.Text = "-";
+
+            spotXBox.IsEnabled = true;
+            spotYBox.IsEnabled = true;
+            spotXBox.Text = link.SpotX.ToString(CultureInfo.InvariantCulture);
+            spotYBox.Text = link.SpotY.ToString(CultureInfo.InvariantCulture);
+
+            // Only what the entry actually carries.
+            if (!string.IsNullOrEmpty(link.ToolTip))
+                linkDetails.Children.Add(ReadOnlyDetail("toolTip", link.ToolTip));
+            if (!string.IsNullOrEmpty(link.LinkMap))
+                linkDetails.Children.Add(ReadOnlyDetail("link/linkMap", link.LinkMap));
+            linkDetails.Visibility = linkDetails.Children.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        private static UIElement ReadOnlyDetail(string label, string value)
+        {
+            var stack = new StackPanel { Margin = new Thickness(0.0, 0.0, 0.0, 8.0) };
+            stack.Children.Add(FieldLabel(label));
+            stack.Children.Add(new TextBlock { Text = value, TextWrapping = TextWrapping.Wrap });
+            return stack;
+        }
+
+        private UIElement BuildMapNoRow(WorldMapSpot spot, WzIntProperty mapNo)
         {
             var row = new DockPanel { Margin = new Thickness(0.0, 0.0, 0.0, 4.0) };
 
-            row.Children.Add(new TextBlock
+            var index = new TextBlock
             {
                 Text = mapNo.Name,
-                Width = 28.0,
+                Width = 24.0,
                 VerticalAlignment = VerticalAlignment.Center
-            });
+            };
+            DockPanel.SetDock(index, Dock.Left);
+            row.Children.Add(index);
+
+            var remove = new Button
+            {
+                Content = "×",
+                Width = 24.0,
+                Height = 24.0,
+                Margin = new Thickness(4.0, 0.0, 0.0, 0.0),
+                ToolTip = "刪除這一筆 mapNo",
+                Tag = mapNo
+            };
+            remove.SetResourceReference(StyleProperty, "HareButtonStyle");
+            remove.Click += delegate { DeleteMapNo(spot, mapNo); };
+            DockPanel.SetDock(remove, Dock.Right);
+            row.Children.Add(remove);
 
             var box = new TextBox
             {
@@ -558,65 +841,225 @@ namespace HaRepacker.GUI.WorldMap
 
             mapNo.Value = value;
             MarkChanged(mapNo);
-
-            // This image's map ids just changed, so the cached set used for spot navigation is
-            // stale for it (and only for it).
-            if (document?.ImageName != null)
-                mapNumberCache.Remove(document.ImageName);
-
+            InvalidateMapNumberCache();
             statusText.Text = "mapNo " + mapNo.Name + " 已更新為 " + value + "。";
         }
 
+        // ---- mapNo structure ----------------------------------------------------------------------
+
+        /// <summary>
+        /// Appends a new mapNo entry, creating the mapNo container itself when the spot has none.
+        /// Only ever reached from the explicit button - opening the editor never adds anything.
+        /// Goes through WzNode so the tree gains the node too, rather than the WZ and the tree
+        /// drifting apart.
+        /// </summary>
+        private void AddMapNo(WorldMapSpot spot)
+        {
+            if (spot.Entry.HRTag is not WzNode entryNode)
+            {
+                statusText.Text = "找不到對應的樹節點，無法新增 mapNo。";
+                return;
+            }
+
+            WzNode containerNode;
+            if (spot.Entry["mapNo"] is WzSubProperty existing)
+            {
+                containerNode = existing.HRTag as WzNode;
+            }
+            else
+            {
+                containerNode = AddChildNode(entryNode, new WzSubProperty("mapNo"));
+            }
+
+            if (containerNode?.Tag is not WzSubProperty container)
+            {
+                statusText.Text = "無法建立 mapNo。";
+                return;
+            }
+
+            string name = WorldMapMapNoIndexer.NextIndexName(container.WzProperties.Select(p => p.Name));
+            WzNode added = AddChildNode(containerNode, new WzIntProperty(name, 0));
+            if (added == null)
+                return;
+
+            InvalidateMapNumberCache();
+            ReloadPreservingSelection();
+            statusText.Text = "已新增 mapNo " + name + "。";
+        }
+
+        /// <summary>
+        /// Inserts through WzNode.AddObject when the undo manager is available, so the insertion
+        /// lands on the same undo stack as every other tree insertion and the tree node is created
+        /// for us. Falls back to a plain insert when there is no manager.
+        /// </summary>
+        private WzNode AddChildNode(WzNode parentNode, WzImageProperty property)
+        {
+            if (UndoRedoMan != null)
+                return parentNode.AddObject(property, UndoRedoMan);
+
+            if (parentNode.Tag is not IPropertyContainer container)
+                return null;
+
+            container.AddProperty(property);
+            if (property.ParentImage != null)
+                property.ParentImage.Changed = true;
+
+            var node = new WzNode(property, true);
+            parentNode.Nodes.Add(node);
+            return node;
+        }
+
+        /// <summary>
+        /// Removes one mapNo entry and renumbers the rest so the names stay contiguous - the
+        /// client reads 0..n-1 and stops at the first gap, so leaving a hole would silently drop
+        /// the remaining maps. Structural, so it asks first.
+        ///
+        /// The empty mapNo container is deliberately left behind: removing it too would be a
+        /// second structural change the user did not ask for.
+        /// </summary>
+        private void DeleteMapNo(WorldMapSpot spot, WzIntProperty mapNo)
+        {
+            if (spot.Entry["mapNo"] is not WzSubProperty container)
+                return;
+            if (!Warning.Warn("確定刪除 mapNo " + mapNo.Name + "？"))
+                return;
+
+            if (mapNo.HRTag is WzNode mapNoNode)
+                mapNoNode.DeleteWzNode();
+            else
+                container.RemoveProperty(mapNo);
+
+            if (container.ParentImage != null)
+                container.ParentImage.Changed = true;
+
+            RenumberMapNo(container);
+            InvalidateMapNumberCache();
+            ReloadPreservingSelection();
+            statusText.Text = "已刪除 mapNo " + mapNo.Name + "。";
+        }
+
+        private static void RenumberMapNo(WzSubProperty container)
+        {
+            List<WzImageProperty> remaining = container.WzProperties.ToList();
+            Dictionary<string, string> renames = WorldMapMapNoIndexer.Renumber(
+                remaining.Select(p => p.Name).ToList());
+            if (renames.Count == 0)
+                return;
+
+            foreach (WzImageProperty property in remaining)
+            {
+                if (!renames.TryGetValue(property.Name, out string newName))
+                    continue;
+
+                // ChangeName keeps the tree label and the WZ name in step and flags the node as
+                // edited; renaming without it would leave the tree showing the old index.
+                if (property.HRTag is WzNode node)
+                    node.ChangeName(newName);
+                else
+                    property.Name = newName;
+            }
+        }
+
+        /// <summary>
+        /// Re-reads the image after a structural change and puts the selection back on the same
+        /// entries, so adding or deleting a mapNo does not dump the user out of their selection.
+        /// </summary>
+        private void ReloadPreservingSelection()
+        {
+            if (document?.Image == null)
+                return;
+
+            var selectedEntryNames = selectedItems
+                .Select(item => item is WorldMapSpot spot ? "S:" + spot.EntryName
+                              : item is WorldMapLink link ? "L:" + link.EntryName : null)
+                .Where(key => key != null)
+                .ToHashSet(StringComparer.Ordinal);
+            string primaryKey = primarySelected is WorldMapSpot p ? "S:" + p.EntryName
+                              : primarySelected is WorldMapLink l ? "L:" + l.EntryName : null;
+
+            document = WorldMapDocument.Load(document.Image);
+            RenderMarkers();
+            UpdateCanvasBounds();
+
+            selectedItems.Clear();
+            primarySelected = null;
+            foreach (IWorldMapMovable item in markers.Keys)
+            {
+                string key = item is WorldMapSpot spot ? "S:" + spot.EntryName : "L:" + ((WorldMapLink)item).EntryName;
+                if (!selectedEntryNames.Contains(key))
+                    continue;
+                selectedItems.Add(item);
+                if (key == primaryKey)
+                    primarySelected = item;
+            }
+            primarySelected ??= selectedItems.FirstOrDefault();
+
+            RefreshSelectionVisuals();
+            PopulateInspector();
+        }
+
+        private void InvalidateMapNumberCache()
+        {
+            if (document?.ImageName != null)
+                mapNumberCache.Remove(document.ImageName);
+        }
+
+        // ---- type / coordinates -------------------------------------------------------------------
+
         private void TypeBox_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
-            if (isPopulatingInspector || selectedSpot?.Type == null)
+            if (isPopulatingInspector || primarySelected is not WorldMapSpot spot || spot.Type == null)
                 return;
-            if (typeBox.SelectedItem is not int value || value == selectedSpot.Type.Value)
+            if (selectedItems.Count != 1)
+                return;
+            if (typeBox.SelectedItem is not int value || value == spot.Type.Value)
                 return;
 
-            selectedSpot.Type.Value = value;
-            MarkChanged(selectedSpot.Type);
+            spot.Type.Value = value;
+            MarkChanged(spot.Type);
 
-            if (spotMarkers.TryGetValue(selectedSpot, out Ellipse marker))
+            if (markers.TryGetValue(spot, out Shape marker))
                 marker.Fill = BrushForType(value);
 
-            statusText.Text = "MapList " + selectedSpot.EntryName + " 的 type 已更新為 " + value + "。";
+            statusText.Text = spot.DisplayName + " 的 type 已更新為 " + value + "。";
         }
 
         private void SpotCoordinateBox_KeyDown(object sender, KeyEventArgs e)
         {
             if (e.Key != Key.Enter)
                 return;
-            CommitSpotCoordinates();
+            CommitCoordinates();
             e.Handled = true;
         }
 
-        private void SpotCoordinateBox_LostFocus(object sender, RoutedEventArgs e) => CommitSpotCoordinates();
+        private void SpotCoordinateBox_LostFocus(object sender, RoutedEventArgs e) => CommitCoordinates();
 
-        private void CommitSpotCoordinates()
+        private void CommitCoordinates()
         {
-            if (isPopulatingInspector || selectedSpot == null || draggingSpot != null)
+            if (isPopulatingInspector || primarySelected == null || selectedItems.Count != 1 || isDraggingItems)
                 return;
 
             if (!int.TryParse(spotXBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out int x)
                 || !int.TryParse(spotYBox.Text, NumberStyles.Integer, CultureInfo.InvariantCulture, out int y))
             {
                 // Put the real values back rather than nagging with a dialog.
-                isPopulatingInspector = true;
-                try
-                {
-                    spotXBox.Text = selectedSpot.SpotX.ToString(CultureInfo.InvariantCulture);
-                    spotYBox.Text = selectedSpot.SpotY.ToString(CultureInfo.InvariantCulture);
-                }
-                finally
-                {
-                    isPopulatingInspector = false;
-                }
+                ShowCoordinates(primarySelected.Position.X.Value, primarySelected.Position.Y.Value);
                 statusText.Text = "座標必須是整數";
                 return;
             }
 
-            ApplySpotPosition(selectedSpot, x, y);
+            IWorldMapMovable item = primarySelected;
+            if (item.Position.X.Value == x && item.Position.Y.Value == y)
+                return;
+
+            item.Position.X.Value = x;
+            item.Position.Y.Value = y;
+            if (item.Position.ParentImage != null)
+                item.Position.ParentImage.Changed = true;
+
+            PositionMarker(item, x, y);
+            PropertiesChanged?.Invoke(this, new WzImageProperty[] { item.Position });
+            statusText.Text = item.DisplayName + " 座標已更新為 " + x + ", " + y + "。";
         }
 
         /// <summary>
@@ -645,16 +1088,35 @@ namespace HaRepacker.GUI.WorldMap
             NavigationRequested?.Invoke(this, parent);
         }
 
-        /// <summary>
-        /// Double-clicking a spot follows it into the WorldMap that covers those maps, matched on
-        /// shared mapNo values rather than guessed from the id - see
-        /// WorldMapNavigation.ResolveForwardTarget.
-        /// </summary>
-        private void NavigateFromSpot(WorldMapSpot spot)
+        private void NavigateFrom(IWorldMapMovable item)
         {
             if (document == null)
                 return;
 
+            // A MapLink states its destination outright, so no guessing is needed.
+            if (item is WorldMapLink link)
+            {
+                string linkTarget = WorldMapNavigation.NormalizeImageName(link.LinkMap);
+                if (linkTarget == null)
+                {
+                    statusText.Text = "這個 MapLink 沒有 link/linkMap，無法判斷目標。";
+                    return;
+                }
+                NavigationRequested?.Invoke(this, linkTarget);
+                return;
+            }
+
+            if (item is WorldMapSpot spot)
+                NavigateFromSpot(spot);
+        }
+
+        /// <summary>
+        /// Double-clicking a spot follows it into the WorldMap that covers those maps, matched on
+        /// shared mapNo values rather than guessed from the id. Uses only the double-clicked
+        /// spot's own mapNo, never the whole selection's.
+        /// </summary>
+        private void NavigateFromSpot(WorldMapSpot spot)
+        {
             var clicked = new List<int>();
             foreach (WzIntProperty mapNo in spot.MapNo)
                 clicked.Add(mapNo.Value);
@@ -741,6 +1203,18 @@ namespace HaRepacker.GUI.WorldMap
             DockPanel.SetDock(resetButton, Dock.Right);
             bar.Children.Add(resetButton);
 
+            Button clearSelectionButton = PanelButton("取消選取");
+            clearSelectionButton.Margin = new Thickness(0.0, 0.0, 8.0, 0.0);
+            clearSelectionButton.Click += delegate { ClearSelection(); };
+            DockPanel.SetDock(clearSelectionButton, Dock.Right);
+            bar.Children.Add(clearSelectionButton);
+
+            Button selectAllButton = PanelButton("全選 Spot");
+            selectAllButton.Margin = new Thickness(0.0, 0.0, 8.0, 0.0);
+            selectAllButton.Click += delegate { SelectAllSpots(); };
+            DockPanel.SetDock(selectAllButton, Dock.Right);
+            bar.Children.Add(selectAllButton);
+
             zoomText = new TextBlock
             {
                 Text = "Zoom: 100%",
@@ -787,7 +1261,7 @@ namespace HaRepacker.GUI.WorldMap
 
             inspectorTitle = new TextBlock
             {
-                Text = "未選取 Spot",
+                Text = "未選取",
                 FontWeight = FontWeights.Bold,
                 Margin = new Thickness(0.0, 0.0, 0.0, 10.0)
             };
@@ -806,9 +1280,24 @@ namespace HaRepacker.GUI.WorldMap
             spotYBox = CoordinateBox();
             inspector.Children.Add(spotYBox);
 
-            inspector.Children.Add(FieldLabel("mapNo"));
+            linkDetails = new StackPanel { Visibility = Visibility.Collapsed };
+            inspector.Children.Add(linkDetails);
+
+            mapNoSection = new StackPanel { Visibility = Visibility.Collapsed };
+            mapNoSection.Children.Add(FieldLabel("mapNo"));
             mapNoList = new StackPanel();
-            inspector.Children.Add(mapNoList);
+            mapNoSection.Children.Add(mapNoList);
+
+            Button addMapNo = PanelButton("＋ 新增 mapNo");
+            addMapNo.HorizontalAlignment = HorizontalAlignment.Stretch;
+            addMapNo.Margin = new Thickness(0.0, 4.0, 0.0, 0.0);
+            addMapNo.Click += delegate
+            {
+                if (primarySelected is WorldMapSpot spot && selectedItems.Count == 1)
+                    AddMapNo(spot);
+            };
+            mapNoSection.Children.Add(addMapNo);
+            inspector.Children.Add(mapNoSection);
 
             var scroller = new ScrollViewer
             {
@@ -876,7 +1365,7 @@ namespace HaRepacker.GUI.WorldMap
             };
             worldCanvas.Children.Add(baseImage);
 
-            // One transform group drives the whole world layer, so the artwork and every spot
+            // One transform group drives the whole world layer, so the artwork and every marker
             // always pan and zoom together.
             var transforms = new TransformGroup();
             transforms.Children.Add(zoomTransform);
@@ -888,7 +1377,8 @@ namespace HaRepacker.GUI.WorldMap
                 ClipToBounds = true,
                 // A transparent background still receives mouse input, which is what lets an
                 // empty area start a pan.
-                Background = Brushes.Transparent
+                Background = Brushes.Transparent,
+                Focusable = true
             };
             viewport.Children.Add(worldCanvas);
 
@@ -896,6 +1386,7 @@ namespace HaRepacker.GUI.WorldMap
             viewport.MouseLeftButtonDown += Viewport_MouseLeftButtonDown;
             viewport.MouseMove += Viewport_MouseMove;
             viewport.MouseLeftButtonUp += Viewport_MouseLeftButtonUp;
+            viewport.KeyDown += Viewport_KeyDown;
 
             return viewport;
         }
