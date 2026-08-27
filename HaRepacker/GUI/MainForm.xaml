@@ -62,6 +62,7 @@
             <MenuItem x:Name="toolsToolStripMenuItem" Header="_Tools">
                 <MenuItem x:Name="exportFilesToXMLToolStripMenuItem" Header="Export files">
                     <MenuItem x:Name="xMLToolStripMenuItem" Header="XML" Click="xMLToolStripMenuItem_Click"/>
+                    <MenuItem x:Name="dataFolderServerXmlToolStripMenuItem" Header="伺服器端XML（Data資料夾批次）" Click="dataFolderServerXmlToolStripMenuItem_Click"/>
                     <MenuItem x:Name="rawDataToolStripMenuItem" Header="Raw data" Click="rawDataToolStripMenuItem_Click"/>
                     <MenuItem x:Name="imgToolStripMenuItem" Header="IMG" Click="imgToolStripMenuItem_Click"/>
                     <MenuItem x:Name="nXFormatToolStripMenuItem" Header="NX" Click="nXFormatToolStripMenuItem_Click"/>

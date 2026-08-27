@@ -1,3 +1,4 @@
+using System;
 using System.Windows;
 using MapleLib.WzLib.Serializer;
 
@@ -17,6 +18,8 @@ namespace HaRepacker.GUI
             defXmlFolderEnable.IsChecked = !string.IsNullOrEmpty(defaultFolder);
             defXmlFolderBox.Text = defaultFolder;
             indentBox.Text = Program.ConfigurationManager.UserSettings.Indentation.ToString();
+            dataFolderParallelismBox.Text = DataFolderWzServerXmlExporter.ResolveParallelism(
+                Program.ConfigurationManager.UserSettings.DataFolderExportParallelism).ToString();
             lineBreakBox.SelectedIndex = (int)Program.ConfigurationManager.UserSettings.LineBreakType;
             themeColorComboBox.SelectedIndex = Program.ConfigurationManager.UserSettings.ThemeColor;
             UpdateFolderState();
@@ -34,6 +37,9 @@ namespace HaRepacker.GUI
             autoAssociateBox.Content = Text("autoAssociateBox.Text", "Automatically associate WZ files with HaRepacker");
             defXmlFolderEnable.Content = Text("defXmlFolderEnable.Text", "Default XML Folder:");
             indentationLabel.Text = Text("label1.Text", "Indentation");
+            dataFolderParallelismLabel.Text = Text("dataFolderParallelismLabel.Text", "Data 批次匯出並行數");
+            dataFolderParallelismHint.Text = string.Format(
+                Text("dataFolderParallelismHint.Text", "1 = 循序，最大 {0}"), Environment.ProcessorCount);
             lineBreakLabel.Text = Text("label2.Text", "Line break");
             themeLabel.Text = Text("label3.Text", "Theme Color:");
             lineBreakBox.Items.Add(Text("lineBreakBox.Items", "None"));
@@ -61,7 +67,14 @@ namespace HaRepacker.GUI
             Program.ConfigurationManager.UserSettings.UseApngIncompatibilityFrame = apngIncompEnable.IsChecked == true;
             Program.ConfigurationManager.UserSettings.AutoAssociate = autoAssociateBox.IsChecked == true;
             Program.ConfigurationManager.UserSettings.DefaultXmlFolder = defXmlFolderEnable.IsChecked == true ? defXmlFolderBox.Text : string.Empty;
+            int parallelism = WpfDialogSupport.ParseInteger(dataFolderParallelismBox.Text, -1);
+            if (parallelism < 1 || parallelism > Environment.ProcessorCount)
+            {
+                Warning.Error(string.Format("Data 批次匯出並行數必須介於 1 到 {0} 之間。", Environment.ProcessorCount));
+                return;
+            }
             Program.ConfigurationManager.UserSettings.Indentation = indentation;
+            Program.ConfigurationManager.UserSettings.DataFolderExportParallelism = parallelism;
             Program.ConfigurationManager.UserSettings.LineBreakType = (LineBreak)lineBreakBox.SelectedIndex;
             Program.ConfigurationManager.UserSettings.ThemeColor = themeColorComboBox.SelectedIndex;
             Program.ConfigurationManager.Save();

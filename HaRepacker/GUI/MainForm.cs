@@ -1966,6 +1966,93 @@ namespace HaRepacker.GUI
             threadDone = true;
         }
 
+        private const string WZ_EXTRACT_ERROR_FILE = "WzExtract_Errors.txt";
+
+        /// <summary>
+        /// Feeds ProgressBarThread the overall split file count while the Data folder export runs.
+        /// There is no single "current file" once several categories are in flight, so the
+        /// secondary bar tracks finished files instead of images inside one file.
+        /// </summary>
+        private sealed class DataFolderExportProgress : ProgressingWzSerializer
+        {
+            public void Reset(int totalShards)
+            {
+                total = totalShards;
+                curr = 0;
+            }
+
+            public void ReportCompleted(int completedShards)
+            {
+                curr = completedShards;
+            }
+        }
+
+        /// <summary>
+        /// Exports every WZ split file collected from a Data folder into server-side XML.
+        /// Categories run in parallel, the shards of one category run in order on a single task
+        /// (Character\Weapon\Weapon_000.wz + Weapon_001.wz -> &lt;out&gt;\Character.wz\Weapon).
+        /// A file that fails to parse is recorded and skipped; the rest of the batch keeps going.
+        /// </summary>
+        /// <param name="param">
+        /// An object array containing:
+        /// [0] - List&lt;DataFolderWzShard&gt; shards: split files with their target directory
+        /// [1] - string baseDir: Base output directory path
+        /// [2] - WzMapleVersion encryption: The MapleStory encryption key
+        /// [3] - DataFolderExportProgress progress: shared with ProgressBarThread
+        /// [4] - int maxDegreeOfParallelism: how many categories may run at once
+        /// </param>
+        private void RunDataFolderServerXmlExtraction(object param)
+        {
+            cancellationTokenSource = new CancellationTokenSource();
+            ChangeApplicationState(false);
+
+            List<DataFolderWzShard> shards = (List<DataFolderWzShard>)((object[])param)[0];
+            string baseDir = (string)((object[])param)[1];
+            WzMapleVersion version = (WzMapleVersion)((object[])param)[2];
+            DataFolderExportProgress progress = (DataFolderExportProgress)((object[])param)[3];
+            int maxDegreeOfParallelism = (int)((object[])param)[4];
+
+            UpdateProgressBar(MainPanel.mainProgressBar, 0, false, true);
+            UpdateProgressBar(MainPanel.mainProgressBar, shards.Count, true, true);
+            progress.Reset(shards.Count);
+
+            try
+            {
+                int completed = 0;
+
+                // Each category task builds its own serializer inside the exporter; UpdateProgressBar
+                // marshals to the UI thread itself, so this callback is safe to run from any of them.
+                IReadOnlyList<string> errors = DataFolderWzServerXmlExporter.Export(
+                    shards,
+                    baseDir,
+                    version,
+                    Program.ConfigurationManager.UserSettings.Indentation,
+                    Program.ConfigurationManager.UserSettings.LineBreakType,
+                    maxDegreeOfParallelism,
+                    () =>
+                    {
+                        progress.ReportCompleted(Interlocked.Increment(ref completed));
+                        UpdateProgressBar(MainPanel.mainProgressBar, 1, false, false);
+                    },
+                    cancellationTokenSource.Token);
+
+                // Written here, on this thread only, once every category task has finished.
+                foreach (string error in errors)
+                {
+                    ErrorLogger.Log(ErrorLevel.IncorrectStructure, error);
+                }
+                ErrorLogger.SaveToFile(WZ_EXTRACT_ERROR_FILE);
+            }
+            finally
+            {
+                // Reset progress bar to 0
+                UpdateProgressBar(MainPanel.mainProgressBar, 0, false, true);
+                UpdateProgressBar(MainPanel.mainProgressBar, 0, true, true);
+
+                threadDone = true;
+            }
+        }
+
         /// <summary>
         /// Extracts and processes the WZ files into .img files
         /// </summary>
@@ -2087,6 +2174,52 @@ namespace HaRepacker.GUI
                     dialog.FileNames, folderDialog.SelectedPath, GetSelectedEncryptionVersion(), serializer 
                 });
             new Thread(new ParameterizedThreadStart(ProgressBarThread)).Start(serializer);
+        }
+
+        /// <summary>
+        /// Server-side XML export from a Toki-HA 1.6.8 style Data folder.
+        /// Unlike xMLToolStripMenuItem_Click the user picks the Data folder instead of individual .wz files;
+        /// every split file below it (Character_000.wz, Map_013.wz, ...) is merged back into one
+        /// old-style WZ directory per category.
+        /// </summary>
+        private void dataFolderServerXmlToolStripMenuItem_Click(object sender, EventArgs e)
+        {
+            FolderBrowserDialog dataFolderDialog = new FolderBrowserDialog()
+            {
+                Description = "選擇Data資料夾"
+            };
+            if (dataFolderDialog.ShowDialog() != Forms.DialogResult.OK)
+                return;
+
+            FolderBrowserDialog folderDialog = new FolderBrowserDialog()
+            {
+                Description = HaRepacker.Properties.Resources.SelectOutDir
+            };
+            if (folderDialog.ShowDialog() != Forms.DialogResult.OK)
+                return;
+
+            List<DataFolderWzShard> shards = DataFolderWzScanner.Scan(dataFolderDialog.SelectedPath);
+            if (shards.Count == 0)
+            {
+                MessageBox.Show("在所選資料夾中找不到任何 WZ 分片檔案（例如 Character_000.wz）。",
+                    Properties.Resources.Warning, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            // No serializer is built here: every category task makes its own inside the exporter,
+            // because WzClassicXmlSerializer carries mutable progress state.
+            DataFolderExportProgress progress = new DataFolderExportProgress();
+            int maxDegreeOfParallelism = DataFolderWzServerXmlExporter.ResolveParallelism(
+                Program.ConfigurationManager.UserSettings.DataFolderExportParallelism);
+
+            threadDone = false;
+            runningThread = new Thread(new ParameterizedThreadStart(RunDataFolderServerXmlExtraction));
+            runningThread.Start(
+                (object)new object[]
+                {
+                    shards, folderDialog.SelectedPath, GetSelectedEncryptionVersion(), progress, maxDegreeOfParallelism
+                });
+            new Thread(new ParameterizedThreadStart(ProgressBarThread)).Start(progress);
         }
 
         /// <summary>

@@ -73,5 +73,12 @@ namespace MapleLib.Configuration
 
         [JsonPropertyName("AutoloadRelatedWzFiles")]
         public bool AutoloadRelatedWzFiles = false;
+
+        /// <summary>
+        /// How many Data folder categories the server-side XML batch export handles at once.
+        /// 0 lets the exporter pick a value from the core count; 1 runs one category after another.
+        /// </summary>
+        [JsonPropertyName("DataFolderExportParallelism")]
+        public int DataFolderExportParallelism = 0;
     }
 }
